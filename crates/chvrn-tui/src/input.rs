@@ -11,7 +11,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     Pane, ReviewInput, ReviewOutcome,
-    render::{GutterAction, InsertionPosition},
+    render::GutterAction,
     session::{ConflictRegion, DiffCompletion, Mode, ResolutionChoice, ReviewSession, TextPane},
     text,
 };
@@ -45,6 +45,9 @@ impl ReviewSession {
                     self.height = height;
                     self.keep_cursor_visible();
                     self.keep_horizontal_visible();
+                    if self.help {
+                        self.prepare_help();
+                    }
                 }
                 ReviewOutcome::Continue
             }
@@ -103,7 +106,7 @@ impl ReviewSession {
             .replace(0..current, text)
             .map_err(|_| ReviewEditError::InvalidText)?;
         self.record_merge_edit(previous);
-        self.record_action(pane);
+        self.record_action(pane, current != 0 || !text.is_empty());
         self.focus = pane;
         self.refresh_after_edit(pane);
         Ok(())
@@ -179,8 +182,32 @@ impl ReviewSession {
             return ReviewOutcome::Continue;
         }
         if self.help {
-            if matches!(event.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.help = false;
+            let maximum = self
+                .help_lines
+                .len()
+                .saturating_sub(usize::from(self.height.saturating_sub(2)));
+            match event.code {
+                KeyCode::Esc | KeyCode::Char('?') => self.help = false,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(maximum);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = self
+                        .help_scroll
+                        .saturating_add(usize::from(self.height.saturating_sub(2)))
+                        .min(maximum);
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self
+                        .help_scroll
+                        .saturating_sub(usize::from(self.height.saturating_sub(2)));
+                }
+                KeyCode::Home => self.help_scroll = 0,
+                KeyCode::End => self.help_scroll = maximum,
+                _ => {}
             }
             return ReviewOutcome::Continue;
         }
@@ -215,7 +242,11 @@ impl ReviewSession {
                 }
                 return ReviewOutcome::Quit;
             }
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => {
+                self.help = true;
+                self.help_scroll = 0;
+                self.prepare_help();
+            }
             KeyCode::Char('i') => self.enter_edit(),
             KeyCode::Char('a') => self.apply_hunk(),
             KeyCode::Char('u') => self.undo(),
@@ -243,7 +274,8 @@ impl ReviewSession {
             KeyCode::PageUp => {
                 self.scroll_by(usize::from(self.height.saturating_sub(3)).max(1), false)
             }
-            KeyCode::Tab | KeyCode::BackTab => self.switch_focus(),
+            KeyCode::Tab => self.switch_focus(!event.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::BackTab => self.switch_focus(false),
             KeyCode::Char('w') => self.cycle_whitespace(),
             KeyCode::Char('o' | 't' | 'b' | 'r') => self.choose_conflict(event.code),
             _ => {}
@@ -290,13 +322,13 @@ impl ReviewSession {
         });
     }
 
-    fn switch_focus(&mut self) {
-        self.focus = match self.focus {
-            Pane::Left => Pane::Right,
-            Pane::Right => Pane::Left,
-            Pane::Ours => Pane::Result,
-            Pane::Result => Pane::Theirs,
-            Pane::Theirs => Pane::Ours,
+    fn switch_focus(&mut self, forward: bool) {
+        self.focus = match (self.focus, forward) {
+            (Pane::Left, _) => Pane::Right,
+            (Pane::Right, _) => Pane::Left,
+            (Pane::Ours, true) | (Pane::Theirs, false) => Pane::Result,
+            (Pane::Result, true) | (Pane::Ours, false) => Pane::Theirs,
+            (Pane::Theirs, true) | (Pane::Result, false) => Pane::Ours,
         };
         let (line, column) = self.position_for_row(self.focus, self.aligned_row);
         self.aligned_row = self.row_for_line(self.focus, line);
@@ -428,7 +460,7 @@ impl ReviewSession {
         };
         if self.pane_mut(self.focus).buffer.insert(inserted).is_ok() {
             self.record_merge_edit(previous);
-            self.record_action(self.focus);
+            self.record_action(self.focus, true);
             self.adjust_merge_regions(
                 self.focus,
                 start..start,
@@ -466,7 +498,7 @@ impl ReviewSession {
             .is_ok()
         {
             self.record_merge_edit(previous);
-            self.record_action(self.focus);
+            self.record_action(self.focus, true);
             self.adjust_merge_regions(self.focus, range, 0, true, None);
             self.refresh_after_edit(self.focus);
         }
@@ -523,16 +555,17 @@ impl ReviewSession {
     }
 
     fn undo(&mut self) {
-        let Some(pane) = self.undo_actions.pop() else {
+        let Some(action) = self.undo_actions.pop() else {
             return;
         };
+        let pane = action.pane;
         let previous = if pane == Pane::Result {
             self.merge_metadata()
         } else {
             None
         };
-        if !self.pane_mut(pane).buffer.undo() {
-            self.undo_actions.push(pane);
+        if action.has_text_history && !self.pane_mut(pane).buffer.undo() {
+            self.undo_actions.push(action);
             return;
         }
         if let (
@@ -549,22 +582,23 @@ impl ReviewSession {
                 self.restore_merge_metadata(restored);
             }
         }
-        self.redo_actions.push(pane);
+        self.redo_actions.push(action);
         self.focus = pane;
         self.refresh_after_edit(pane);
     }
 
     fn redo(&mut self) {
-        let Some(pane) = self.redo_actions.pop() else {
+        let Some(action) = self.redo_actions.pop() else {
             return;
         };
+        let pane = action.pane;
         let previous = if pane == Pane::Result {
             self.merge_metadata()
         } else {
             None
         };
-        if !self.pane_mut(pane).buffer.redo() {
-            self.redo_actions.push(pane);
+        if action.has_text_history && !self.pane_mut(pane).buffer.redo() {
+            self.redo_actions.push(action);
             return;
         }
         if let (
@@ -581,7 +615,7 @@ impl ReviewSession {
                 self.restore_merge_metadata(restored);
             }
         }
-        self.undo_actions.push(pane);
+        self.undo_actions.push(action);
         self.focus = pane;
         self.refresh_after_edit(pane);
     }
@@ -647,7 +681,7 @@ impl ReviewSession {
             self.message = "Cannot apply this hunk to the destination".to_owned();
             return;
         }
-        self.record_action(target);
+        self.record_action(target, true);
         self.refresh_after_edit(target);
     }
 
@@ -723,27 +757,24 @@ impl ReviewSession {
             shift_tracked_range(&mut region.result, range.clone(), replacement_chars);
         }
         conflicts.remove(index);
-        resolutions.push((id, choice));
         resolved.push(crate::session::ResolvedConflict {
             id,
             result: range.start..range.start + replacement_chars,
             ours,
             theirs,
+            ours_accepted: matches!(&choice, ResolutionChoice::Ours | ResolutionChoice::Both),
+            theirs_accepted: matches!(&choice, ResolutionChoice::Theirs | ResolutionChoice::Both),
         });
+        resolutions.push((id, choice));
         self.record_merge_edit(before);
-        self.record_action(Pane::Result);
+        self.record_action(Pane::Result, !range.is_empty() || !replacement.is_empty());
         self.refresh_after_edit(Pane::Result);
         if self.selected.is_some() {
             self.select_hunk(false);
         }
     }
 
-    fn insert_resolved_source(
-        &mut self,
-        id: chvrn_core::merge::ConflictId,
-        source: Pane,
-        position: InsertionPosition,
-    ) {
+    fn insert_resolved_source(&mut self, id: chvrn_core::merge::ConflictId, source: Pane) {
         let Mode::ThreeWay {
             ours,
             result,
@@ -754,23 +785,21 @@ impl ReviewSession {
         else {
             return;
         };
-        let Some(region) = resolved.iter().find(|region| region.id == id) else {
+        let Some(index) = resolved.iter().position(|region| region.id == id) else {
             return;
         };
-        let (source, lines) = match source {
-            Pane::Ours => (ours, region.ours.clone()),
-            Pane::Theirs => (theirs, region.theirs.clone()),
+        let region = &resolved[index];
+        let (source_pane, lines) = match source {
+            Pane::Ours if !region.ours_accepted => (ours, region.ours.clone()),
+            Pane::Theirs if !region.theirs_accepted => (theirs, region.theirs.clone()),
             _ => return,
         };
-        let source_chars = text::line_range_chars(source.snapshot.text(), lines);
-        let inserted = text::slice_chars(source.snapshot.text(), source_chars).to_owned();
+        let source_chars = text::line_range_chars(source_pane.snapshot.text(), lines);
+        let inserted = text::slice_chars(source_pane.snapshot.text(), source_chars).to_owned();
         if inserted.is_empty() {
             return;
         }
-        let offset = match position {
-            InsertionPosition::Before => region.result.start,
-            InsertionPosition::After => region.result.end,
-        };
+        let offset = region.result.end;
         if offset > result.buffer.len_chars() {
             return;
         }
@@ -784,8 +813,15 @@ impl ReviewSession {
             self.message = "Cannot insert the selected source block".to_owned();
             return;
         }
+        if let Mode::ThreeWay { resolved, .. } = &mut self.mode {
+            if source == Pane::Ours {
+                resolved[index].ours_accepted = true;
+            } else {
+                resolved[index].theirs_accepted = true;
+            }
+        }
         self.record_merge_edit(before);
-        self.record_action(Pane::Result);
+        self.record_action(Pane::Result, true);
         self.adjust_merge_regions(
             Pane::Result,
             offset..offset,
@@ -924,8 +960,8 @@ impl ReviewSession {
                                         Pane::Result => {}
                                     }
                                 }
-                                GutterAction::InsertResolved { id, position } => {
-                                    self.insert_resolved_source(id, hit.pane, position)
+                                GutterAction::InsertResolved { id } => {
+                                    self.insert_resolved_source(id, hit.pane)
                                 }
                             }
                             return ReviewOutcome::Continue;

@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, Receiver, SyncSender, TrySendError},
@@ -304,6 +304,8 @@ pub(crate) struct ResolvedConflict {
     pub(crate) result: Range<usize>,
     pub(crate) ours: Range<usize>,
     pub(crate) theirs: Range<usize>,
+    pub(crate) ours_accepted: bool,
+    pub(crate) theirs_accepted: bool,
 }
 
 pub(crate) enum Mode {
@@ -446,6 +448,12 @@ pub(crate) struct PaneProjection {
     pub(crate) actions: Vec<ChangeBand>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct HistoryAction {
+    pub(crate) pane: Pane,
+    pub(crate) has_text_history: bool,
+}
+
 pub struct ReviewSession {
     pub(crate) mode: Mode,
     pub(crate) rows: Vec<ViewRow>,
@@ -460,6 +468,8 @@ pub struct ReviewSession {
     pub(crate) height: u16,
     pub(crate) editing: bool,
     pub(crate) help: bool,
+    pub(crate) help_lines: Vec<String>,
+    pub(crate) help_scroll: usize,
     pub(crate) confirming_discard: bool,
     pub(crate) changed: bool,
     pub(crate) refresh_conflict: bool,
@@ -467,9 +477,12 @@ pub struct ReviewSession {
     pub(crate) latest_generation: u64,
     pub(crate) accepted_generation: u64,
     pub(crate) message: String,
+    pub(crate) left_path: Option<PathBuf>,
+    pub(crate) right_path: Option<PathBuf>,
+    pub(crate) output_path: Option<PathBuf>,
     pub(crate) whitespace: WhitespacePolicy,
-    pub(crate) undo_actions: Vec<Pane>,
-    pub(crate) redo_actions: Vec<Pane>,
+    pub(crate) undo_actions: Vec<HistoryAction>,
+    pub(crate) redo_actions: Vec<HistoryAction>,
     pub(crate) local_generation: u64,
     pub(crate) local_pending: bool,
     local_worker: Option<LocalWorker>,
@@ -498,6 +511,8 @@ impl ReviewSession {
             height: 24,
             editing: false,
             help: false,
+            help_lines: Vec::new(),
+            help_scroll: 0,
             confirming_discard: false,
             changed: false,
             refresh_conflict: false,
@@ -505,6 +520,9 @@ impl ReviewSession {
             latest_generation: 0,
             accepted_generation: 0,
             message: String::new(),
+            left_path: None,
+            right_path: None,
+            output_path: None,
             whitespace: WhitespacePolicy::Exact,
             undo_actions: Vec::new(),
             redo_actions: Vec::new(),
@@ -565,6 +583,8 @@ impl ReviewSession {
             height: 24,
             editing: false,
             help: false,
+            help_lines: Vec::new(),
+            help_scroll: 0,
             confirming_discard: false,
             changed: false,
             refresh_conflict: false,
@@ -572,6 +592,9 @@ impl ReviewSession {
             latest_generation: 0,
             accepted_generation: 0,
             message: String::new(),
+            left_path: None,
+            right_path: None,
+            output_path: None,
             whitespace: WhitespacePolicy::Exact,
             undo_actions: Vec::new(),
             redo_actions: Vec::new(),
@@ -661,6 +684,8 @@ impl ReviewSession {
     }
 
     pub fn set_paths(&mut self, left: &Path, right: &Path) {
+        self.left_path = Some(left.to_path_buf());
+        self.right_path = Some(right.to_path_buf());
         match &mut self.mode {
             Mode::TwoWay {
                 left: lhs,
@@ -692,6 +717,16 @@ impl ReviewSession {
         }
         if self.local_pending {
             self.refresh_alignment();
+        }
+        if self.help {
+            self.prepare_help();
+        }
+    }
+
+    pub fn set_output_path(&mut self, path: &Path) {
+        self.output_path = Some(path.to_path_buf());
+        if self.help {
+            self.prepare_help();
         }
     }
 
@@ -1078,8 +1113,11 @@ impl ReviewSession {
         }
     }
 
-    pub(crate) fn record_action(&mut self, pane: Pane) {
-        self.undo_actions.push(pane);
+    pub(crate) fn record_action(&mut self, pane: Pane, has_text_history: bool) {
+        self.undo_actions.push(HistoryAction {
+            pane,
+            has_text_history,
+        });
         self.redo_actions.clear();
     }
 
@@ -1546,21 +1584,30 @@ fn three_way_action_bands(
         });
     }
     for region in resolved {
+        let ours_pending = !region.ours_accepted && !region.ours.is_empty();
+        let theirs_pending = !region.theirs_accepted && !region.theirs.is_empty();
+        if !ours_pending && !theirs_pending {
+            continue;
+        }
         let result_range = result_line_range(result, &region.result);
-        left.push(ChangeBand {
-            left: region.ours.clone(),
-            right: result_range.clone(),
-            hunk: None,
-            resolved: Some(region.id),
-            kind: ChangeKind::Resolved,
-        });
-        right.push(ChangeBand {
-            left: result_range,
-            right: region.theirs.clone(),
-            hunk: None,
-            resolved: Some(region.id),
-            kind: ChangeKind::Resolved,
-        });
+        if ours_pending {
+            left.push(ChangeBand {
+                left: region.ours.clone(),
+                right: result_range.clone(),
+                hunk: None,
+                resolved: Some(region.id),
+                kind: ChangeKind::Resolved,
+            });
+        }
+        if theirs_pending {
+            right.push(ChangeBand {
+                left: result_range,
+                right: region.theirs.clone(),
+                hunk: None,
+                resolved: Some(region.id),
+                kind: ChangeKind::Resolved,
+            });
+        }
     }
     let key = |band: &ChangeBand| {
         (

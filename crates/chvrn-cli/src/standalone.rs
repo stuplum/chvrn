@@ -95,13 +95,8 @@ pub fn diff(left: PathBuf, right: PathBuf, options: &Options) -> Result<u8> {
     let left_text = snapshot(left_file.bytes())?;
     let right_text = snapshot(right_file.bytes())?;
     let mut session = ReviewSession::two_way(left_text.text(), right_text.text());
-    session.set_paths(&left, &right);
+    session.set_paths(&left_file.path, &right_file.path);
     session.set_whitespace_policy(options.whitespace.into());
-    session.set_message(format!(
-        "{} | {} | s saves edited buffers; q never approves",
-        left.display(),
-        right.display()
-    ));
     let watch = FileWatch::new(&[&left_file.path, &right_file.path], false)?;
     let language = LanguageUi::new(
         options,
@@ -300,13 +295,10 @@ pub fn merge(args: MergeArgs, options: &Options) -> Result<u8> {
     }
     let mut session =
         ReviewSession::three_way(base_text.text(), ours_text.text(), theirs_text.text());
-    session.set_paths(&args.ours, &args.theirs);
+    session.set_paths(&ours.path, &theirs.path);
     session.set_read_only(Pane::Ours, true);
     session.set_read_only(Pane::Theirs, true);
-    session.set_message(format!(
-        "Merge into {} | o ours, t theirs, b both, r manual; s saves",
-        args.output.display()
-    ));
+    session.set_output_path(&output.path);
     let language = LanguageUi::new(options, output.path.parent().ok_or("output has no parent")?)?;
     let mut host = MergeHost {
         base,

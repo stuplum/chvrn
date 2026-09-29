@@ -4,14 +4,13 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear},
 };
-use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    Pane,
+    Pane, WhitespacePolicy,
     session::{ChangeBand, ChangeKind, Mode, ReviewSession, ViewLine},
     text,
 };
@@ -26,20 +25,9 @@ pub(crate) struct MouseHit {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum InsertionPosition {
-    Before,
-    After,
-}
-
-#[derive(Clone, Copy)]
 pub(crate) enum GutterAction {
-    ApplyChoice {
-        hunk: usize,
-    },
-    InsertResolved {
-        id: ConflictId,
-        position: InsertionPosition,
-    },
+    ApplyChoice { hunk: usize },
+    InsertResolved { id: ConflictId },
 }
 
 #[derive(Clone, Copy)]
@@ -71,7 +59,27 @@ const HEADING: Color = Color::Rgb(34, 37, 41);
 const RAIL: Color = Color::Rgb(21, 23, 27);
 const INK: Color = Color::Rgb(199, 204, 209);
 const MUTED: Color = Color::Rgb(108, 115, 122);
+const ACCENT: Color = Color::Rgb(112, 194, 210);
+const MODIFIED: Color = Color::Rgb(222, 180, 106);
 const CONNECTOR_WIDTH: u16 = 5;
+
+fn wrap_help_line(lines: &mut Vec<String>, text: &str, width: usize) {
+    if width == 0 {
+        return;
+    }
+    let mut start = 0;
+    let mut occupied = 0;
+    for (index, grapheme) in text.grapheme_indices(true) {
+        let next_width = grapheme.width();
+        if occupied > 0 && occupied + next_width > width {
+            lines.push(text[start..index].to_owned());
+            start = index;
+            occupied = 0;
+        }
+        occupied += next_width;
+    }
+    lines.push(text[start..].to_owned());
+}
 
 pub(crate) fn visible_pane_count(session: &ReviewSession, width: u16) -> usize {
     match (&session.mode, width) {
@@ -168,12 +176,12 @@ impl ReviewSession {
         } else {
             "plain text"
         };
-        let header = format!(
-            "chvrn  {mode}  {}  {}  {:?}  {language}",
-            if self.editing { "INSERT" } else { "REVIEW" },
-            if self.changed { "modified" } else { "clean" },
-            self.whitespace
-        );
+        let whitespace = match self.whitespace {
+            WhitespacePolicy::Exact => "Exact",
+            WhitespacePolicy::IgnoreEdge => "IgnoreEdge",
+            WhitespacePolicy::IgnoreAll => "IgnoreAll",
+            WhitespacePolicy::IgnoreBlankLines => "IgnoreBlankLines",
+        };
         frame
             .buffer_mut()
             .set_style(area, Style::default().fg(INK).bg(SURFACE));
@@ -181,13 +189,39 @@ impl ReviewSession {
             Rect::new(area.x, area.y, area.width, 1),
             Style::default().fg(MUTED).bg(HEADING),
         );
-        frame.buffer_mut().set_stringn(
-            area.x.saturating_add(1),
-            area.y,
-            header,
-            usize::from(area.width.saturating_sub(1)),
-            Style::default().fg(Color::Rgb(170, 187, 202)).bg(HEADING),
-        );
+        let quiet = Style::default().fg(MUTED).bg(HEADING);
+        let normal = Style::default().fg(INK).bg(HEADING);
+        let editing = if self.editing {
+            normal.fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            quiet
+        };
+        let modified = if self.changed {
+            normal.fg(MODIFIED).add_modifier(Modifier::BOLD)
+        } else {
+            quiet
+        };
+        let mut x = area.x.saturating_add(1);
+        for (label, style) in [
+            ("chvrn  ", quiet),
+            (mode, normal),
+            ("  ", quiet),
+            (if self.editing { "INSERT" } else { "REVIEW" }, editing),
+            ("  ", quiet),
+            (if self.changed { "modified" } else { "clean" }, modified),
+            ("  ", quiet),
+            (whitespace, quiet),
+            ("  ", quiet),
+            (language, quiet),
+        ] {
+            (x, _) = frame.buffer_mut().set_stringn(
+                x,
+                area.y,
+                label,
+                usize::from(area.right().saturating_sub(x)),
+                style,
+            );
+        }
         let (panes, connectors, count) = pane_areas(self, area);
         if area.height > 1 {
             for pane_area in panes.iter().take(count) {
@@ -225,33 +259,156 @@ impl ReviewSession {
             }
         }
         if area.height >= 2 {
-            let footer = if self.confirming_discard {
-                Cow::Borrowed("Unsaved changes. y discards and quits; any other key returns")
-            } else if self.refresh_conflict {
-                Cow::Borrowed(
-                    "External changes conflict with local edits. R discards local edits and reloads; submit is blocked",
-                )
-            } else if self.local_pending {
-                Cow::Borrowed(
-                    "Updating edited diff; hunk apply and submit wait for the latest alignment",
-                )
-            } else if self.message.is_empty() {
-                Cow::Borrowed(
-                    "[ ] hunks  »/« choose  diagonals add  i edit  u undo  Ctrl-R redo  ? help  s submit  q quit",
-                )
-            } else {
-                Cow::Borrowed(self.message.as_str())
-            };
-            frame.buffer_mut().set_stringn(
-                area.x,
-                area.y + area.height - 1,
-                footer,
-                usize::from(area.width),
-                Style::default().fg(Color::Rgb(202, 182, 130)).bg(HEADING),
-            );
+            self.render_footer(frame);
         }
         if self.help {
             self.render_help(frame);
+        }
+    }
+
+    fn render_footer(&self, frame: &mut Frame<'_>) {
+        let screen = frame.area();
+        let area = Rect::new(screen.x, screen.bottom() - 1, screen.width, 1);
+        let normal = Style::default().fg(INK).bg(HEADING);
+        let key_style = normal.fg(ACCENT).add_modifier(Modifier::BOLD);
+        let buffer = frame.buffer_mut();
+        buffer.set_style(area, normal);
+        let message = if self.confirming_discard {
+            "Unsaved changes. y discards and quits; any other key returns"
+        } else if self.refresh_conflict {
+            "External changes conflict with local edits. R discards local edits and reloads; submit is blocked"
+        } else if self.local_pending {
+            "Updating edited diff; hunk apply and submit wait for the latest alignment"
+        } else {
+            &self.message
+        };
+        if !message.is_empty() {
+            buffer.set_stringn(
+                area.x,
+                area.y,
+                message,
+                usize::from(area.width),
+                normal.fg(MODIFIED),
+            );
+            return;
+        }
+        let review = !self.editing;
+        let conflict = match &self.mode {
+            Mode::ThreeWay { conflicts, .. } => {
+                self.selected.and_then(|index| conflicts.get(index))
+            }
+            Mode::TwoWay { .. } => None,
+        };
+        let can_copy = match &self.mode {
+            Mode::TwoWay { left, right, .. } => {
+                self.selected.is_some()
+                    && !if self.focus == Pane::Left {
+                        right.read_only
+                    } else {
+                        left.read_only
+                    }
+            }
+            Mode::ThreeWay { .. } => false,
+        };
+        let shortcuts = [
+            ("[Esc]", "Review", self.editing, true),
+            (
+                "[Ctrl-Z]",
+                "Undo",
+                self.editing && !self.undo_actions.is_empty(),
+                false,
+            ),
+            ("[o]", "Ours", review && conflict.is_some(), false),
+            ("[t]", "Theirs", review && conflict.is_some(), false),
+            ("[b]", "Both", review && conflict.is_some(), false),
+            (
+                "[r]",
+                "Manual",
+                review && conflict.is_some_and(|region| region.changed),
+                false,
+            ),
+            ("[a]", "Copy", review && can_copy, false),
+            (
+                "[i]",
+                "Edit",
+                review && !self.pane(self.focus).read_only,
+                false,
+            ),
+            (
+                "[u]",
+                "Undo",
+                review && !self.undo_actions.is_empty(),
+                false,
+            ),
+            ("[Ctrl-R]", "Redo", !self.redo_actions.is_empty(), false),
+            ("[s]", "Save", review, true),
+            ("[q]", "Quit", review, true),
+            ("[?]", "Help", review, true),
+            ("[Tab]", "Next pane", review, false),
+            ("[Shift-Tab]", "Previous pane", review, false),
+            ("[ / ]", "Hunks", review && self.selected.is_some(), false),
+        ];
+        let mandatory_width: usize = shortcuts
+            .iter()
+            .filter(|(_, _, enabled, essential)| *enabled && *essential)
+            .map(|(key, label, _, _)| key.len() + label.len() + 3)
+            .sum();
+        let compact = usize::from(area.width) < mandatory_width.saturating_sub(2);
+        let mut reserved: usize = shortcuts
+            .iter()
+            .filter(|(_, _, enabled, essential)| *enabled && *essential)
+            .map(|(key, label, _, _)| key.len() + if compact { 2 } else { label.len() + 3 })
+            .sum();
+        let mut x = area.x;
+        for (key, label, enabled, essential) in shortcuts {
+            if !enabled {
+                continue;
+            }
+            let label = if compact { "" } else { label };
+            let width = key.len() + if label.is_empty() { 0 } else { label.len() + 1 };
+            if essential {
+                reserved = reserved.saturating_sub(width + 2);
+            }
+            if width + reserved > usize::from(area.right().saturating_sub(x)) {
+                continue;
+            }
+            (x, _) = buffer.set_stringn(x, area.y, key, key.len(), key_style);
+            if !label.is_empty() {
+                (x, _) = buffer.set_stringn(x, area.y, " ", 1, normal);
+                (x, _) = buffer.set_stringn(x, area.y, label, label.len(), normal);
+            }
+            x = x.saturating_add(2);
+        }
+        let path = match (&self.mode, self.focus) {
+            (Mode::TwoWay { .. }, Pane::Left) => self.left_path.as_deref(),
+            (Mode::TwoWay { .. }, _) => self.right_path.as_deref(),
+            (Mode::ThreeWay { .. }, _) => self.output_path.as_deref(),
+        };
+        if let Some(path) = path {
+            let name = path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy();
+            let available = usize::from(area.right().saturating_sub(x));
+            let style = normal.fg(MUTED);
+            let width = name.width();
+            if width <= available {
+                buffer.set_stringn(area.right() - width as u16, area.y, &name, width, style);
+            } else if available >= 3 {
+                let mut start = name.len();
+                let mut width = 1;
+                for (index, grapheme) in name.grapheme_indices(true).rev() {
+                    let next_width = width + grapheme.width();
+                    if next_width > available {
+                        break;
+                    }
+                    start = index;
+                    width = next_width;
+                }
+                let x = area.right() - width as u16;
+                buffer.set_stringn(x, area.y, "…", 1, style);
+                buffer.set_stringn(x + 1, area.y, &name[start..], width - 1, style);
+            }
         }
     }
 
@@ -486,12 +643,7 @@ impl ReviewSession {
         let action_bands = self.action_bands(connector.left, connector.right);
         for band in action_bands.iter().rev() {
             for source in [connector.right, connector.left] {
-                for action in self
-                    .band_actions(connector, band, source)
-                    .into_iter()
-                    .rev()
-                    .flatten()
-                {
+                if let Some(action) = self.band_action(connector, band, source) {
                     frame.buffer_mut().set_string(
                         action.x,
                         action.y,
@@ -506,18 +658,16 @@ impl ReviewSession {
         }
     }
 
-    fn band_actions(
+    fn band_action(
         &self,
         connector: &Connector,
         band: &ChangeBand,
         source: Pane,
-    ) -> [Option<PositionedAction>; 2] {
+    ) -> Option<PositionedAction> {
         if self.local_pending {
-            return [None, None];
+            return None;
         }
-        let Some((edge_x, y, row)) = self.band_action_anchor(connector, band, source) else {
-            return [None, None];
-        };
+        let (edge_x, y, row) = self.band_action_anchor(connector, band, source)?;
         let hit = |action| MouseHit {
             pane: source,
             row,
@@ -543,72 +693,31 @@ impl ReviewSession {
         if choice {
             let hunk = band.hunk.expect("choice action must identify its hunk");
             let symbol = if source == connector.left { "»" } else { "«" };
-            return [
-                Some(PositionedAction {
-                    x: edge_x,
-                    y,
-                    symbol,
-                    hit: hit(GutterAction::ApplyChoice { hunk }),
-                }),
-                None,
-            ];
+            return Some(PositionedAction {
+                x: edge_x,
+                y,
+                symbol,
+                hit: hit(GutterAction::ApplyChoice { hunk }),
+            });
         }
-        let Some(id) = band.resolved else {
-            return [None, None];
-        };
+        let id = band.resolved?;
         let resolved_source = matches!(
             (connector.left, connector.right, source),
             (Pane::Ours, Pane::Result, Pane::Ours) | (Pane::Result, Pane::Theirs, Pane::Theirs)
         );
         if !resolved_source {
-            return [None, None];
+            return None;
         }
-        let Mode::ThreeWay { resolved, .. } = &self.mode else {
-            return [None, None];
-        };
-        let source_is_empty = resolved
-            .iter()
-            .find(|region| region.id == id)
-            .is_none_or(|region| {
-                if source == Pane::Ours {
-                    region.ours.is_empty()
-                } else {
-                    region.theirs.is_empty()
-                }
-            });
-        if source_is_empty {
-            return [None, None];
-        }
-        let inward_x = if source == connector.left {
-            edge_x.saturating_add(1)
-        } else {
-            edge_x.saturating_sub(1)
-        };
-        let (before, after) = if source == connector.left {
-            ("↗", "↘")
-        } else {
-            ("↖", "↙")
-        };
-        [
-            Some(PositionedAction {
-                x: edge_x,
-                y,
-                symbol: before,
-                hit: hit(GutterAction::InsertResolved {
-                    id,
-                    position: InsertionPosition::Before,
-                }),
-            }),
-            Some(PositionedAction {
-                x: inward_x,
-                y,
-                symbol: after,
-                hit: hit(GutterAction::InsertResolved {
-                    id,
-                    position: InsertionPosition::After,
-                }),
-            }),
-        ]
+        Some(PositionedAction {
+            x: edge_x,
+            y,
+            symbol: if source == connector.left {
+                "↘"
+            } else {
+                "↙"
+            },
+            hit: hit(GutterAction::InsertResolved { id }),
+        })
     }
 
     fn band_action_anchor(
@@ -654,22 +763,90 @@ impl ReviewSession {
         None
     }
 
+    pub(crate) fn prepare_help(&mut self) {
+        self.help_lines.clear();
+        let width = usize::from(self.width.min(100).saturating_sub(2));
+        let guide = [
+            "?/Esc: close help   Up/Down/PgUp/PgDn: scroll help",
+            "Tab: next pane   Shift-Tab: previous pane",
+            "j/k or arrows: rows   h/l: columns",
+            "[ / ]: previous/next hunk",
+            "i: edit   Esc: review   u: undo   Ctrl-R: redo",
+            "Insert mode: type text; Ctrl-Z: undo; Ctrl-R: redo",
+            match self.mode {
+                Mode::TwoWay { .. } => "a or »/«: copy the focused source hunk",
+                Mode::ThreeWay { .. } => "o/t/b: choose ours/theirs/both   r: accept manual edit",
+            },
+            match self.mode {
+                Mode::TwoWay { .. } => "Both panes are editable unless marked read-only",
+                Mode::ThreeWay { .. } => "»/«: choose source   ↘/↙: insert remaining source below",
+            },
+            "w: whitespace policy   PageUp/PageDown: scroll",
+            "s: save/submit   q: quit without approval",
+        ];
+        for line in guide {
+            wrap_help_line(&mut self.help_lines, line, width);
+        }
+        let (left_label, right_label) = match self.mode {
+            Mode::TwoWay { .. } => ("Left:", "Right:"),
+            Mode::ThreeWay { .. } => ("Ours:", "Theirs:"),
+        };
+        for (label, path) in [
+            (left_label, self.left_path.as_deref()),
+            (right_label, self.right_path.as_deref()),
+            ("Output:", self.output_path.as_deref()),
+        ] {
+            if let Some(path) = path {
+                wrap_help_line(&mut self.help_lines, "", width);
+                wrap_help_line(&mut self.help_lines, label, width);
+                wrap_help_line(&mut self.help_lines, &path.to_string_lossy(), width);
+            }
+        }
+        self.help_scroll = self.help_scroll.min(
+            self.help_lines
+                .len()
+                .saturating_sub(usize::from(self.height.saturating_sub(2))),
+        );
+    }
+
     fn render_help(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        let width = area.width.min(62);
-        let height = area.height.min(13);
+        let width = area.width.min(100);
+        let height = usize::from(area.height).min(self.help_lines.len().saturating_add(2)) as u16;
         let box_area = Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
             width,
             height,
         );
+        let style = Style::default().fg(INK).bg(HEADING);
         frame.render_widget(Clear, box_area);
-        let guide = "j/k or arrows: rows   h/l: columns   Tab: focus\n[ ]: previous/next hunk   a: copy focused hunk\ni: edit   Esc: review   u: undo   Ctrl-R: redo\no/t/b: choose ours/theirs/both   r: edited result\n»/«: choose or copy   diagonals: add before/after\nw: whitespace policy   PageUp/PageDown: scroll\ns: submit   q: quit   ?: close help";
-        frame.render_widget(
-            Paragraph::new(guide).block(Block::default().borders(Borders::ALL).title("Help")),
-            box_area,
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Help")
+            .style(style);
+        let inner = block.inner(box_area);
+        frame.render_widget(block, box_area);
+        let scroll = self.help_scroll.min(
+            self.help_lines
+                .len()
+                .saturating_sub(usize::from(inner.height)),
         );
+        for (row, line) in self
+            .help_lines
+            .iter()
+            .skip(scroll)
+            .take(usize::from(inner.height))
+            .enumerate()
+        {
+            frame.buffer_mut().set_stringn(
+                inner.x,
+                inner.y + row as u16,
+                line,
+                usize::from(inner.width),
+                style,
+            );
+        }
     }
 
     pub(crate) fn mouse_target(&self, x: u16, y: u16) -> Option<MouseHit> {
@@ -687,11 +864,7 @@ impl ReviewSession {
                 let bands = self.action_bands(connector.left, connector.right);
                 for band in bands {
                     for source in [connector.left, connector.right] {
-                        for action in self
-                            .band_actions(connector, band, source)
-                            .into_iter()
-                            .flatten()
-                        {
+                        if let Some(action) = self.band_action(connector, band, source) {
                             if x == action.x && y == action.y {
                                 return Some(action.hit);
                             }
@@ -790,14 +963,15 @@ fn draw_connector_band(
         .max(0)
         .min(i64::from(area.height));
     let last = left_end.max(right_end).max(0).min(i64::from(area.height));
-    let steps = i64::from(area.width).max(1);
+    let steps = i64::from(area.width.saturating_sub(2)).max(1);
     let color = band_color(band.kind);
     for x in 0..area.width {
-        let distance = i64::from(x);
-        let top_left = 2 * (left_start * (steps - distance) + right_start * distance);
-        let top_right = top_left + 2 * (right_start - left_start);
-        let bottom_left = 2 * (left_end * (steps - distance) + right_end * distance);
-        let bottom_right = bottom_left + 2 * (right_end - left_end);
+        let start = i64::from(x.saturating_sub(1)).min(steps);
+        let end = i64::from(x).min(steps);
+        let top_left = 2 * (left_start * (steps - start) + right_start * start);
+        let top_right = 2 * (left_start * (steps - end) + right_start * end);
+        let bottom_left = 2 * (left_end * (steps - start) + right_end * start);
+        let bottom_right = 2 * (left_end * (steps - end) + right_end * end);
         let top = top_left.min(top_right).div_euclid(steps);
         let bottom = (bottom_left.max(bottom_right) + steps - 1).div_euclid(steps);
         for y in first..last {

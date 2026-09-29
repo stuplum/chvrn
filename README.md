@@ -40,20 +40,24 @@ Two-way comparisons show borderless left/right editors. Three-way merges show **
 
 Each pane displays continuous real lines rather than blank alignment rows. Shaded change regions connect across unequal heights through Unicode half-block gutters. Changed text has stronger background emphasis without losing syntax colours. Each pane has a change-overview strip, including offscreen changes.
 
-Click `»` or `«` to copy only that source hunk across a two-way comparison, or choose that source for one unresolved merge conflict. After a merge choice, diagonal controls insert a complete source block before or after the current result: `↗` / `↘` from ours and `↖` / `↙` from theirs. Insertion preserves manual edits and duplicate lines, supports undo/redo, and leaves unrelated conflicts untouched. Saving remains explicit.
+Click `»` or `«` to copy only that source hunk across a two-way comparison, or choose that source for one unresolved merge conflict. Accepted sources have no gutter control. The remaining source offers one insert-below control: `↘` from ours or `↙` from theirs. Inserting that source consumes its control; choosing both leaves neither control. Insertion preserves manual edits and duplicate lines, supports undo/redo of both text and available controls, and leaves unrelated conflicts untouched. Merge choices remain undoable even when they leave the text unchanged, including accepting a deletion. Saving remains explicit.
 
 Truecolour terminals give the intended palette. `NO_COLOR` disables colours. No Powerline/Nerd Font is required; connectors use ordinary Unicode block characters and arrows. Terminal cells approximate diagonal edges rather than reproducing a graphical editor's smooth curves.
 
+The normal footer highlights shortcuts before a dimmed, right-aligned filename. Two-way comparisons show the focused file; merges show the output file. Filenames shorten before essential save, quit and help shortcuts are dropped. Merge-choice hints appear only for a selected unresolved conflict; insert mode shows editing controls instead. Warnings and host status messages take precedence over the normal footer.
+
+The header emphasises `modified` in amber and `INSERT` in cyan and bold. State labels remain readable with `NO_COLOR`; colour is not the only indicator.
+
 ## Controls
 
-Press `?` for editor help. Escape leaves insert mode before navigation actions.
+Press `?` for editor help, including full source and output paths. Help wraps long paths; Up/Down and PageUp/PageDown scroll, and Home/End jump to the start/end. Escape closes help or leaves insert mode before navigation actions.
 
 | Key | Action |
 | --- | --- |
 | Arrows or `h`, `j`, `k`, `l` | Move by displayed row/grapheme |
-| Tab | Switch focused pane |
+| Tab / Shift-Tab | Focus next/previous pane, wrapping at either end |
 | `[` / `]` | Previous/next hunk |
-| `a` | Copy selected hunk from focused source to the opposite pane |
+| `a` | Copy selected hunk from focused source to the opposite pane in a two-way diff |
 | `i`, Escape | Enter/leave insert mode |
 | `u`, Ctrl-R | Undo/redo |
 | Home, End, PageUp, PageDown | Navigate |

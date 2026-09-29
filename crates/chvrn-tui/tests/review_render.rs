@@ -34,6 +34,301 @@ fn row_text(buffer: &Buffer, y: u16) -> String {
         .collect()
 }
 
+fn gutter_controls(buffer: &Buffer) -> String {
+    buffer
+        .content
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            let row = index / usize::from(buffer.area.width);
+            row >= 2 && row + 1 < usize::from(buffer.area.height)
+        })
+        .map(|(_, cell)| cell.symbol())
+        .filter(|symbol| matches!(*symbol, "»" | "«" | "↗" | "↘" | "↖" | "↙"))
+        .collect()
+}
+
+#[test]
+fn footer_keeps_shortcuts_ahead_of_the_focused_filename_and_distinguishes_keys() {
+    let mut session = ReviewSession::two_way("old\n", "new\n");
+    session.set_paths(
+        Path::new("/workspace/booking-service/templates/cancellation/notice.ts"),
+        Path::new("/workspace/booking-service/templates/cancellation/revised.ts"),
+    );
+    let buffer = draw(&session, 180, 12);
+    let footer = row_text(&buffer, 11);
+    let save = footer.find("[s]").expect("save shortcut must be visible");
+    let filename = footer
+        .find("notice.ts")
+        .expect("focused filename must be visible");
+    assert!(save < filename);
+    assert!(footer.trim_end().ends_with("notice.ts"));
+    assert!(!footer.contains("/workspace/"));
+    assert_ne!(
+        buffer[(save as u16 + 1, 11)].style(),
+        buffer[(filename as u16, 11)].style()
+    );
+    assert_ne!(
+        buffer[(save as u16 + 1, 11)].style(),
+        buffer[(save as u16 + 4, 11)].style()
+    );
+
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    )));
+    let switched = row_text(&draw(&session, 180, 12), 11);
+    assert!(switched.trim_end().ends_with("revised.ts"));
+    assert!(!switched.contains("notice.ts"));
+}
+
+#[test]
+fn footer_sacrifices_a_long_unicode_filename_before_clipping_essential_shortcuts() {
+    let mut session = ReviewSession::two_way("old\n", "new\n");
+    session.set_paths(
+        Path::new("/workspace/通知/界界界界界界界界界界界界界界界界界界界界e\u{301}-cancellation-notice.ts"),
+        Path::new("/workspace/revised.ts"),
+    );
+
+    for width in [64, 48, 32] {
+        session.handle(ReviewInput::Resize { width, height: 10 });
+        let footer = row_text(&draw(&session, width, 10), 9);
+        for shortcut in ["[s]", "[q]", "[?]"] {
+            assert!(
+                footer.contains(shortcut),
+                "{shortcut} disappeared at width {width}: {footer}"
+            );
+        }
+        assert!(!footer.contains("/workspace/"));
+    }
+}
+
+#[test]
+fn merge_choice_hints_cannot_displace_save_quit_or_help_on_narrow_terminals() {
+    let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+    session.set_output_path(Path::new("/workspace/cancellation-notice.ts"));
+    for width in [32, 48, 64, 80] {
+        session.handle(ReviewInput::Resize { width, height: 10 });
+        let footer = row_text(&draw(&session, width, 10), 9);
+        for shortcut in ["[s]", "[q]", "[?]"] {
+            assert!(
+                footer.contains(shortcut),
+                "{shortcut} disappeared at width {width}: {footer}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shift_tab_reveals_the_previous_pane_in_a_narrow_merge() {
+    let mut session = ReviewSession::three_way("BASEONLY\n", "OURSONLY\n", "THEIRSONLY\n");
+    session.handle(ReviewInput::Resize {
+        width: 26,
+        height: 8,
+    });
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    let ours = visible_text(&draw(&session, 26, 8));
+    assert_eq!(session.focus(), Pane::Ours);
+    assert!(ours.contains("OURSONLY"));
+    assert!(!ours.contains("Merged result"));
+    assert!(!ours.contains("THEIRSONLY"));
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    let theirs = visible_text(&draw(&session, 26, 8));
+    assert_eq!(session.focus(), Pane::Theirs);
+    assert!(theirs.contains("THEIRSONLY"));
+    assert!(!theirs.contains("Merged result"));
+    assert!(!theirs.contains("OURSONLY"));
+}
+
+#[test]
+fn help_recovers_both_full_paths_when_the_footer_only_shows_a_filename() {
+    let mut session = ReviewSession::two_way("old\n", "new\n");
+    session.set_paths(
+        Path::new("/workspace/first-component/src/notice.ts"),
+        Path::new("/workspace/second-component/src/notice.ts"),
+    );
+    let footer = row_text(&draw(&session, 140, 20), 19);
+    assert!(!footer.contains("/workspace/"));
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('?'),
+        KeyModifiers::NONE,
+    )));
+    let help = visible_text(&draw(&session, 140, 20));
+    assert!(help.contains("/workspace/first-component/src/notice.ts"));
+    assert!(help.contains("/workspace/second-component/src/notice.ts"));
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    )));
+    let closed = visible_text(&draw(&session, 140, 20));
+    assert!(!closed.contains("/workspace/first-component/"));
+    assert!(!closed.contains("/workspace/second-component/"));
+}
+
+#[test]
+fn footer_merge_choices_follow_remaining_conflicts_through_resolution_undo_and_redo() {
+    let mut session = ReviewSession::three_way(
+        "head\nbase-one\nmiddle\nbase-two\ntail\n",
+        "head\nours-one\nmiddle\nours-two\ntail\n",
+        "head\ntheirs-one\nmiddle\ntheirs-two\ntail\n",
+    );
+    assert_eq!(session.unresolved_conflicts(), 2);
+    let initial = row_text(&draw(&session, 180, 12), 11);
+    for shortcut in ["[o]", "[t]", "[b]"] {
+        assert!(
+            initial.contains(shortcut),
+            "missing merge choice {shortcut}: {initial}"
+        );
+    }
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(session.unresolved_conflicts(), 1);
+    let remaining = row_text(&draw(&session, 180, 12), 11);
+    for shortcut in ["[o]", "[t]", "[b]"] {
+        assert!(
+            remaining.contains(shortcut),
+            "remaining conflict lost {shortcut}: {remaining}"
+        );
+    }
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(session.unresolved_conflicts(), 0);
+    let resolved = row_text(&draw(&session, 180, 12), 11);
+    for shortcut in ["[o]", "[t]", "[b]"] {
+        assert!(
+            !resolved.contains(shortcut),
+            "resolved merge still offers {shortcut}: {resolved}"
+        );
+    }
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(session.unresolved_conflicts(), 1);
+    let undone = row_text(&draw(&session, 180, 12), 11);
+    for shortcut in ["[o]", "[t]", "[b]"] {
+        assert!(
+            undone.contains(shortcut),
+            "undo did not restore {shortcut}: {undone}"
+        );
+    }
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(session.unresolved_conflicts(), 0);
+    let redone = row_text(&draw(&session, 180, 12), 11);
+    for shortcut in ["[o]", "[t]", "[b]"] {
+        assert!(
+            !redone.contains(shortcut),
+            "redo retained {shortcut}: {redone}"
+        );
+    }
+}
+
+#[test]
+fn footer_insert_mode_offers_escape_instead_of_letter_commands_that_would_insert_text() {
+    let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('i'),
+        KeyModifiers::NONE,
+    )));
+    let editing = row_text(&draw(&session, 180, 12), 11);
+    assert!(editing.contains("[Esc]"));
+    for shortcut in ["[o]", "[t]", "[b]", "[s]", "[q]", "[u]"] {
+        assert!(
+            !editing.contains(shortcut),
+            "insert mode advertises review command {shortcut}"
+        );
+    }
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('s'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(session.pane_text(Pane::Result), "sours\n");
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    )));
+    let reviewing = row_text(&draw(&session, 180, 12), 11);
+    assert!(reviewing.contains("[s]"));
+    assert!(!reviewing.contains("[Esc]"));
+}
+
+#[test]
+fn header_distinguishes_insert_mode_and_restores_review_styling_on_escape() {
+    let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+    let initial = draw(&session, 120, 10);
+    let review_column = row_text(&initial, 0).find("REVIEW").unwrap() as u16;
+    let review_style = initial[(review_column, 0)].style();
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('i'),
+        KeyModifiers::NONE,
+    )));
+    assert!(session.is_editing());
+    let editing = draw(&session, 120, 10);
+    let insert_column = row_text(&editing, 0).find("INSERT").unwrap() as u16;
+    let insert_style = editing[(insert_column, 0)].style();
+    assert_ne!(insert_style, review_style);
+    assert_ne!(
+        editing[(insert_column, 0)].fg,
+        editing[(insert_column, 0)].bg
+    );
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    )));
+    assert!(!session.is_editing());
+    let restored = draw(&session, 120, 10);
+    let restored_column = row_text(&restored, 0).find("REVIEW").unwrap() as u16;
+    assert_eq!(restored[(restored_column, 0)].style(), review_style);
+}
+
+#[test]
+fn header_emphasises_modified_state_without_conflating_it_with_insert_mode() {
+    let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+    let initial = draw(&session, 120, 10);
+    let clean_column = row_text(&initial, 0).find("clean").unwrap() as u16;
+    let clean_style = initial[(clean_column, 0)].style();
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('i'),
+        KeyModifiers::NONE,
+    )));
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('X'),
+        KeyModifiers::NONE,
+    )));
+    assert!(session.is_dirty());
+    let changed = draw(&session, 120, 10);
+    let header = row_text(&changed, 0);
+    let modified_column = header.find("modified").unwrap() as u16;
+    let insert_column = header.find("INSERT").unwrap() as u16;
+    let modified_style = changed[(modified_column, 0)].style();
+    assert_ne!(modified_style, clean_style);
+    assert_ne!(modified_style, changed[(insert_column, 0)].style());
+    assert_ne!(
+        changed[(modified_column, 0)].fg,
+        changed[(modified_column, 0)].bg
+    );
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    )));
+    let reviewing = draw(&session, 120, 10);
+    let modified_column = row_text(&reviewing, 0).find("modified").unwrap() as u16;
+    assert_eq!(reviewing[(modified_column, 0)].style(), modified_style);
+}
+
 #[test]
 fn unequal_height_replacement_keeps_each_pane_continuous_and_joins_changed_regions() {
     let session = ReviewSession::two_way("head\nA-old\nB-old\nend\n", "head\nC-new\nend\n");
@@ -52,6 +347,60 @@ fn unequal_height_replacement_keeps_each_pane_continuous_and_joins_changed_regio
             .any(|cell| matches!(cell.symbol(), "▀" | "▄"))
     );
     assert_ne!(buffer[(b_x + 12, b_y)].bg, buffer[(b_x + 12, b_y + 1)].bg);
+}
+
+#[test]
+fn connector_edges_do_not_extend_unequal_replacements_into_unchanged_lines() {
+    let short = "head\nOLD\ntail\n";
+    let long = "head\nNEW1\nNEW2\nNEW3\nNEW4\nNEW5\ntail\n";
+    for (left, right, left_rows, right_rows) in
+        [(short, long, 3..4, 3..8), (long, short, 3..8, 3..4)]
+    {
+        let session = ReviewSession::two_way(left, right);
+        let buffer = draw(&session, 80, 12);
+        let (left_edge, _) = cell_at(&buffer, "»");
+        let (right_edge, _) = cell_at(&buffer, "«");
+        for (x, changed_rows) in [(left_edge, left_rows), (right_edge, right_rows)] {
+            let rail = buffer[(x, 2)].bg;
+            for y in 3..10 {
+                if changed_rows.contains(&y) {
+                    continue;
+                }
+                let cell = &buffer[(x, y)];
+                assert_eq!(
+                    cell.bg, rail,
+                    "connector spills into unchanged row {y} at {x}"
+                );
+                assert!(
+                    !matches!(cell.symbol(), "▀" | "▄"),
+                    "connector half-block spills into unchanged row {y} at {x}",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn connector_edges_follow_changed_lines_after_an_earlier_insertion() {
+    let session = ReviewSession::two_way(
+        "head\nsame\nkeep\nOLD\ntail\n",
+        "head\none\ntwo\nthree\nfour\nfive\nsame\nkeep\nNEW\ntail\n",
+    );
+    let buffer = draw(&session, 80, 15);
+    let (left_edge, _) = cell_at(&buffer, "»");
+    let (right_edge, _) = cell_at(&buffer, "«");
+    for (x, y) in [(left_edge, 6), (right_edge, 9)] {
+        let rail = buffer[(x, 2)].bg;
+        let cell = &buffer[(x, y)];
+        assert_eq!(
+            cell.bg, rail,
+            "connector reaches an unchanged line at ({x}, {y})"
+        );
+        assert!(
+            !matches!(cell.symbol(), "▀" | "▄"),
+            "connector half-block reaches an unchanged line at ({x}, {y})",
+        );
+    }
 }
 
 #[test]
@@ -104,6 +453,144 @@ fn unresolved_merge_shades_both_sources_and_result_differently_from_resolved_mer
         .unwrap();
     assert_ne!(unresolved_bg, resolved[(resolved_x, resolved_y)].bg);
     assert_eq!(session.unresolved_conflicts(), 0);
+}
+
+#[test]
+fn accepting_a_source_removes_its_gutter_controls_and_click_targets() {
+    for (choice, accepted, expected) in [
+        ('o', "»↗↘", "head\nours\ntail\n"),
+        ('t', "«↖↙", "head\ntheirs\ntail\n"),
+        ('b', "»«↗↘↖↙", "head\nours\ntheirs\ntail\n"),
+    ] {
+        let mut session = ReviewSession::three_way(
+            "head\nbase\ntail\n",
+            "head\nours\ntail\n",
+            "head\ntheirs\ntail\n",
+        );
+        session.handle(ReviewInput::Resize {
+            width: 120,
+            height: 20,
+        });
+        let initial = draw(&session, 120, 20);
+        let targets: Vec<_> = ["»", "«"]
+            .into_iter()
+            .filter(|symbol| accepted.contains(*symbol))
+            .map(|symbol| (symbol, cell_at(&initial, symbol)))
+            .collect();
+        session.handle(ReviewInput::Key(KeyEvent::new(
+            KeyCode::Char(choice),
+            KeyModifiers::NONE,
+        )));
+        let resolved = draw(&session, 120, 20);
+        let controls = gutter_controls(&resolved);
+        assert!(
+            !controls.chars().any(|symbol| accepted.contains(symbol)),
+            "accepted source still has controls: {controls}"
+        );
+        for (symbol, (x, y)) in targets {
+            let inner_x = if symbol == "»" { x + 1 } else { x - 1 };
+            for column in [x, inner_x] {
+                session.handle(ReviewInput::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                assert_eq!(session.pane_text(Pane::Result), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_remaining_source_offers_insertion_below_without_an_above_control() {
+    for (choice, below, expected) in [
+        ('o', "↙", "head\nours\ntheirs\ntail\n"),
+        ('t', "↘", "head\ntheirs\nours\ntail\n"),
+    ] {
+        let mut session = ReviewSession::three_way(
+            "head\nbase\ntail\n",
+            "head\nours\ntail\n",
+            "head\ntheirs\ntail\n",
+        );
+        session.handle(ReviewInput::Resize {
+            width: 120,
+            height: 20,
+        });
+        session.handle(ReviewInput::Key(KeyEvent::new(
+            KeyCode::Char(choice),
+            KeyModifiers::NONE,
+        )));
+        let buffer = draw(&session, 120, 20);
+        let controls = gutter_controls(&buffer);
+        assert!(
+            !controls.contains(['↗', '↖']),
+            "insert-above controls are still visible: {controls}"
+        );
+        let (column, row) = cell_at(&buffer, below);
+        session.handle(ReviewInput::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(session.pane_text(Pane::Result), expected);
+    }
+}
+
+#[test]
+fn inserting_the_remaining_source_consumes_its_control_and_undo_restores_it() {
+    let mut session = ReviewSession::three_way(
+        "head\nbase\ntail\n",
+        "head\nours\ntail\n",
+        "head\ntheirs\ntail\n",
+    );
+    session.handle(ReviewInput::Resize {
+        width: 120,
+        height: 20,
+    });
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::NONE,
+    )));
+    let before = draw(&session, 120, 20);
+    let (column, row) = cell_at(&before, "↙");
+    session.handle(ReviewInput::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }));
+    assert_eq!(
+        session.pane_text(Pane::Result),
+        "head\nours\ntheirs\ntail\n"
+    );
+    assert_eq!(gutter_controls(&draw(&session, 120, 20)), "");
+    session.handle(ReviewInput::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }));
+    assert_eq!(
+        session.pane_text(Pane::Result),
+        "head\nours\ntheirs\ntail\n"
+    );
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(session.pane_text(Pane::Result), "head\nours\ntail\n");
+    assert_eq!(gutter_controls(&draw(&session, 120, 20)), "↙");
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('r'),
+        KeyModifiers::CONTROL,
+    )));
+    assert_eq!(
+        session.pane_text(Pane::Result),
+        "head\nours\ntheirs\ntail\n"
+    );
+    assert_eq!(gutter_controls(&draw(&session, 120, 20)), "");
 }
 
 #[test]

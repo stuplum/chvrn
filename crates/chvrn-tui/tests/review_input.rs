@@ -45,11 +45,52 @@ fn click_gutter_control(session: &mut ReviewSession, symbol: &str) -> ReviewOutc
 }
 
 #[test]
-fn gutter_insertion_places_the_opposite_block_above_or_below_the_chosen_block() {
+fn shift_tab_cycles_backwards_and_wraps_in_three_way_review() {
+    for event in [
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+    ] {
+        let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+        assert_eq!(session.focus(), Pane::Result);
+        for expected in [Pane::Ours, Pane::Theirs, Pane::Result] {
+            session.handle(ReviewInput::Key(event));
+            assert_eq!(
+                session.focus(),
+                expected,
+                "incorrect reverse focus for {event:?}"
+            );
+        }
+        key(&mut session, KeyCode::Tab);
+        assert_eq!(session.focus(), Pane::Theirs);
+        session.handle(ReviewInput::Key(event));
+        assert_eq!(session.focus(), Pane::Result);
+    }
+}
+
+#[test]
+fn shift_tab_wraps_between_both_panes_in_two_way_review() {
+    let mut session = ReviewSession::two_way("left\n", "right\n");
+    for expected in [Pane::Right, Pane::Left] {
+        session.handle(ReviewInput::Key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(session.focus(), expected);
+    }
+    key(&mut session, KeyCode::Tab);
+    assert_eq!(session.focus(), Pane::Right);
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    assert_eq!(session.focus(), Pane::Left);
+}
+
+#[test]
+fn gutter_insertion_places_the_opposite_block_below_the_chosen_block() {
     for (choice, symbol, expected) in [
-        ('o', "↖", "head\ntheirs\nours-a\nours-b\ntail\n"),
         ('o', "↙", "head\nours-a\nours-b\ntheirs\ntail\n"),
-        ('t', "↗", "head\nours-a\nours-b\ntheirs\ntail\n"),
         ('t', "↘", "head\ntheirs\nours-a\nours-b\ntail\n"),
     ] {
         let mut session = ReviewSession::three_way(
@@ -138,11 +179,11 @@ fn gutter_insertion_leaves_later_conflicts_unresolved_and_targetable() {
     assert_eq!(session.unresolved_conflicts(), 2);
     key(&mut session, KeyCode::Char('t'));
 
-    click_gutter_control(&mut session, "↗");
+    click_gutter_control(&mut session, "↘");
 
     assert_eq!(
         session.pane_text(Pane::Result),
-        "head\nλours-one-a\nours-one-b\ntheirs-one\nkeep\nstay\nours-two\ntail\n"
+        "head\ntheirs-one\nλours-one-a\nours-one-b\nkeep\nstay\nours-two\ntail\n"
     );
     assert_eq!(session.unresolved_conflicts(), 1);
     assert!(matches!(
@@ -157,14 +198,14 @@ fn gutter_insertion_leaves_later_conflicts_unresolved_and_targetable() {
 
     assert_eq!(
         session.pane_text(Pane::Result),
-        "head\nλours-one-a\nours-one-b\ntheirs-one\nkeep\nstay\ntheirs-two-a\ntheirs-two-b\ntail\n"
+        "head\ntheirs-one\nλours-one-a\nours-one-b\nkeep\nstay\ntheirs-two-a\ntheirs-two-b\ntail\n"
     );
     assert_eq!(session.unresolved_conflicts(), 0);
     assert!(matches!(
         key(&mut session, KeyCode::Char('s')),
         ReviewOutcome::Submitted(submission)
             if submission.result.as_deref() == Some(
-                "head\nλours-one-a\nours-one-b\ntheirs-one\nkeep\nstay\ntheirs-two-a\ntheirs-two-b\ntail\n"
+                "head\ntheirs-one\nλours-one-a\nours-one-b\nkeep\nstay\ntheirs-two-a\ntheirs-two-b\ntail\n"
             )
     ));
 }
@@ -201,7 +242,7 @@ fn gutter_insertion_preserves_manual_edits_to_the_result() {
 fn gutter_insertion_can_restore_code_after_choosing_a_deletion() {
     for (ours, theirs, choice, symbol) in [
         ("head\ntail\n", "head\ntheirs\ntail\n", 'o', "↙"),
-        ("head\ntheirs\ntail\n", "head\ntail\n", 't', "↗"),
+        ("head\ntheirs\ntail\n", "head\ntail\n", 't', "↘"),
     ] {
         let mut session = ReviewSession::three_way("head\nbase\ntail\n", ours, theirs);
         key(&mut session, KeyCode::Char(choice));
@@ -641,6 +682,71 @@ fn undoing_a_conflict_choice_restores_unresolved_merge_state() {
     );
     ctrl_r(&mut session);
     assert_eq!(session.pane_text(Pane::Result), "theirs\n");
+    assert_eq!(session.unresolved_conflicts(), 0);
+}
+
+#[test]
+fn undoing_a_deletion_choice_restores_all_four_conflicts_and_their_controls() {
+    let base = "head\nbase-one\nkeep-one\nstay-one\nbase-two\nkeep-two\nstay-two\ndeleted\nkeep-three\nstay-three\nbase-four\ntail\n";
+    let ours = "head\nours-one\nkeep-one\nstay-one\nours-two\nkeep-two\nstay-two\nkeep-three\nstay-three\nours-four\ntail\n";
+    let theirs = "head\ntheirs-one\nkeep-one\nstay-one\ntheirs-two\nkeep-two\nstay-two\nedited\nkeep-three\nstay-three\ntheirs-four\ntail\n";
+    let mut session = ReviewSession::three_way(base, ours, theirs);
+    assert_eq!(session.unresolved_conflicts(), 4);
+    key(&mut session, KeyCode::Char(']'));
+    key(&mut session, KeyCode::Char(']'));
+    key(&mut session, KeyCode::Char('o'));
+    assert_eq!(session.unresolved_conflicts(), 3);
+    assert_eq!(session.pane_text(Pane::Result), ours);
+
+    key(&mut session, KeyCode::Char('u'));
+    assert_eq!(
+        key(&mut session, KeyCode::Char('s')),
+        ReviewOutcome::UnresolvedConflicts(4),
+    );
+    assert_eq!(session.pane_text(Pane::Result), ours);
+    let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|frame| session.render(frame)).unwrap();
+    let controls = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .filter(|cell| matches!(cell.symbol(), "»" | "«"))
+        .count();
+    assert_eq!(controls, 8);
+
+    ctrl_r(&mut session);
+    assert_eq!(session.unresolved_conflicts(), 3);
+    assert_eq!(session.pane_text(Pane::Result), ours);
+    key(&mut session, KeyCode::Char('u'));
+    assert_eq!(session.unresolved_conflicts(), 4);
+}
+
+#[test]
+fn undoing_a_deletion_choice_preserves_an_earlier_text_changing_resolution() {
+    let base = "head\nbase-one\nkeep\nstay\ndeleted\ntail\n";
+    let ours = "head\nours-one\nkeep\nstay\ntail\n";
+    let theirs = "head\ntheirs-one\nkeep\nstay\nedited\ntail\n";
+    let first_resolved = "head\ntheirs-one\nkeep\nstay\ntail\n";
+    let mut session = ReviewSession::three_way(base, ours, theirs);
+    key(&mut session, KeyCode::Char('t'));
+    assert_eq!(session.pane_text(Pane::Result), first_resolved);
+    assert_eq!(session.unresolved_conflicts(), 1);
+    key(&mut session, KeyCode::Char('o'));
+    assert_eq!(session.unresolved_conflicts(), 0);
+
+    key(&mut session, KeyCode::Char('u'));
+    assert_eq!(session.pane_text(Pane::Result), first_resolved);
+    assert_eq!(session.unresolved_conflicts(), 1);
+    key(&mut session, KeyCode::Char('u'));
+    assert_eq!(session.pane_text(Pane::Result), ours);
+    assert_eq!(session.unresolved_conflicts(), 2);
+
+    ctrl_r(&mut session);
+    assert_eq!(session.pane_text(Pane::Result), first_resolved);
+    assert_eq!(session.unresolved_conflicts(), 1);
+    ctrl_r(&mut session);
+    assert_eq!(session.pane_text(Pane::Result), first_resolved);
     assert_eq!(session.unresolved_conflicts(), 0);
 }
 

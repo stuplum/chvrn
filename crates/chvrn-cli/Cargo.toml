@@ -1,0 +1,24 @@
+[package]
+name = "chvrn-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "chvrn"
+path = "src/main.rs"
+
+[dependencies]
+chvrn-core.workspace = true
+chvrn-git.workspace = true
+chvrn-tui.workspace = true
+chvrn-integrations.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+notify.workspace = true
+tempfile.workspace = true
+unicode-segmentation.workspace = true
+url.workspace = true

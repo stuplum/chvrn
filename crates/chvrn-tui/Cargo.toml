@@ -1,0 +1,12 @@
+[package]
+name = "chvrn-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chvrn-core.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true

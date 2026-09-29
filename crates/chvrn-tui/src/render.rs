@@ -1,0 +1,1066 @@
+use chvrn_core::{merge::ConflictId, structural::HighlightKind};
+use ratatui::{
+    Frame,
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Clear, Paragraph},
+};
+use std::borrow::Cow;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
+use crate::{
+    Pane,
+    session::{ChangeBand, ChangeKind, Mode, ReviewSession, ViewLine},
+    text,
+};
+
+#[derive(Clone, Copy)]
+pub(crate) struct MouseHit {
+    pub(crate) pane: Pane,
+    pub(crate) row: usize,
+    pub(crate) column: usize,
+    pub(crate) gutter: bool,
+    pub(crate) action: Option<GutterAction>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum InsertionPosition {
+    Before,
+    After,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum GutterAction {
+    ApplyChoice {
+        hunk: usize,
+    },
+    InsertResolved {
+        id: ConflictId,
+        position: InsertionPosition,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct PositionedAction {
+    x: u16,
+    y: u16,
+    symbol: &'static str,
+    hit: MouseHit,
+}
+
+#[derive(Clone, Copy)]
+struct PaneArea {
+    pane: Pane,
+    outer: Rect,
+    content: Rect,
+    gutter: u16,
+    overview_x: u16,
+}
+
+#[derive(Clone, Copy)]
+struct Connector {
+    area: Rect,
+    left: Pane,
+    right: Pane,
+}
+
+const SURFACE: Color = Color::Rgb(25, 27, 30);
+const HEADING: Color = Color::Rgb(34, 37, 41);
+const RAIL: Color = Color::Rgb(21, 23, 27);
+const INK: Color = Color::Rgb(199, 204, 209);
+const MUTED: Color = Color::Rgb(108, 115, 122);
+const CONNECTOR_WIDTH: u16 = 5;
+
+pub(crate) fn visible_pane_count(session: &ReviewSession, width: u16) -> usize {
+    match (&session.mode, width) {
+        (Mode::TwoWay { .. }, width) if width < 48 => 1,
+        (Mode::ThreeWay { .. }, width) if width < 75 => 1,
+        (Mode::TwoWay { .. }, _) => 2,
+        (Mode::ThreeWay { .. }, _) => 3,
+    }
+}
+
+fn pane_areas(session: &ReviewSession, area: Rect) -> ([PaneArea; 3], [Connector; 2], usize) {
+    let body = Rect::new(
+        area.x,
+        area.y.saturating_add(2),
+        area.width,
+        area.height.saturating_sub(3),
+    );
+    let count = visible_pane_count(session, area.width);
+    let available = body
+        .width
+        .saturating_sub(CONNECTOR_WIDTH * (count as u16 - 1));
+    let panes = match (&session.mode, count) {
+        (_, 1) => [session.focus; 3],
+        (Mode::TwoWay { .. }, _) => [Pane::Left, Pane::Right, Pane::Right],
+        (Mode::ThreeWay { .. }, _) => [Pane::Ours, Pane::Result, Pane::Theirs],
+    };
+    let areas = std::array::from_fn(|index| {
+        let slot = index.min(count);
+        let start_offset = (u32::from(available) * slot as u32 / count as u32
+            + u32::from(CONNECTOR_WIDTH) * slot as u32)
+            .min(u32::from(body.width)) as u16;
+        let end_offset = if index >= count {
+            start_offset
+        } else {
+            (u32::from(available) * (slot as u32 + 1) / count as u32
+                + u32::from(CONNECTOR_WIDTH) * slot as u32)
+                .min(u32::from(body.width)) as u16
+        };
+        let outer = Rect::new(
+            body.x.saturating_add(start_offset),
+            body.y,
+            end_offset - start_offset,
+            body.height,
+        );
+        let gutter = outer.width.saturating_sub(2).min(5);
+        let content = Rect::new(
+            outer.x.saturating_add(gutter),
+            outer.y,
+            outer.width.saturating_sub(gutter + 1),
+            outer.height,
+        );
+        PaneArea {
+            pane: panes[index],
+            outer,
+            content,
+            gutter,
+            overview_x: outer.x.saturating_add(outer.width.saturating_sub(1)),
+        }
+    });
+    let connectors = std::array::from_fn(|index| Connector {
+        area: Rect::new(
+            areas[index].outer.right(),
+            body.y,
+            CONNECTOR_WIDTH,
+            body.height,
+        ),
+        left: panes[index],
+        right: panes[index + 1],
+    });
+    (areas, connectors, count)
+}
+
+impl ReviewSession {
+    pub(crate) fn pane_content_width(&self, pane: Pane) -> usize {
+        let (panes, _, count) = pane_areas(self, Rect::new(0, 0, self.width, self.height));
+        panes
+            .iter()
+            .take(count)
+            .find(|area| area.pane == pane)
+            .map_or(0, |area| usize::from(area.content.width))
+    }
+
+    pub fn render(&self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let mode = match &self.mode {
+            Mode::TwoWay { .. } => "DIFF",
+            Mode::ThreeWay { .. } => "MERGE",
+        };
+        let language = if self.pane(self.focus).language.is_some() {
+            "syntax"
+        } else {
+            "plain text"
+        };
+        let header = format!(
+            "chvrn  {mode}  {}  {}  {:?}  {language}",
+            if self.editing { "INSERT" } else { "REVIEW" },
+            if self.changed { "modified" } else { "clean" },
+            self.whitespace
+        );
+        frame
+            .buffer_mut()
+            .set_style(area, Style::default().fg(INK).bg(SURFACE));
+        frame.buffer_mut().set_style(
+            Rect::new(area.x, area.y, area.width, 1),
+            Style::default().fg(MUTED).bg(HEADING),
+        );
+        frame.buffer_mut().set_stringn(
+            area.x.saturating_add(1),
+            area.y,
+            header,
+            usize::from(area.width.saturating_sub(1)),
+            Style::default().fg(Color::Rgb(170, 187, 202)).bg(HEADING),
+        );
+        let (panes, connectors, count) = pane_areas(self, area);
+        if area.height > 1 {
+            for pane_area in panes.iter().take(count) {
+                frame.buffer_mut().set_style(
+                    Rect::new(pane_area.outer.x, area.y + 1, pane_area.outer.width, 1),
+                    Style::default().bg(HEADING),
+                );
+                let style = Style::default()
+                    .fg(if pane_area.pane == self.focus {
+                        INK
+                    } else {
+                        MUTED
+                    })
+                    .bg(HEADING);
+                if pane_area.pane == self.focus {
+                    frame
+                        .buffer_mut()
+                        .set_stringn(pane_area.outer.x, area.y + 1, "▸", 1, style);
+                }
+                frame.buffer_mut().set_stringn(
+                    pane_area.outer.x.saturating_add(2),
+                    area.y + 1,
+                    pane_name(pane_area.pane),
+                    usize::from(pane_area.outer.width.saturating_sub(2)),
+                    style,
+                );
+            }
+        }
+        for pane_area in panes.iter().take(count) {
+            self.render_pane(frame, pane_area);
+        }
+        if !self.local_pending {
+            for connector in connectors.iter().take(count - 1) {
+                self.render_connector(frame, connector);
+            }
+        }
+        if area.height >= 2 {
+            let footer = if self.confirming_discard {
+                Cow::Borrowed("Unsaved changes. y discards and quits; any other key returns")
+            } else if self.refresh_conflict {
+                Cow::Borrowed(
+                    "External changes conflict with local edits. R discards local edits and reloads; submit is blocked",
+                )
+            } else if self.local_pending {
+                Cow::Borrowed(
+                    "Updating edited diff; hunk apply and submit wait for the latest alignment",
+                )
+            } else if self.message.is_empty() {
+                Cow::Borrowed(
+                    "[ ] hunks  »/« choose  diagonals add  i edit  u undo  Ctrl-R redo  ? help  s submit  q quit",
+                )
+            } else {
+                Cow::Borrowed(self.message.as_str())
+            };
+            frame.buffer_mut().set_stringn(
+                area.x,
+                area.y + area.height - 1,
+                footer,
+                usize::from(area.width),
+                Style::default().fg(Color::Rgb(202, 182, 130)).bg(HEADING),
+            );
+        }
+        if self.help {
+            self.render_help(frame);
+        }
+    }
+
+    fn render_pane(&self, frame: &mut Frame<'_>, pane_area: &PaneArea) {
+        let pane = pane_area.pane;
+        if pane_area.content.width == 0 || pane_area.content.height == 0 {
+            return;
+        }
+        if self.local_pending {
+            self.render_pending_pane(frame, pane_area);
+            return;
+        }
+        let view = self.pane(pane);
+        for offset in 0..usize::from(pane_area.content.height) {
+            let Some(row_index) = self.pane_row(pane, offset) else {
+                break;
+            };
+            let Some(line) = self.rows.get(row_index).and_then(|row| row.line(pane)) else {
+                continue;
+            };
+            let projection_index = self.pane_top(pane) + offset;
+            let region = self.pane_region(pane, projection_index);
+            let background = region.map_or(SURFACE, |(kind, selected)| {
+                region_color(kind, pane, selected)
+            });
+            let y = pane_area.content.y + offset as u16;
+            frame.buffer_mut().set_style(
+                Rect::new(
+                    pane_area.outer.x,
+                    y,
+                    pane_area.outer.width.saturating_sub(1),
+                    1,
+                ),
+                Style::default().fg(INK).bg(background),
+            );
+            render_line_number(
+                frame.buffer_mut(),
+                pane_area.outer.x,
+                y,
+                pane_area.gutter,
+                line.number + 1,
+                background,
+            );
+            let horizontal = *self.horizontal.get(&pane).unwrap_or(&0);
+            render_line(
+                frame.buffer_mut(),
+                pane_area.content,
+                y,
+                line,
+                &view.syntax,
+                horizontal,
+                background,
+                region.map(|(kind, _)| kind),
+            );
+            if row_index == self.aligned_row && pane == self.focus {
+                if let Some(x) = cursor_cell(pane_area.content, Some(line), self.column, horizontal)
+                {
+                    let cell = &mut frame.buffer_mut()[(x, y)];
+                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+        self.render_overview(frame.buffer_mut(), pane_area);
+    }
+
+    fn render_pending_pane(&self, frame: &mut Frame<'_>, pane_area: &PaneArea) {
+        let pane = pane_area.pane;
+        let source = &self.pane(pane).buffer;
+        for line_index in 0..usize::from(pane_area.content.height) {
+            let number = self.scroll + line_index;
+            let Some(start) = source.line_to_char(number) else {
+                break;
+            };
+            let end = source
+                .line_to_char(number + 1)
+                .unwrap_or(source.len_chars());
+            let y = pane_area.content.y + line_index as u16;
+            render_line_number(
+                frame.buffer_mut(),
+                pane_area.outer.x,
+                y,
+                pane_area.gutter,
+                number + 1,
+                SURFACE,
+            );
+            let cursor = (pane == self.focus && number == self.aligned_row)
+                .then_some(source.cursor().clamp(start, end));
+            let first = cursor.map_or(start, |cursor| start.max(cursor.saturating_sub(64)));
+            let mut last = end.min(first.saturating_add(512));
+            let snippet = loop {
+                match source.slice_chars(first..last) {
+                    Ok(snippet) => break snippet,
+                    Err(_) if last > first => last -= 1,
+                    Err(_) => break String::new(),
+                }
+            };
+            let mut snippet = snippet;
+            while snippet.ends_with('\n') || snippet.ends_with('\r') {
+                snippet.pop();
+            }
+            let clipped = first > start;
+            let mut content = pane_area.content;
+            if clipped && content.width > 0 {
+                frame.buffer_mut().set_string(
+                    content.x,
+                    y,
+                    "‹",
+                    Style::default().fg(MUTED).bg(SURFACE),
+                );
+                content.x += 1;
+                content.width -= 1;
+            }
+            let line = ViewLine::new(number, snippet, 0);
+            render_line(frame.buffer_mut(), content, y, &line, &[], 0, SURFACE, None);
+            if let Some(cursor) = cursor {
+                let relative = cursor.saturating_sub(first).min(line.text.chars().count());
+                let column = text::grapheme_column(&line.text, relative);
+                if let Some(x) = cursor_cell(content, Some(&line), column, 0) {
+                    let cell = &mut frame.buffer_mut()[(x, y)];
+                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+        self.render_overview(frame.buffer_mut(), pane_area);
+    }
+
+    fn pane_region(&self, pane: Pane, index: usize) -> Option<(ChangeKind, bool)> {
+        let pairs: &[(Pane, Pane)] = match &self.mode {
+            Mode::TwoWay { .. } => &[(Pane::Left, Pane::Right)],
+            Mode::ThreeWay { .. } => &[(Pane::Ours, Pane::Result), (Pane::Result, Pane::Theirs)],
+        };
+        pairs
+            .iter()
+            .filter(|(left, right)| pane == *left || pane == *right)
+            .filter_map(|(left, right)| {
+                band_at(self.change_bands(*left, *right), index, pane == *left)
+            })
+            .max_by_key(|band| kind_priority(band.kind))
+            .map(|band| {
+                (
+                    band.kind,
+                    band.hunk.is_some_and(|hunk| self.selected == Some(hunk)),
+                )
+            })
+    }
+
+    fn overview_region(&self, pane: Pane, first: usize, end: usize) -> Option<ChangeKind> {
+        let pairs: &[(Pane, Pane)] = match &self.mode {
+            Mode::TwoWay { .. } => &[(Pane::Left, Pane::Right)],
+            Mode::ThreeWay { .. } => &[(Pane::Ours, Pane::Result), (Pane::Result, Pane::Theirs)],
+        };
+        pairs
+            .iter()
+            .filter(|(left, right)| pane == *left || pane == *right)
+            .filter_map(|(left, right)| {
+                band_in_range(self.change_bands(*left, *right), first, end, pane == *left)
+            })
+            .max_by_key(|band| kind_priority(band.kind))
+            .map(|band| band.kind)
+    }
+
+    fn render_overview(&self, buffer: &mut Buffer, pane_area: &PaneArea) {
+        let height = usize::from(pane_area.outer.height);
+        if height == 0 {
+            return;
+        }
+        let pane = pane_area.pane;
+        let total = if self.local_pending {
+            self.pane(pane).buffer.line_count()
+        } else {
+            self.projected_rows(pane).len()
+        };
+        let top = if self.local_pending {
+            self.scroll
+        } else {
+            self.pane_top(pane)
+        };
+        for offset in 0..height {
+            let first = total.saturating_mul(offset).saturating_add(height - 1) / height;
+            let end = total.saturating_mul(offset + 1).saturating_add(height - 1) / height;
+            let kind = if !self.local_pending && end > first {
+                self.overview_region(pane, first, end)
+            } else {
+                None
+            };
+            let in_viewport = end > first && first < top.saturating_add(height) && end > top;
+            let y = pane_area.outer.y + offset as u16;
+            let (symbol, color) = if let Some(kind) = kind {
+                ("▐", band_color(kind))
+            } else if in_viewport {
+                ("│", Color::Rgb(91, 110, 125))
+            } else {
+                ("│", Color::Rgb(47, 51, 57))
+            };
+            buffer.set_string(
+                pane_area.overview_x,
+                y,
+                symbol,
+                Style::default().fg(color).bg(RAIL),
+            );
+        }
+    }
+
+    fn render_connector(&self, frame: &mut Frame<'_>, connector: &Connector) {
+        if connector.area.width == 0 || connector.area.height == 0 {
+            return;
+        }
+        frame
+            .buffer_mut()
+            .set_style(connector.area, Style::default().fg(MUTED).bg(RAIL));
+        let left_top = self.pane_top(connector.left);
+        let right_top = self.pane_top(connector.right);
+        let height = usize::from(connector.area.height);
+        let bands = self.change_bands(connector.left, connector.right);
+        let first =
+            bands.partition_point(|band| band.left.end < left_top && band.right.end < right_top);
+        let bands = &bands[first..];
+        let end = bands.partition_point(|band| {
+            band.left.start <= left_top.saturating_add(height)
+                || band.right.start <= right_top.saturating_add(height)
+        });
+        let bands = &bands[..end];
+        for band in bands {
+            draw_connector_band(
+                frame.buffer_mut(),
+                connector.area,
+                band,
+                left_top,
+                right_top,
+            );
+        }
+        let action_bands = self.action_bands(connector.left, connector.right);
+        for band in action_bands.iter().rev() {
+            for source in [connector.right, connector.left] {
+                for action in self
+                    .band_actions(connector, band, source)
+                    .into_iter()
+                    .rev()
+                    .flatten()
+                {
+                    frame.buffer_mut().set_string(
+                        action.x,
+                        action.y,
+                        action.symbol,
+                        Style::default()
+                            .fg(Color::Rgb(225, 220, 188))
+                            .bg(band_color(band.kind))
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+            }
+        }
+    }
+
+    fn band_actions(
+        &self,
+        connector: &Connector,
+        band: &ChangeBand,
+        source: Pane,
+    ) -> [Option<PositionedAction>; 2] {
+        if self.local_pending {
+            return [None, None];
+        }
+        let Some((edge_x, y, row)) = self.band_action_anchor(connector, band, source) else {
+            return [None, None];
+        };
+        let hit = |action| MouseHit {
+            pane: source,
+            row,
+            column: 0,
+            gutter: true,
+            action: Some(action),
+        };
+        let choice = matches!(
+            (&self.mode, connector.left, connector.right, source),
+            (
+                Mode::TwoWay { .. },
+                Pane::Left,
+                Pane::Right,
+                Pane::Left | Pane::Right
+            ) | (Mode::ThreeWay { .. }, Pane::Ours, Pane::Result, Pane::Ours)
+                | (
+                    Mode::ThreeWay { .. },
+                    Pane::Result,
+                    Pane::Theirs,
+                    Pane::Theirs
+                )
+        ) && band.hunk.is_some();
+        if choice {
+            let hunk = band.hunk.expect("choice action must identify its hunk");
+            let symbol = if source == connector.left { "»" } else { "«" };
+            return [
+                Some(PositionedAction {
+                    x: edge_x,
+                    y,
+                    symbol,
+                    hit: hit(GutterAction::ApplyChoice { hunk }),
+                }),
+                None,
+            ];
+        }
+        let Some(id) = band.resolved else {
+            return [None, None];
+        };
+        let resolved_source = matches!(
+            (connector.left, connector.right, source),
+            (Pane::Ours, Pane::Result, Pane::Ours) | (Pane::Result, Pane::Theirs, Pane::Theirs)
+        );
+        if !resolved_source {
+            return [None, None];
+        }
+        let Mode::ThreeWay { resolved, .. } = &self.mode else {
+            return [None, None];
+        };
+        let source_is_empty = resolved
+            .iter()
+            .find(|region| region.id == id)
+            .is_none_or(|region| {
+                if source == Pane::Ours {
+                    region.ours.is_empty()
+                } else {
+                    region.theirs.is_empty()
+                }
+            });
+        if source_is_empty {
+            return [None, None];
+        }
+        let inward_x = if source == connector.left {
+            edge_x.saturating_add(1)
+        } else {
+            edge_x.saturating_sub(1)
+        };
+        let (before, after) = if source == connector.left {
+            ("↗", "↘")
+        } else {
+            ("↖", "↙")
+        };
+        [
+            Some(PositionedAction {
+                x: edge_x,
+                y,
+                symbol: before,
+                hit: hit(GutterAction::InsertResolved {
+                    id,
+                    position: InsertionPosition::Before,
+                }),
+            }),
+            Some(PositionedAction {
+                x: inward_x,
+                y,
+                symbol: after,
+                hit: hit(GutterAction::InsertResolved {
+                    id,
+                    position: InsertionPosition::After,
+                }),
+            }),
+        ]
+    }
+
+    fn band_action_anchor(
+        &self,
+        connector: &Connector,
+        band: &ChangeBand,
+        source: Pane,
+    ) -> Option<(u16, u16, usize)> {
+        let (range, x) = if source == connector.left {
+            (&band.left, connector.area.x)
+        } else {
+            (&band.right, connector.area.right().saturating_sub(1))
+        };
+        let top = self.pane_top(source);
+        if range.is_empty() {
+            let other = if source == connector.left {
+                connector.right
+            } else {
+                connector.left
+            };
+            let other_index = if source == connector.left {
+                band.right.start
+            } else {
+                band.left.start
+            };
+            let row = *self.projected_rows(other).get(other_index)?;
+            let offset = range.start.checked_sub(top)?;
+            if offset < usize::from(connector.area.height) {
+                let y = connector.area.y + offset as u16;
+                return Some((x, y, row));
+            }
+            return None;
+        }
+        let end = range
+            .end
+            .min(top.saturating_add(usize::from(connector.area.height)));
+        for index in range.start.max(top)..end {
+            let offset = index - top;
+            let row = self.pane_row(source, offset)?;
+            let y = connector.area.y + offset as u16;
+            return Some((x, y, row));
+        }
+        None
+    }
+
+    fn render_help(&self, frame: &mut Frame<'_>) {
+        let area = frame.area();
+        let width = area.width.min(62);
+        let height = area.height.min(13);
+        let box_area = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y + (area.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, box_area);
+        let guide = "j/k or arrows: rows   h/l: columns   Tab: focus\n[ ]: previous/next hunk   a: copy focused hunk\ni: edit   Esc: review   u: undo   Ctrl-R: redo\no/t/b: choose ours/theirs/both   r: edited result\n»/«: choose or copy   diagonals: add before/after\nw: whitespace policy   PageUp/PageDown: scroll\ns: submit   q: quit   ?: close help";
+        frame.render_widget(
+            Paragraph::new(guide).block(Block::default().borders(Borders::ALL).title("Help")),
+            box_area,
+        );
+    }
+
+    pub(crate) fn mouse_target(&self, x: u16, y: u16) -> Option<MouseHit> {
+        let area = Rect::new(0, 0, self.width, self.height);
+        let (panes, connectors, count) = pane_areas(self, area);
+        if !self.local_pending {
+            for connector in connectors.iter().take(count - 1) {
+                if x < connector.area.x
+                    || x >= connector.area.right()
+                    || y < connector.area.y
+                    || y >= connector.area.bottom()
+                {
+                    continue;
+                }
+                let bands = self.action_bands(connector.left, connector.right);
+                for band in bands {
+                    for source in [connector.left, connector.right] {
+                        for action in self
+                            .band_actions(connector, band, source)
+                            .into_iter()
+                            .flatten()
+                        {
+                            if x == action.x && y == action.y {
+                                return Some(action.hit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let pane_area = panes.into_iter().take(count).find(|pane| {
+            y >= pane.content.y
+                && y < pane.content.bottom()
+                && x >= pane.outer.x
+                && x < pane.overview_x
+        })?;
+        let offset = usize::from(y - pane_area.content.y);
+        let row = if self.local_pending {
+            let line = self.scroll + offset;
+            (line < self.pane(pane_area.pane).buffer.line_count()).then_some(line)?
+        } else {
+            self.pane_row(pane_area.pane, offset)?
+        };
+        let gutter = x < pane_area.content.x;
+        let column = if self.local_pending || gutter {
+            0
+        } else {
+            let line = self.rows.get(row)?.line(pane_area.pane)?;
+            let horizontal = *self.horizontal.get(&pane_area.pane).unwrap_or(&0);
+            grapheme_at_cell(
+                line,
+                horizontal.saturating_add(usize::from(x - pane_area.content.x)),
+            )
+        };
+        Some(MouseHit {
+            pane: pane_area.pane,
+            row,
+            column,
+            gutter,
+            action: None,
+        })
+    }
+}
+
+fn render_line_number(
+    buffer: &mut Buffer,
+    x: u16,
+    y: u16,
+    gutter: u16,
+    number: usize,
+    background: Color,
+) {
+    let width = usize::from(gutter.saturating_sub(1));
+    if width == 0 {
+        return;
+    }
+    let mut digits = [b' '; 20];
+    let mut value = number;
+    let mut cursor = digits.len();
+    while value > 0 && cursor > 0 {
+        cursor -= 1;
+        digits[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+    let visible = std::str::from_utf8(&digits[digits.len() - width..]).expect("decimal digits");
+    buffer.set_stringn(
+        x,
+        y,
+        visible,
+        width,
+        Style::default().fg(MUTED).bg(background),
+    );
+}
+
+fn pane_name(pane: Pane) -> &'static str {
+    match pane {
+        Pane::Left => "Left",
+        Pane::Right => "Right",
+        Pane::Ours => "Ours",
+        Pane::Result => "Merged result",
+        Pane::Theirs => "Theirs",
+    }
+}
+
+fn draw_connector_band(
+    buffer: &mut Buffer,
+    area: Rect,
+    band: &ChangeBand,
+    left_top: usize,
+    right_top: usize,
+) {
+    let left_start = band.left.start as i64 - left_top as i64;
+    let right_start = band.right.start as i64 - right_top as i64;
+    let left_end = band.left.end as i64 - left_top as i64;
+    let right_end = band.right.end as i64 - right_top as i64;
+    let first = left_start
+        .min(right_start)
+        .max(0)
+        .min(i64::from(area.height));
+    let last = left_end.max(right_end).max(0).min(i64::from(area.height));
+    let steps = i64::from(area.width).max(1);
+    let color = band_color(band.kind);
+    for x in 0..area.width {
+        let distance = i64::from(x);
+        let top_left = 2 * (left_start * (steps - distance) + right_start * distance);
+        let top_right = top_left + 2 * (right_start - left_start);
+        let bottom_left = 2 * (left_end * (steps - distance) + right_end * distance);
+        let bottom_right = bottom_left + 2 * (right_end - left_end);
+        let top = top_left.min(top_right).div_euclid(steps);
+        let bottom = (bottom_left.max(bottom_right) + steps - 1).div_euclid(steps);
+        for y in first..last {
+            let top_half = y * 2 >= top && y * 2 < bottom;
+            let bottom_half = y * 2 + 1 >= top && y * 2 + 1 < bottom;
+            if !top_half && !bottom_half {
+                continue;
+            }
+            let cell = &mut buffer[(area.x + x, area.y + y as u16)];
+            let (mut upper, mut lower) = match cell.symbol() {
+                "▀" => (cell.fg, cell.bg),
+                "▄" => (cell.bg, cell.fg),
+                _ => (cell.bg, cell.bg),
+            };
+            if top_half {
+                upper = color;
+            }
+            if bottom_half {
+                lower = color;
+            }
+            if upper == lower {
+                cell.set_symbol(" ").set_style(Style::default().bg(upper));
+            } else {
+                cell.set_symbol("▀")
+                    .set_style(Style::default().fg(upper).bg(lower));
+            }
+        }
+    }
+}
+
+fn band_at(bands: &[ChangeBand], index: usize, left: bool) -> Option<&ChangeBand> {
+    let upto =
+        bands.partition_point(|band| (if left { &band.left } else { &band.right }).start <= index);
+    let band = bands.get(upto.checked_sub(1)?)?;
+    (if left { &band.left } else { &band.right })
+        .contains(&index)
+        .then_some(band)
+}
+
+fn band_in_range(
+    bands: &[ChangeBand],
+    first: usize,
+    end: usize,
+    left: bool,
+) -> Option<&ChangeBand> {
+    let upto =
+        bands.partition_point(|band| (if left { &band.left } else { &band.right }).start < end);
+    let band = bands.get(upto.checked_sub(1)?)?;
+    let range = if left { &band.left } else { &band.right };
+    (range.end > first || range.is_empty() && range.start >= first).then_some(band)
+}
+
+fn kind_priority(kind: ChangeKind) -> u8 {
+    match kind {
+        ChangeKind::Conflict => 5,
+        ChangeKind::Resolved => 4,
+        ChangeKind::Modified => 3,
+        ChangeKind::Added | ChangeKind::Removed => 2,
+    }
+}
+
+fn band_color(kind: ChangeKind) -> Color {
+    match kind {
+        ChangeKind::Modified => Color::Rgb(81, 122, 163),
+        ChangeKind::Added => Color::Rgb(79, 151, 108),
+        ChangeKind::Removed => Color::Rgb(154, 95, 78),
+        ChangeKind::Conflict => Color::Rgb(183, 124, 65),
+        ChangeKind::Resolved => Color::Rgb(95, 164, 140),
+    }
+}
+
+fn brighten(color: Color, amount: u8) -> Color {
+    match color {
+        Color::Rgb(red, green, blue) => Color::Rgb(
+            red.saturating_add(amount),
+            green.saturating_add(amount),
+            blue.saturating_add(amount),
+        ),
+        _ => color,
+    }
+}
+
+fn region_color(kind: ChangeKind, pane: Pane, selected: bool) -> Color {
+    let color = match (kind, pane) {
+        (ChangeKind::Modified, Pane::Left | Pane::Ours) => Color::Rgb(68, 64, 65),
+        (ChangeKind::Modified, _) => Color::Rgb(47, 65, 82),
+        (ChangeKind::Added, _) => Color::Rgb(37, 66, 52),
+        (ChangeKind::Removed, _) => Color::Rgb(71, 49, 48),
+        (ChangeKind::Conflict, Pane::Result) => Color::Rgb(93, 67, 48),
+        (ChangeKind::Conflict, _) => Color::Rgb(77, 58, 49),
+        (ChangeKind::Resolved, _) => Color::Rgb(40, 68, 63),
+    };
+    if selected { brighten(color, 9) } else { color }
+}
+
+fn intraline_color(region: Option<ChangeKind>, background: Color) -> Color {
+    brighten(
+        background,
+        if matches!(region, Some(ChangeKind::Conflict)) {
+            34
+        } else {
+            26
+        },
+    )
+}
+
+fn render_line(
+    buffer: &mut Buffer,
+    area: Rect,
+    y: u16,
+    line: &ViewLine,
+    syntax: &[chvrn_core::structural::HighlightSpan],
+    offset: usize,
+    background: Color,
+    region: Option<ChangeKind>,
+) {
+    let stop = line.stop_at_cell(offset);
+    let mut cell_position = stop.cells;
+    let mut scalar_position = stop.scalar;
+    for (byte, grapheme) in line.text[stop.byte..].grapheme_indices(true) {
+        let width = text::display_cell_width(grapheme, cell_position);
+        let current = scalar_position;
+        scalar_position += grapheme.chars().count();
+        let start = cell_position;
+        cell_position += width;
+        if cell_position <= offset {
+            continue;
+        }
+        if start < offset {
+            continue;
+        }
+        let visible_x = start - offset;
+        if visible_x + width > usize::from(area.width) {
+            break;
+        }
+        let absolute_byte = line.byte_start + stop.byte + byte;
+        let prefix = syntax.partition_point(|span| span.bytes.start <= absolute_byte);
+        let syntax_color = syntax[..prefix]
+            .iter()
+            .rev()
+            .find(|span| absolute_byte < span.bytes.end)
+            .map(|span| syntax_color(&span.kind))
+            .unwrap_or(INK);
+        let changed_prefix = line.changed.partition_point(|span| span.start <= current);
+        let changed = changed_prefix > 0 && current < line.changed[changed_prefix - 1].end;
+        let style = if changed {
+            Style::default()
+                .fg(syntax_color)
+                .bg(intraline_color(region, background))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(syntax_color).bg(background)
+        };
+        let x = area.x.saturating_add(visible_x as u16);
+        if grapheme == "\t" {
+            buffer.set_string(x, y, "→", style);
+            if width > 1 {
+                buffer.set_stringn(x + 1, y, "   ", width - 1, style);
+            }
+        } else if grapheme.chars().any(char::is_control) || UnicodeWidthStr::width(grapheme) == 0 {
+            buffer.set_string(x, y, "·", style);
+        } else {
+            buffer.set_string(x, y, grapheme, style);
+        }
+    }
+}
+
+fn syntax_color(kind: &HighlightKind) -> Color {
+    match kind {
+        HighlightKind::Keyword => Color::Rgb(207, 146, 111),
+        HighlightKind::Identifier => Color::Rgb(194, 189, 223),
+        HighlightKind::String => Color::Rgb(132, 183, 127),
+        HighlightKind::Number => Color::Rgb(177, 177, 124),
+        HighlightKind::Comment => Color::Rgb(115, 124, 120),
+        HighlightKind::Type => Color::Rgb(139, 183, 196),
+        HighlightKind::Function => Color::Rgb(195, 161, 210),
+        HighlightKind::Punctuation => INK,
+    }
+}
+
+fn grapheme_at_cell(line: &ViewLine, target: usize) -> usize {
+    let stop = line.stop_at_cell(target);
+    let mut cells = stop.cells;
+    let mut column = stop.grapheme;
+    for grapheme in line.text[stop.byte..].graphemes(true) {
+        let width = text::display_cell_width(grapheme, cells);
+        if cells + width > target {
+            break;
+        }
+        cells += width;
+        column += 1;
+    }
+    column
+}
+
+fn cursor_cell(area: Rect, line: Option<&ViewLine>, column: usize, offset: usize) -> Option<u16> {
+    let line = line?;
+    let cells = line.cells_before(column);
+    let visible = cells.checked_sub(offset)?;
+    if visible < usize::from(area.width) {
+        Some(area.x + visible as u16)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steep_connectors_cover_every_row_between_their_endpoints() {
+        let area = Rect::new(0, 0, 5, 24);
+        let color = band_color(ChangeKind::Modified);
+        for (left, right) in [(18..20, 2..4), (2..4, 18..20)] {
+            let mut buffer = Buffer::empty(area);
+            buffer.set_style(area, Style::default().bg(RAIL));
+            let band = ChangeBand {
+                left,
+                right,
+                hunk: None,
+                resolved: None,
+                kind: ChangeKind::Modified,
+            };
+            draw_connector_band(&mut buffer, area, &band, 0, 0);
+
+            for y in 2..20 {
+                assert!(
+                    (0..5).any(|x| {
+                        let cell = &buffer[(x, y)];
+                        cell.bg == color || matches!(cell.symbol(), "▀" | "▄") && cell.fg == color
+                    }),
+                    "connector is disconnected at row {y}: {band:?}",
+                );
+            }
+            assert!((0..5).all(|x| buffer[(x, 0)].bg == RAIL));
+            assert!((0..5).all(|x| buffer[(x, 23)].bg == RAIL));
+        }
+    }
+
+    #[test]
+    fn adjacent_connectors_do_not_erase_previously_painted_half_cells() {
+        let area = Rect::new(0, 0, 5, 4);
+        let color = band_color(ChangeKind::Modified);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_style(area, Style::default().bg(RAIL));
+        for (left, right) in [(0..1, 0..2), (1..2, 2..3)] {
+            let band = ChangeBand {
+                left,
+                right,
+                hunk: None,
+                resolved: None,
+                kind: ChangeKind::Modified,
+            };
+            draw_connector_band(&mut buffer, area, &band, 0, 0);
+        }
+
+        for x in 0..5 {
+            let cell = &buffer[(x, 1)];
+            assert_eq!(cell.bg, color, "unpainted half at column {x}");
+            if matches!(cell.symbol(), "▀" | "▄") {
+                assert_eq!(cell.fg, color, "unpainted half at column {x}");
+            }
+        }
+    }
+}

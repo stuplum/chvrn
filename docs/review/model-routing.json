@@ -1,0 +1,113 @@
+{
+  "endpoint": "https://api.typesafe.ai/v1/systemone",
+  "request": {
+    "model": "jev-1.13.0",
+    "state": {
+      "goal": "Select the most efficient available coding model for each of four independent agent slices, optimising successful delivery per resource use, not lowest price alone. New Rust terminal diff/editor tool in one Cargo workspace. Parent owns shared interfaces and integration. All features listed are required, no scaffolds. No measured prices or speed benchmarks are available, only catalogue tier descriptions.",
+      "tasks": {
+        "engine": "Build a Rust rope-based diff and merge engine: patience line alignment, Unicode intraline changes, whitespace policies, bidirectional hunk application, tree-sitter structural move/reflow detection, correct 3-way auto-merge and explicit conflicts. Tests-first, documented contracts. Complex boundary correctness.",
+        "tui": "Build Rust ratatui/crossterm editable dual/triple-pane diff UI with ghost alignment, synchronised scroll, syntax/intraline highlighting, keyboard/mouse hunk controls, rope editing/undo, conflict choices, watch/gate state and terminal restoration. Contracts provided; substantial stateful interactive work.",
+        "git": "Build Rust Git repository/patch backend and headless CLI: tracked/untracked/renamed/deleted files, arbitrary paths, refs/index/worktree, lossless patch import/export, per-hunk staging/rejection, atomic saves with stale-snapshot checks, concurrent-agent protection, difftool/mergetool integration. No overwrite of unreviewed edits. Correctness critical.",
+        "integrations": "Build Rust herdr 0.9 adapter using verified CLI JSON schemas, companion/gate/auto lifecycle, no-focus companion split, explicit gate focus, structured review feedback queued during blocked approval UI, local Unix socket patch submission, LSP hover/diagnostics/definition/formatting, agent hunk explanations. Contracts provided; robust external process/protocol boundaries."
+      }
+    },
+    "questions": {
+      "engine": {
+        "type": "choice",
+        "instructions": "Choose the least-resource model/effort sufficient to implement state.tasks.engine correctly. Evaluate that slice only. Avoid expensive frontier if coding workhorse is sufficient.",
+        "criteria": {
+          "gpt-6-luna|medium": "Fast affordable model for easier tasks. Lowest resource tier. Medium reasoning. Choose only if likely to implement the slice correctly with little rework.",
+          "gpt-6-sol|medium": "Coding workhorse, balanced resource use, medium reasoning. Prefer for well-defined implementation that does not need deep boundary reasoning.",
+          "gpt-6-sol|high": "Coding workhorse with greater reasoning depth. More time than medium but can reduce correctness rework for complex algorithms, concurrency or state.",
+          "gpt-6-astra|high": "Frontier intelligence for demanding work, highest model resource tier here. Use only if workhorse likely insufficient."
+        }
+      },
+      "tui": {
+        "type": "choice",
+        "instructions": "Choose the least-resource model/effort sufficient to implement state.tasks.tui correctly. Evaluate that slice only. Avoid expensive frontier if coding workhorse is sufficient.",
+        "criteria": {
+          "gpt-6-luna|medium": "Fast affordable model for easier tasks. Lowest resource tier. Medium reasoning. Choose only if likely to implement the slice correctly with little rework.",
+          "gpt-6-sol|medium": "Coding workhorse, balanced resource use, medium reasoning. Prefer for well-defined implementation that does not need deep boundary reasoning.",
+          "gpt-6-sol|high": "Coding workhorse with greater reasoning depth. More time than medium but can reduce correctness rework for complex algorithms, concurrency or state.",
+          "gpt-6-astra|high": "Frontier intelligence for demanding work, highest model resource tier here. Use only if workhorse likely insufficient."
+        }
+      },
+      "git": {
+        "type": "choice",
+        "instructions": "Choose the least-resource model/effort sufficient to implement state.tasks.git correctly. Evaluate that slice only. Avoid expensive frontier if coding workhorse is sufficient.",
+        "criteria": {
+          "gpt-6-luna|medium": "Fast affordable model for easier tasks. Lowest resource tier. Medium reasoning. Choose only if likely to implement the slice correctly with little rework.",
+          "gpt-6-sol|medium": "Coding workhorse, balanced resource use, medium reasoning. Prefer for well-defined implementation that does not need deep boundary reasoning.",
+          "gpt-6-sol|high": "Coding workhorse with greater reasoning depth. More time than medium but can reduce correctness rework for complex algorithms, concurrency or state.",
+          "gpt-6-astra|high": "Frontier intelligence for demanding work, highest model resource tier here. Use only if workhorse likely insufficient."
+        }
+      },
+      "integrations": {
+        "type": "choice",
+        "instructions": "Choose the least-resource model/effort sufficient to implement state.tasks.integrations correctly. Evaluate that slice only. Avoid expensive frontier if coding workhorse is sufficient.",
+        "criteria": {
+          "gpt-6-luna|medium": "Fast affordable model for easier tasks. Lowest resource tier. Medium reasoning. Choose only if likely to implement the slice correctly with little rework.",
+          "gpt-6-sol|medium": "Coding workhorse, balanced resource use, medium reasoning. Prefer for well-defined implementation that does not need deep boundary reasoning.",
+          "gpt-6-sol|high": "Coding workhorse with greater reasoning depth. More time than medium but can reduce correctness rework for complex algorithms, concurrency or state.",
+          "gpt-6-astra|high": "Frontier intelligence for demanding work, highest model resource tier here. Use only if workhorse likely insufficient."
+        }
+      }
+    }
+  },
+  "response": {
+    "model": "jev-1.13.0",
+    "answers": {
+      "engine": {
+        "type": "choice",
+        "choice": "gpt-6-sol|high",
+        "confidence": 0.78,
+        "probabilities": {
+          "gpt-6-astra|high": 0.15,
+          "gpt-6-sol|high": 0.84,
+          "gpt-6-luna|medium": 0,
+          "gpt-6-sol|medium": 0.01
+        }
+      },
+      "tui": {
+        "type": "choice",
+        "choice": "gpt-6-sol|high",
+        "confidence": 0.64,
+        "probabilities": {
+          "gpt-6-astra|high": 0.01,
+          "gpt-6-sol|high": 0.73,
+          "gpt-6-luna|medium": 0,
+          "gpt-6-sol|medium": 0.26
+        }
+      },
+      "git": {
+        "type": "choice",
+        "choice": "gpt-6-sol|high",
+        "confidence": 0.92,
+        "probabilities": {
+          "gpt-6-astra|high": 0.03,
+          "gpt-6-sol|high": 0.94,
+          "gpt-6-luna|medium": 0,
+          "gpt-6-sol|medium": 0.03
+        }
+      },
+      "integrations": {
+        "type": "choice",
+        "choice": "gpt-6-sol|high",
+        "confidence": 0.57,
+        "probabilities": {
+          "gpt-6-astra|high": 0.04,
+          "gpt-6-sol|high": 0.68,
+          "gpt-6-luna|medium": 0,
+          "gpt-6-sol|medium": 0.27
+        }
+      }
+    },
+    "usage": {
+      "input_tokens": 1553,
+      "output_tokens": 322
+    }
+  },
+  "harness": "omp",
+  "provider": "openai-codex",
+  "note": "Routing judgement, not a speed or cost benchmark. Credential retrieved from 1Password in memory and never included in this artefact."
+}

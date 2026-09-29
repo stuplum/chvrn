@@ -1,0 +1,13 @@
+[package]
+name = "chvrn-integrations"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chvrn-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

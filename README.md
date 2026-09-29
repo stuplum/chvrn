@@ -34,6 +34,18 @@ Run repository review commands from the repository being reviewed. With no subco
 
 A terminal on both stdin and stdout enables the TUI. `--non-interactive`, `--format text`, `--format json`, or redirected input/output use headless output without terminal control sequences. Headless review only inspects. Headless merge writes the output only when all conflicts merge automatically. Exit codes: `0` for equal headless diff/clean merge or explicit successful interactive submission, `1` for differences, unresolved merge or interactive quit, and `2` for errors.
 
+## Development checks
+
+CI runs formatting and locked workspace tests with stable Rust on Linux and macOS for pushes and pull requests. The workflow has read-only repository permissions and does not publish releases or deploy.
+
+Run the same checks locally:
+
+```sh
+rustup toolchain install stable --profile minimal --component rustfmt
+cargo +stable fmt --all --check
+cargo +stable test --workspace --locked
+```
+
 ## Terminal presentation
 
 Two-way comparisons show borderless left/right editors. Three-way merges show **Ours | Merged result | Theirs**, keeping the common base internal and both source panes read-only.

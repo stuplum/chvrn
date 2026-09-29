@@ -757,6 +757,126 @@ fn overview_strips_indicate_offscreen_changes_without_scrolling_the_panes() {
 }
 
 #[test]
+fn overview_viewport_block_moves_with_the_visible_lines() {
+    let text = (0..50)
+        .map(|line| format!("line{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut session = ReviewSession::two_way(&text, &text);
+    session.handle(ReviewInput::Resize {
+        width: 80,
+        height: 13,
+    });
+    let initial = draw(&session, 80, 13);
+    for x in [36, 79] {
+        let rows: Vec<_> = (2..12)
+            .filter(|&y| initial[(x, y)].symbol() == "█")
+            .collect();
+        assert_eq!(rows, vec![2, 3]);
+    }
+
+    session.go_to(Pane::Left, 29, 0);
+    let scrolled = draw(&session, 80, 13);
+    for x in [36, 79] {
+        let rows: Vec<_> = (2..12)
+            .filter(|&y| scrolled[(x, y)].symbol() == "█")
+            .collect();
+        assert_eq!(rows, vec![6, 7]);
+        assert_eq!(scrolled[(x, 2)].symbol(), "│");
+    }
+}
+
+#[test]
+fn overview_viewport_block_expands_when_more_of_the_file_becomes_visible() {
+    let text = (0..50)
+        .map(|line| format!("line{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut session = ReviewSession::two_way(&text, &text);
+    session.handle(ReviewInput::Resize {
+        width: 80,
+        height: 13,
+    });
+    session.handle(ReviewInput::Resize {
+        width: 80,
+        height: 23,
+    });
+    let resized = draw(&session, 80, 23);
+    for x in [36, 79] {
+        let rows: Vec<_> = (2..22)
+            .filter(|&y| resized[(x, y)].symbol() == "█")
+            .collect();
+        assert_eq!(rows, vec![2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+}
+
+#[test]
+fn overview_viewport_block_brightens_overlapping_changes_and_restores_them_after_scrolling() {
+    use ratatui::style::Color;
+
+    let base = (0..50)
+        .map(|line| format!("line{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ours = base.replace("line40", "OURS");
+    let theirs = base.replace("line40", "THEIRS");
+    for (mut session, pane) in [
+        (ReviewSession::two_way(&base, &ours), Pane::Right),
+        (
+            ReviewSession::three_way(&base, &ours, &theirs),
+            Pane::Theirs,
+        ),
+    ] {
+        session.handle(ReviewInput::Resize {
+            width: 80,
+            height: 13,
+        });
+        let outside = draw(&session, 80, 13);
+        let marker = &outside[(79, 10)];
+        assert_eq!(marker.symbol(), "▐");
+        let Color::Rgb(red, green, blue) = marker.fg else {
+            panic!("expected an RGB change marker");
+        };
+
+        session.go_to(pane, 40, 0);
+        let inside = draw(&session, 80, 13);
+        let highlighted = &inside[(79, 10)];
+        let Color::Rgb(brighter_red, brighter_green, brighter_blue) = highlighted.fg else {
+            panic!("expected an RGB viewport marker");
+        };
+        assert!(
+            brighter_red > red && brighter_green > green && brighter_blue > blue,
+            "visible change must use a brighter variation of its own colour",
+        );
+        assert_eq!(highlighted.symbol(), "█");
+
+        session.go_to(pane, 0, 0);
+        let restored = draw(&session, 80, 13);
+        assert_eq!(restored[(79, 10)].symbol(), "▐");
+        assert_eq!(restored[(79, 10)].fg, marker.fg);
+    }
+}
+
+#[test]
+fn overview_viewport_block_is_continuous_when_the_whole_file_fits() {
+    let mut session = ReviewSession::two_way("one\ntwo", "one\ntwo");
+    session.handle(ReviewInput::Resize {
+        width: 80,
+        height: 13,
+    });
+    let buffer = draw(&session, 80, 13);
+    for x in [36, 79] {
+        for y in 2..12 {
+            assert_eq!(
+                buffer[(x, y)].symbol(),
+                "█",
+                "whole-file viewport has a gap at ({x}, {y})",
+            );
+        }
+    }
+}
+
+#[test]
 fn tab_expands_to_display_cells_without_changing_the_source_text() {
     let session = ReviewSession::two_way("a\tb\n", "a\tc\n");
     let buffer = draw(&session, 80, 8);

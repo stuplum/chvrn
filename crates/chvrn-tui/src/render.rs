@@ -580,12 +580,19 @@ impl ReviewSession {
             self.pane(pane).buffer.line_count()
         } else {
             self.projected_rows(pane).len()
-        };
+        }
+        .max(1);
         let top = if self.local_pending {
             self.scroll
         } else {
             self.pane_top(pane)
         };
+        let viewport_start = top.saturating_mul(height) / total;
+        let viewport_end = top
+            .saturating_add(height)
+            .min(total)
+            .saturating_mul(height)
+            .div_ceil(total);
         for offset in 0..height {
             let first = total.saturating_mul(offset).saturating_add(height - 1) / height;
             let end = total.saturating_mul(offset + 1).saturating_add(height - 1) / height;
@@ -594,14 +601,13 @@ impl ReviewSession {
             } else {
                 None
             };
-            let in_viewport = end > first && first < top.saturating_add(height) && end > top;
+            let in_viewport = (viewport_start..viewport_end).contains(&offset);
             let y = pane_area.outer.y + offset as u16;
-            let (symbol, color) = if let Some(kind) = kind {
-                ("▐", band_color(kind))
-            } else if in_viewport {
-                ("│", Color::Rgb(91, 110, 125))
-            } else {
-                ("│", Color::Rgb(47, 51, 57))
+            let (symbol, color) = match (kind, in_viewport) {
+                (Some(kind), true) => ("█", brighten(band_color(kind), 40)),
+                (Some(kind), false) => ("▐", band_color(kind)),
+                (None, true) => ("█", Color::Rgb(91, 110, 125)),
+                (None, false) => ("│", Color::Rgb(47, 51, 57)),
             };
             buffer.set_string(
                 pane_area.overview_x,

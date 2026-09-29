@@ -38,7 +38,7 @@ A terminal on both stdin and stdout enables the TUI. `--non-interactive`, `--for
 
 Two-way comparisons show borderless left/right editors. Three-way merges show **Ours | Merged result | Theirs**, keeping the common base internal and both source panes read-only.
 
-Each pane displays continuous real lines rather than blank alignment rows. Shaded change regions connect across unequal heights through Unicode half-block gutters. Changed text has stronger background emphasis without losing syntax colours. Each pane has a change-overview strip, including offscreen changes.
+Each pane displays continuous real lines rather than blank alignment rows. Shaded change regions connect across unequal heights through Unicode half-block gutters. Changed text has stronger background emphasis without losing syntax colours. Each pane has a change-overview strip, including offscreen changes. A solid block in that same column shows the visible range: neutral over unchanged lines and a brighter variation of each change colour where they overlap. Its position and length follow scrolling and terminal size.
 
 Click `»` or `«` to copy only that source hunk across a two-way comparison, or choose that source for one unresolved merge conflict. Accepted sources have no gutter control. The remaining source offers one insert-below control: `↘` from ours or `↙` from theirs. Inserting that source consumes its control; choosing both leaves neither control. Insertion preserves manual edits and duplicate lines, supports undo/redo of both text and available controls, and leaves unrelated conflicts untouched. Merge choices remain undoable even when they leave the text unchanged, including accepting a deletion. Saving remains explicit.
 

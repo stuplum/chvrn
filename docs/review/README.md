@@ -1,6 +1,6 @@
-# chvrn test-first review
+# Historical test-first review checkpoint
 
-This is a specification and test-source review package, not a built application. The user selected a review checkpoint before production implementation. No production source, Cargo manifests, binary, commits or remote repository are included at this checkpoint.
+This records the specification and test-source review before production implementation. Statements below about missing source, manifests, binaries or verification describe that checkpoint, not the current repository. Use the [project README](../../README.md), [user guide](../usage.md) and [development guide](../development.md) for current documentation. Local planning paths and agent panes below are retained as historical provenance, not portable setup instructions.
 
 ## Start here
 

@@ -1,113 +1,78 @@
-# chvrn
+# Chvrn
 
-Editable terminal diff, three-way merge and Git review, usable standalone or alongside a herdr agent. Review submission, file writes, staging and quitting are separate actions. Quitting never approves a review.
+**Editable diffs, three-way merges and Git review in your terminal.**
 
-## Build and run
+[![Three-way merge capture placeholder: Ours, Merged result and Theirs, with connected change regions.](docs/assets/merge-preview.svg)](docs/demo.md)
 
-Requires Rust 1.85 or newer and Git. The local socket integration requires Unix. The exercised platform is macOS arm64.
+*Visual placeholder, not a screenshot. [Reproduce the scene and capture the demo.](docs/demo.md)*
 
-From the repository root:
+Chvrn keeps comparison and editing in the same view. Follow a change across connected panes, copy just the hunk you want, or edit the result directly. Review and resolve without switching between a diff viewer and an editor.
+
+[Install](#install) · [Try it](#quick-start) · [User guide](docs/usage.md)
+
+## Work in the comparison
+
+- **Follow real source lines.** Panes keep their own continuous lines. Shaded connectors join changes of different heights; intraline highlights and change-overview strips help you keep your place.
+- **Choose individual changes.** Copy a hunk in either direction in a two-way diff. In a merge, choose ours, theirs or both, or edit the result and accept that region. An unaccepted source can still be inserted below your chosen result.
+- **Keep reviewing before you write.** Edits and merge choices support undo/redo. Resolving the last conflict opens confirmation, not an automatic save. Quitting is never approval.
+
+| Workflow | What you can do |
+| --- | --- |
+| Two-way diff | Edit either file and copy selected hunks between them. |
+| Three-way merge | Work in **Ours · Merged result · Theirs**, with read-only sources and an editable result. Independent changes merge automatically; unresolved conflicts block saving. |
+| Local Git review | Compare the worktree with the index or a revision, stage or restore individual hunks in the appropriate review mode, and submit comments in a JSON report. No implicit staging or committing. |
+| Language-aware editing | Syntax highlighting for Rust, TypeScript/TSX, JavaScript/JSX, Python and JSON. Optional LSP hover, diagnostics, definitions and formatting. Other UTF-8 files remain editable. |
+
+## Install
+
+Build from source with **stable Rust and Git**:
 
 ```sh
-cargo build --release --locked
-"$PWD/target/release/chvrn" --help
+git clone https://github.com/stuplum/chvrn.git
+cd chvrn
+cargo install --locked --path crates/chvrn-cli
+chvrn --help
 ```
 
-Optional installation into Cargo's binary directory:
+Cargo installs the `chvrn` executable into its binary directory, normally `~/.cargo/bin`; that directory must be on `PATH`. A truecolour terminal gives the intended palette. No Nerd Font is required.
+
+[Build without installing and run development checks.](docs/development.md)
+
+## Quick start
+
+Try an editable comparison using disposable files:
 
 ```sh
-cargo install --locked --path "$PWD/crates/chvrn-cli"
+demo=$(mktemp -d)
+printf 'Hello\nKeep this line\n' > "$demo/before.txt"
+printf 'Welcome\nKeep this line\nOne more line\n' > "$demo/after.txt"
+chvrn diff "$demo/before.txt" "$demo/after.txt"
 ```
 
-The following commands assume the installed `chvrn` is on `PATH`.
+Click a `»` or `«` gutter control to copy a hunk. Press `i` to edit, Escape to return to navigation, and `u` to undo. `s` saves; `q` quits without saving pending edits.
+
+Review a repository from its working directory:
 
 ```sh
-chvrn diff /path/to/before.rs /path/to/after.rs
-chvrn merge --base /path/to/base.rs --ours /path/to/ours.rs --theirs /path/to/theirs.rs --output /path/to/result.rs
+chvrn
 chvrn review --base HEAD
-chvrn review --base index
-chvrn review --base HEAD --report /tmp/chvrn-review.json
-chvrn diff /path/to/before.rs /path/to/after.rs --format json
 ```
 
-Run repository review commands from the repository being reviewed. With no subcommand, `chvrn` reviews worktree changes against the index. Positional review paths restrict the inspected files. `--base HEAD` compares against the resolved revision and checks that a named reference has not moved before mutation or feedback delivery.
+The first compares the worktree with the index. The second compares it with `HEAD`. Use `S` to stage a hunk in an index review; use `x` to restore a hunk from the chosen revision in a revision review. **These actions write immediately**, separately from submitting the review.
 
-A terminal on both stdin and stdout enables the TUI. `--non-interactive`, `--format text`, `--format json`, or redirected input/output use headless output without terminal control sequences. Headless review only inspects. Headless merge writes the output only when all conflicts merge automatically. Exit codes: `0` for equal headless diff/clean merge or explicit successful interactive submission, `1` for differences, unresolved merge or interactive quit, and `2` for errors.
-
-## Development checks
-
-CI runs formatting and locked workspace tests with stable Rust on Linux and macOS for pushes and pull requests. The workflow has read-only repository permissions and does not publish releases or deploy.
-
-Run the same checks locally:
+Merge three files into a separate result:
 
 ```sh
-rustup toolchain install stable --profile minimal --component rustfmt
-cargo +stable fmt --all --check
-cargo +stable test --workspace --locked
+chvrn merge --base /path/to/base.ts \
+  --ours /path/to/ours.ts --theirs /path/to/theirs.ts \
+  --output /path/to/result.ts
 ```
 
-## Terminal presentation
+Choose conflicts with `o`, `t` or `b`. At the final confirmation, `y` writes the result; `n` or Escape returns to review. The [walk-through](docs/demo.md) provides ready-to-use inputs.
 
-Two-way comparisons show borderless left/right editors. Three-way merges show **Ours | Merged result | Theirs**, keeping the common base internal and both source panes read-only.
+## Use with Git
 
-Each pane displays continuous real lines rather than blank alignment rows. Shaded change regions connect across unequal heights through Unicode half-block gutters. Changed text has stronger background emphasis without losing syntax colours. Each pane has a change-overview strip, including offscreen changes. A solid block in that same column shows the visible range: neutral over unchanged lines and a brighter variation of each change colour where they overlap. Its position and length follow scrolling and terminal size.
-
-Click `»` or `«` to copy only that source hunk across a two-way comparison, or choose that source for one unresolved merge conflict. Accepted sources have no gutter control. The remaining source offers one insert-below control: `↘` from ours or `↙` from theirs. Inserting that source consumes its control; choosing both leaves neither control. Insertion preserves manual edits and duplicate lines, supports undo/redo of both text and available controls, and leaves unrelated conflicts untouched. Merge choices remain undoable even when they leave the text unchanged, including accepting a deletion. Saving remains explicit.
-
-Resolving the final conflict opens a confirmation prompt; `s` opens it manually, including for a conflict-free merge. Press `y` to write the result and exit, or `n`/Escape to continue reviewing, editing or inserting another source. Other keys, mouse actions and paste do not change the result while confirmation is open. Unresolved conflicts block confirmation and report how many remain. The input files and output destination are revalidated when the write is confirmed.
-
-Truecolour terminals give the intended palette. `NO_COLOR` disables colours. No Powerline/Nerd Font is required; connectors use ordinary Unicode block characters and arrows. Terminal cells approximate diagonal edges rather than reproducing a graphical editor's smooth curves.
-
-The normal footer highlights shortcuts before a dimmed, right-aligned filename. Two-way comparisons show the focused file; merges show the output file. Filenames shorten before essential save, quit and help shortcuts are dropped. Merge-choice hints appear only for a selected unresolved conflict; insert mode shows editing controls instead. Warnings and host status messages take precedence over the normal footer.
-
-The header emphasises `modified` in amber and `INSERT` in cyan and bold. State labels remain readable with `NO_COLOR`; colour is not the only indicator.
-
-## Controls
-
-Press `?` for editor help, including full source and output paths. Help wraps long paths; Up/Down and PageUp/PageDown scroll, and Home/End jump to the start/end. Escape closes help or leaves insert mode before navigation actions.
-
-| Key | Action |
-| --- | --- |
-| Arrows or `h`, `j`, `k`, `l` | Move by displayed row/grapheme |
-| Tab / Shift-Tab | Focus next/previous pane, wrapping at either end |
-| `[` / `]` | Previous/next hunk |
-| `a` | Copy selected hunk from focused source to the opposite pane in a two-way diff |
-| `i`, Escape | Enter/leave insert mode |
-| `u`, Ctrl-R | Undo/redo |
-| Home, End, PageUp, PageDown | Navigate |
-| Shift-Left / Shift-Right | Horizontal scroll |
-| `w` | Cycle exact, ignore-edge, ignore-all and ignore-blank-lines matching |
-| `s` | Save/submit a two-way review, or open merge confirmation |
-| `y`, `n` / Escape | At merge confirmation, write and exit or return to review |
-| `q` | Quit without approval; dirty buffers require `y` to discard |
-| `R` | Explicitly discard local edits and load a conflicting external refresh |
-| `o`, `t`, `b` | Resolve selected merge conflict with ours, theirs or both |
-| `r` | Accept a manually edited merge conflict region |
-
-Mouse clicks focus/select real source lines. Gutter controls act on their indicated source and difference; right-clicking a two-way hunk gutter also copies it from that pane. The wheel scrolls through real lines. Narrow terminals show only the focused pane; resizing keeps its cursor visible.
-
-Repository-only controls:
-
-| Key | Action |
-| --- | --- |
-| Ctrl-N / Ctrl-P | Next/previous file |
-| `S` | Stage selected exact hunk against the index |
-| `x` | Reject selected hunk, or decline the current patch preview |
-| `c` | Enter review comment; Enter ends comment entry |
-| `v` | Open the next queued socket patch candidate |
-| `P` | Export the inspected patch to `--export-patch` |
-| `E` | Ask the selected herdr agent to explain the selected hunk |
-
-Repository base panes are read-only. Dirty edits must be submitted or discarded before switching files or staging/rejecting hunks. Acceptance does not commit or implicitly stage. Rejected ranges retain their inspected snapshot identities in submitted reports.
-
-## Patches and Git tools
-
-```sh
-chvrn review --base HEAD --patch /path/to/candidate.patch
-chvrn review --base HEAD --export-patch /tmp/chvrn-export.patch
-```
-
-Imported patches remain previews until explicit submission. The `difftool` subcommand accepts two paths or Git's `LOCAL`/`REMOTE` environment variables. `mergetool` accepts explicit `--base`, `--ours`, `--theirs`, `--output` paths or Git's `BASE`/`LOCAL`/`REMOTE`/`MERGED` variables. Configure Git locally if wanted:
+Run these inside the repository where you want Chvrn as your diff and merge tool. They change repository-local Git configuration:
 
 ```sh
 git config diff.tool chvrn
@@ -117,59 +82,37 @@ git config mergetool.chvrn.cmd 'chvrn mergetool --base "$BASE" --ours "$LOCAL" -
 git config mergetool.chvrn.trustExitCode true
 ```
 
-## Herdr
+Then run `git difftool` for changes or `git mergetool` for merge conflicts. [Details and write behaviour.](docs/usage.md#git-difftool-and-mergetool)
 
-Standalone operation does not require herdr. Integrated commands require `HERDR_ENV=1` and an explicit agent name or pane ID.
+## Essential controls
 
-```sh
-chvrn review --base HEAD --herdr companion --agent chvrn-engine
-chvrn review --base HEAD --herdr auto --agent chvrn-engine
-chvrn review --base HEAD --herdr gate --agent chvrn-engine
-chvrn review --base HEAD --herdr companion --agent chvrn-engine --open-companion
-```
+| Key | Action |
+| --- | --- |
+| `[` / `]`, Tab / Shift-Tab | Previous/next change; switch panes |
+| `i`, Escape | Enter/leave insert mode |
+| `u`, Ctrl-R | Undo/redo |
+| `o` / `t` / `b`, `r` | Choose a merge source or both; accept a manually edited conflict |
+| `s` | Save a file comparison, submit the current repository file, or open merge confirmation |
+| `y`, `n` / Escape | Confirm the merge write, or return to review |
+| `q`, `?` | Quit without approval; show help |
 
-Companion mode stays passive. Auto mode offers a gate only after verified lifecycle transitions. `--open-companion` creates a split without taking focus. Explicit gate mode opens the current review directly.
+Keyboard and mouse are supported. Dirty buffers require confirmation before quitting. [Full controls, Git actions and safety guidance.](docs/usage.md)
 
-Authoritative lifecycle and session identity are required for automatic transitions and feedback delivery. For omp, install herdr's official integration with `herdr integration install omp`, activate it in a new agent process, then inspect `herdr agent get` and `herdr agent explain --json`. Screen text or an unverified idle status is not authority. The installed integration was exercised against herdr 0.9.0.
+## Optional integrations
 
-An agent's permission/question prompt is independent of code approval. Submitted feedback waits for verified input readiness; chvrn never answers that prompt. The complete inspected Git state is revalidated before delivery. An ambiguous delivery failure is reported as uncertain rather than retried blindly. Resolve the agent's prompt separately while feedback is pending.
+Chvrn does not require an agent or Herdr. Inside Herdr it can accompany a selected agent, offer review after verified lifecycle transitions and return explicitly submitted feedback. An agent's permission prompt remains a separate decision.
 
-## Language server
+A configured language server adds editor assistance; a private local socket lets tools propose patches for human review. [LSP, Herdr and socket setup.](docs/integrations.md)
 
-```sh
-chvrn diff /path/to/before.cpp /path/to/after.cpp --lsp /usr/bin/clangd --lsp-arg=--log=error
-```
+## Project status
 
-`K` requests hover, `D` diagnostics, `g` definition and `F` formatting for the focused document. Escape returns from the temporary definition view. Formatting is an undoable in-memory edit; `s` still controls saving. Same-document definitions use the inspected in-memory text, including unsaved text. Delayed responses must match the current buffer identity. Repeated diagnostics reuse only that snapshot's diagnostic batch.
+Early development. The exercised interactive platform is **macOS arm64**. CI is configured for Linux and macOS; that is not a claim of Linux terminal verification or Windows support. Installation is currently from source.
 
-No server is started without `--lsp`. Unsupported capabilities and server errors are visible. Reads have a 30-second timeout. Diagnostics require a matching document version. Real clangd formatting, hover, diagnostics and definitions were exercised; other server combinations are not runtime-verified.
+Text editing requires UTF-8. Binary content is identified rather than rewritten. See [current limitations](docs/usage.md#safety-and-current-limitations) before using scripted or integration workflows.
 
-## Local socket
+## Documentation
 
-```sh
-chvrn review --base HEAD --socket /tmp/chvrn-private/review.sock
-```
-
-The socket parent must be owner-private. A missing parent is created with mode `0700`; the socket has mode `0600`. Messages use a four-byte big-endian byte length followed by UTF-8 JSON, with a 65,536-byte frame limit. Clients obtain current per-file IDs with `{"type":"inspect"}`, then send `patch_candidate` and query `review_status`. Socket proposals cannot bypass preview or explicit approval. Accepted/declined receipts survive snapshot refresh while the process runs, not process restart. Full schemas are in the integration contract.
-
-## Safety and limits
-
-- UTF-8 text is editable. Binary/invalid UTF-8 content is identified, not lossily decoded for editing.
-- Original line endings and final-newline state are retained. Whitespace modes change matching, not stored bytes.
-- Rust, TypeScript/TSX, JavaScript/JSX, Python and JSON have Tree-sitter syntax/structural analysis. Other UTF-8 files use textual diff. Structural classification works on top-level syntax units; it is not semantic refactoring.
-- Stale buffer results, moved references, changed index/worktree snapshots, unsafe paths and symlink targets are rejected before the relevant operation.
-- File replacement is atomic per file, not across multiple files. Partial filesystem failures are reported. There is no filesystem-wide lock against arbitrary external writers.
-- Large local diff/syntax refreshes run on a coalescing worker. Hunk actions and submission wait for the current alignment. Startup and merge construction still perform work before the first frame.
-- Windows, Linux runtime behaviour and language servers other than clangd have not been exercised here. Native non-UTF-8 path regression tests exclude Apple filesystems, which rejected the fixture itself.
-- No claim of IntelliJ feature parity or general performance superiority.
-
-## Development and contracts
-
-```sh
-cargo test --workspace --locked
-cargo fmt --all --check
-```
-
-One workspace, five crates: the CLI composes core diff/edit/merge, Git transactions, the terminal UI and external integrations. Four Jev-selected `openai-codex/gpt-6-sol` workers implemented the library slices in separate herdr panes; the coordinator implemented the CLI and ran integrated verification.
-
-Contracts: [core](docs/contracts/core.md), [Git](docs/contracts/git.md), [terminal UI](docs/contracts/tui.md), [integrations](docs/contracts/integrations.md). The approved [design](docs/superpowers/specs/2026-09-28-chvrn-design.md) records scope and ownership.
+- [User guide](docs/usage.md): commands, complete controls, patches, reports and safety.
+- [Integrations](docs/integrations.md): optional language servers, Herdr and local socket access.
+- [Demo and capture guide](docs/demo.md): reproducible merge and Git-review scenes.
+- [Development](docs/development.md): builds, checks, workspace structure and implementation contracts.

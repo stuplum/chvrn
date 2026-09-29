@@ -1,19 +1,41 @@
-# chvrn CLI contract for test review
+# Chvrn CLI contract
 
-The coordinator owns `/Users/stuart.plumbley/Personal Workspace/chvrn/crates/chvrn-cli/tests/cli.rs`. These are black-box consumer tests for the eventual `chvrn` Cargo binary. No binary or implementation exists at the test-review checkpoint. Proposed dev dependencies: `tempfile` and `serde_json`.
+The `chvrn-cli` package builds the `chvrn` executable. [Black-box consumer tests](../../crates/chvrn-cli/tests/cli.rs) exercise its headless interface; the [user guide](../usage.md) describes interactive workflows and controls. The [original test-review package](../review/README.md) is historical, not current implementation status.
+
+## Routing and terminal selection
+
+The commands are `diff`, `merge`, `review`, `difftool` and `mergetool`. No subcommand selects repository review against the index. The TUI opens only with terminal stdin and stdout, `--format auto` and no `--non-interactive`. Explicit `--format text` or `--format json` never launches it. Headless `auto` uses JSON.
+
+Operational/usage failures exit `2`. Quitting an interactive session exits `1`, never approval. Successful explicit interactive submission exits `0`. Repository submission can advance through multiple files before the process completes.
 
 ## File comparison
 
-`chvrn diff LEFT RIGHT --format json` reads explicit file paths, writes one JSON document to stdout and never modifies either input. Missing input is an error, not an empty file. JSON contains `equal: bool` and `hunks: [{left: {start, end}, right: {start, end}}]`, with zero-based half-open line ranges. Exit code 0 means equal, 1 means differences, and 2 means operational/usage failure. JSON output cannot contain terminal control sequences outside JSON strings.
+`chvrn diff LEFT RIGHT --format json` reads explicit paths and never modifies either input. Missing input is an error, not an empty file. Text JSON contains `equal: bool` and `hunks: [{left: {start, end}, right: {start, end}}]`, using zero-based half-open line ranges. Binary/invalid UTF-8 content is identified rather than opened for text editing. Equal content exits `0`; differences exit `1`. JSON has no terminal control sequences outside JSON strings.
 
-The eventual interactive invocation selects the TUI only when the relevant terminal streams are TTYs. Explicit machine-readable output never launches it.
+Interactive file comparison permits editing both buffers. `s` explicitly saves changed files; guarded replacement is atomic per file, not across both inputs. Quit discards no dirty text without confirmation and never implies saving.
 
-## Headless merge
+## Merge
 
-`chvrn merge --base BASE --ours OURS --theirs THEIRS --output RESULT --non-interactive` combines non-conflicting changes into RESULT while preserving the three inputs. Success is exit 0. Unresolved conflicts are exit 1 and must not create or replace RESULT. Operational/usage errors are exit 2. Existing-output and concurrent-write protections from the design still apply to successful writes; specifying an output is not permission to overwrite a later concurrent edit.
+`chvrn merge --base BASE --ours OURS --theirs THEIRS --output RESULT --non-interactive` combines conflict-free changes into RESULT while preserving the three inputs. Success exits `0`. Unresolved conflicts exit `1` without creating or replacing RESULT. Existing-output and concurrent-write guards also apply to successful writes.
 
-## Review gate
+Interactive merging shows ours/result/theirs with read-only source panes. Conflicts require source selection or manual acceptance. Resolving the final conflict opens confirmation; `s` can request confirmation manually. Only explicit `y` confirmation submits a resolved result for a guarded write. `n` or Escape returns to review.
 
-`chvrn review --herdr gate --agent AGENT --non-interactive` cannot accept a review on the user's behalf. Outside herdr it exits 2 without modifying files or contacting a different session. Standalone diff and merge remain usable outside herdr. Companion and automatic modes, Git difftool/mergetool entry points, patch input and socket composition retain the requirements in the main design and require real-runtime verification after implementation.
+## Repository review
 
-These tests prove CLI-visible data, exit codes and side effects once the real binary exists. They do not substitute for the core/Git tests or interactive terminal smoke checks.
+`--base index` compares worktree content with the inspected index. A revision base such as `HEAD` compares the worktree with its resolved tree. Positional review paths are repository-relative. The review retains index/worktree/reference state for the operations that validate it.
+
+Headless review emits `{base, patch_preview, files}` or a text summary, without staging, rejecting, importing a patch or submitting a report. Its equality/exit calculation compares content and deletion state; empty-file additions and mode-only differences may report equal. It is not a complete Git cleanliness predicate.
+
+Interactive `S` stages an exact textual hunk from an index review. Interactive `x` restores a textual hunk from a revision review, or declines an active patch preview. Both Git mutations are distinct from `s` review submission; quitting does not undo completed mutations. No action implicitly commits.
+
+`--patch FILE` previews candidate changes; interactive acceptance of every candidate file is required before application. `--export-patch PATH` needs revision-based interactive review and `P`. `--report PATH` writes after completed interactive submission. Merely passing export/report flags in headless mode does not produce those artefacts.
+
+## Git tools
+
+`difftool` accepts explicit paths or Git's `LOCAL`/`REMOTE` environment variables and reuses file comparison. `mergetool` accepts merge flags or Git's `BASE`/`LOCAL`/`REMOTE`/`MERGED` and reuses three-way merging. Missing required paths are errors. These entry points retain normal interactive/headless and write semantics.
+
+## Optional integrations
+
+Explicit `--herdr` modes require `HERDR_ENV=1`; gate mode also requires a TTY. Interactive Git review inside Herdr defaults to automatic mode, with `--agent` overriding the inherited `HERDR_PANE_ID`. Standalone file diff/merge do not construct the repository's Herdr adapter. No headless invocation accepts an agent review on the user's behalf.
+
+LSP requires explicit configuration. The private socket is started only by interactive repository review. Protocol/lifecycle tests do not establish arbitrary server/platform compatibility; see the [integration guide](../integrations.md) and [integration contract](integrations.md).

@@ -104,13 +104,15 @@ pub fn run(session: &mut ReviewSession, host: &mut impl ReviewHost) -> Result<u8
                 continue;
             }
         }
-        match host.input(session, &event) {
-            Ok(true) => continue,
-            Err(error) => {
-                session.set_message(error.to_string());
-                continue;
+        if !session.is_confirming_merge() {
+            match host.input(session, &event) {
+                Ok(true) => continue,
+                Err(error) => {
+                    session.set_message(error.to_string());
+                    continue;
+                }
+                Ok(false) => {}
             }
-            Ok(false) => {}
         }
         let input = match event {
             Event::Key(key) => ReviewInput::Key(key),

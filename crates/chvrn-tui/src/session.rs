@@ -471,6 +471,7 @@ pub struct ReviewSession {
     pub(crate) help_lines: Vec<String>,
     pub(crate) help_scroll: usize,
     pub(crate) confirming_discard: bool,
+    pub(crate) confirming_merge: bool,
     pub(crate) changed: bool,
     pub(crate) refresh_conflict: bool,
     pub(crate) pending: Option<DiffCompletion>,
@@ -514,6 +515,7 @@ impl ReviewSession {
             help_lines: Vec::new(),
             help_scroll: 0,
             confirming_discard: false,
+            confirming_merge: false,
             changed: false,
             refresh_conflict: false,
             pending: None,
@@ -586,6 +588,7 @@ impl ReviewSession {
             help_lines: Vec::new(),
             help_scroll: 0,
             confirming_discard: false,
+            confirming_merge: false,
             changed: false,
             refresh_conflict: false,
             pending: None,
@@ -608,6 +611,9 @@ impl ReviewSession {
 
     pub fn focus(&self) -> Pane {
         self.focus
+    }
+    pub fn is_confirming_merge(&self) -> bool {
+        self.confirming_merge
     }
     pub fn is_editing(&self) -> bool {
         self.editing
@@ -1186,7 +1192,7 @@ impl ReviewSession {
         *resolved = metadata.resolved;
     }
 
-    pub(crate) fn submit(&self) -> ReviewOutcome {
+    pub(crate) fn submit(&mut self) -> ReviewOutcome {
         if self.refresh_conflict {
             return ReviewOutcome::RefreshConflict;
         }
@@ -1196,6 +1202,12 @@ impl ReviewSession {
         if self.unresolved_conflicts() > 0 {
             return ReviewOutcome::UnresolvedConflicts(self.unresolved_conflicts());
         }
+        if matches!(&self.mode, Mode::ThreeWay { .. }) && !self.confirming_merge {
+            self.confirming_merge = true;
+            self.message.clear();
+            return ReviewOutcome::Continue;
+        }
+        self.confirming_merge = false;
         match &self.mode {
             Mode::TwoWay { left, right, .. } => ReviewOutcome::Submitted(ReviewSubmission {
                 left: left.buffer.text(),

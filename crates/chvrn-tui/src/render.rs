@@ -279,6 +279,8 @@ impl ReviewSession {
             "External changes conflict with local edits. R discards local edits and reloads; submit is blocked"
         } else if self.local_pending {
             "Updating edited diff; hunk apply and submit wait for the latest alignment"
+        } else if self.confirming_merge {
+            "[y] Write merge  [n/Esc] Review"
         } else {
             &self.message
         };
@@ -788,7 +790,10 @@ impl ReviewSession {
                 Mode::ThreeWay { .. } => "»/«: choose source   ↘/↙: insert remaining source below",
             },
             "w: whitespace policy   PageUp/PageDown: scroll",
-            "s: save/submit   q: quit without approval",
+            match self.mode {
+                Mode::TwoWay { .. } => "s: save/submit   q: quit without approval",
+                Mode::ThreeWay { .. } => "s: confirm merge   y: write   n/Esc: review   q: quit",
+            },
         ];
         for line in guide {
             wrap_help_line(&mut self.help_lines, line, width);

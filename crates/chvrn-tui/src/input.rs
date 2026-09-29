@@ -25,16 +25,18 @@ pub enum ReviewEditError {
 
 impl ReviewSession {
     pub fn handle(&mut self, input: ReviewInput) -> ReviewOutcome {
-        match input {
+        let unresolved_before = self.unresolved_conflicts();
+        let outcome = match input {
             ReviewInput::Key(event)
                 if matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
             {
                 self.handle_key(event)
             }
             ReviewInput::Key(_) => ReviewOutcome::Continue,
+            ReviewInput::Mouse(_) if self.confirming_merge => ReviewOutcome::Continue,
             ReviewInput::Mouse(event) => self.handle_mouse(event),
             ReviewInput::Paste(text) => {
-                if self.editing {
+                if self.editing && !self.confirming_merge {
                     self.insert_text(&text);
                 }
                 ReviewOutcome::Continue
@@ -67,7 +69,13 @@ impl ReviewSession {
                 }
                 ReviewOutcome::Continue
             }
+        };
+        if unresolved_before > 0 && self.unresolved_conflicts() == 0 {
+            self.confirming_merge = true;
+            self.editing = false;
+            self.message.clear();
         }
+        outcome
     }
 
     pub fn go_to(&mut self, pane: Pane, line: usize, grapheme: usize) {
@@ -178,6 +186,23 @@ impl ReviewSession {
         if self.confirming_discard {
             if event.code == KeyCode::Esc {
                 self.confirming_discard = false;
+            }
+            return ReviewOutcome::Continue;
+        }
+        if self.confirming_merge {
+            if event.kind != KeyEventKind::Press || !event.modifiers.is_empty() {
+                return ReviewOutcome::Continue;
+            }
+            match event.code {
+                KeyCode::Char('y') => return self.submit(),
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.confirming_merge = false;
+                    self.message.clear();
+                }
+                KeyCode::Char('s') if self.local_pending => {
+                    return ReviewOutcome::LocalDiffPending;
+                }
+                _ => {}
             }
             return ReviewOutcome::Continue;
         }

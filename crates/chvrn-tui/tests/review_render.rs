@@ -211,6 +211,10 @@ fn footer_merge_choices_follow_remaining_conflicts_through_resolution_undo_and_r
         );
     }
     session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Esc,
+        KeyModifiers::NONE,
+    )));
+    session.handle(ReviewInput::Key(KeyEvent::new(
         KeyCode::Char('u'),
         KeyModifiers::NONE,
     )));
@@ -481,6 +485,10 @@ fn accepting_a_source_removes_its_gutter_controls_and_click_targets() {
             KeyCode::Char(choice),
             KeyModifiers::NONE,
         )));
+        session.handle(ReviewInput::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
         let resolved = draw(&session, 120, 20);
         let controls = gutter_controls(&resolved);
         assert!(
@@ -521,6 +529,10 @@ fn the_remaining_source_offers_insertion_below_without_an_above_control() {
             KeyCode::Char(choice),
             KeyModifiers::NONE,
         )));
+        session.handle(ReviewInput::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
         let buffer = draw(&session, 120, 20);
         let controls = gutter_controls(&buffer);
         assert!(
@@ -551,6 +563,10 @@ fn inserting_the_remaining_source_consumes_its_control_and_undo_restores_it() {
     });
     session.handle(ReviewInput::Key(KeyEvent::new(
         KeyCode::Char('o'),
+        KeyModifiers::NONE,
+    )));
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Esc,
         KeyModifiers::NONE,
     )));
     let before = draw(&session, 120, 20);

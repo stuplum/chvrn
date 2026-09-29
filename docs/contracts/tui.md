@@ -83,6 +83,7 @@ impl ReviewSession {
     pub fn focus(&self) -> Pane;
     pub fn cursor(&self) -> Cursor;
     pub fn is_editing(&self) -> bool;
+    pub fn is_confirming_merge(&self) -> bool;
     pub fn is_dirty(&self) -> bool;
     pub fn is_local_diff_pending(&self) -> bool;
     pub fn poll_background(&mut self);
@@ -138,9 +139,13 @@ For a selected three-way conflict, `o`, `t` and `b` choose ours, theirs and both
 
 After a merge choice, accepted sources have no gutter control. An unaccepted, non-empty source offers one action to insert its complete original conflict block below the tracked result range: `↘` from ours or `↙` from theirs. Insertion marks that source accepted and removes its control; choosing both accepts both sources. Acceptance is explicit state, not inferred from text equality, so manual edits do not reactivate an accepted source. Insertion is additive without deduplication, preserves source line endings and existing manual edits, and supports an empty chosen result. Tracked result ranges and source acceptance participate in undo/redo alongside unresolved-conflict metadata. These actions neither resolve unrelated conflicts nor submit the result. No insert-above action is available.
 
-`s` explicitly submits a valid review, but returns `RefreshConflict` instead if an external refresh is pending against dirty buffers; unresolved merge conflicts likewise block merge submission. `q` on a clean session returns `Quit`; on a dirty session it returns `DiscardRequired` without discarding or submitting. Escape dismisses that confirmation and retains edits. Only `ConfirmDiscard` while confirmation is active returns `Quit` and drops the review without a submission. `Submitted` and `Quit` are distinct terminal outcomes. The review host must not infer approval from a quit.
+`s` explicitly submits a valid two-way review. In three-way mode it opens merge confirmation and returns `Continue`; resolving the final conflict also opens confirmation, including text-identical choices, deletion choices, mouse choices, manual acceptance and redo. `is_confirming_merge` exposes this state so hosts can leave confirmation input to the session rather than consuming it as an integration shortcut. While confirmation is open, an unmodified `y` key press submits the result; `n` or Escape returns to review without submitting. Other keys, key repeats, mouse actions and paste cannot edit or submit the result. Resizing and background completion remain available.
 
-`LocalDiffPending` is not approval or a terminal outcome; the review remains open for further editing, navigation or an explicit quit.
+Manual confirmation requests and confirmed submissions both check for `RefreshConflict`, pending local alignment and unresolved conflicts. Unresolved conflicts return `UnresolvedConflicts` with the remaining count rather than accepting provisional text. Confirmation does not write files; the host revalidates the source files and output destination before writing a `Submitted` result.
+
+`q` on a clean session returns `Quit`; on a dirty session it returns `DiscardRequired` without discarding or submitting. Escape dismisses that discard confirmation and retains edits. Only `ConfirmDiscard` while discard confirmation is active returns `Quit` and drops the review without a submission. `Submitted` and `Quit` are distinct terminal outcomes. The review host must not infer approval from a quit.
+
+`LocalDiffPending` is not approval or a terminal outcome; the review remains open. Dismiss merge confirmation before further editing, navigation or an explicit quit.
 
 ## Rendering contract
 

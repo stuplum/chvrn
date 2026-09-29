@@ -100,6 +100,7 @@ fn gutter_insertion_places_the_opposite_block_below_the_chosen_block() {
         );
         key(&mut session, KeyCode::Char(choice));
         assert_eq!(session.unresolved_conflicts(), 0);
+        key(&mut session, KeyCode::Esc);
 
         assert!(matches!(
             click_gutter_control(&mut session, symbol),
@@ -113,8 +114,9 @@ fn gutter_insertion_places_the_opposite_block_below_the_chosen_block() {
             "head\nours-a\nours-b\ntail\n"
         );
         assert_eq!(session.pane_text(Pane::Theirs), "head\ntheirs\ntail\n");
+        key(&mut session, KeyCode::Char('s'));
         assert!(matches!(
-            key(&mut session, KeyCode::Char('s')),
+            key(&mut session, KeyCode::Char('y')),
             ReviewOutcome::Submitted(submission) if submission.result.as_deref() == Some(expected)
         ));
     }
@@ -129,6 +131,7 @@ fn gutter_insertion_preserves_duplicate_lines_in_the_two_blocks() {
     );
     assert_eq!(session.unresolved_conflicts(), 1);
     key(&mut session, KeyCode::Char('o'));
+    key(&mut session, KeyCode::Esc);
 
     click_gutter_control(&mut session, "↙");
 
@@ -146,6 +149,7 @@ fn gutter_insertion_undo_restores_the_choice_before_undoing_the_resolution() {
         "head\ntheirs\ntail\n",
     );
     key(&mut session, KeyCode::Char('o'));
+    key(&mut session, KeyCode::Esc);
     click_gutter_control(&mut session, "↙");
 
     key(&mut session, KeyCode::Char('u'));
@@ -202,7 +206,7 @@ fn gutter_insertion_leaves_later_conflicts_unresolved_and_targetable() {
     );
     assert_eq!(session.unresolved_conflicts(), 0);
     assert!(matches!(
-        key(&mut session, KeyCode::Char('s')),
+        key(&mut session, KeyCode::Char('y')),
         ReviewOutcome::Submitted(submission)
             if submission.result.as_deref() == Some(
                 "head\ntheirs-one\nλours-one-a\nours-one-b\nkeep\nstay\ntheirs-two-a\ntheirs-two-b\ntail\n"
@@ -218,6 +222,7 @@ fn gutter_insertion_preserves_manual_edits_to_the_result() {
         "head\ntheirs\ntail\n",
     );
     key(&mut session, KeyCode::Char('o'));
+    key(&mut session, KeyCode::Esc);
     session.go_to(Pane::Result, 0, 0);
     key(&mut session, KeyCode::Char('i'));
     key(&mut session, KeyCode::Char('X'));
@@ -248,6 +253,7 @@ fn gutter_insertion_can_restore_code_after_choosing_a_deletion() {
         key(&mut session, KeyCode::Char(choice));
         assert_eq!(session.pane_text(Pane::Result), "head\ntail\n");
         assert_eq!(session.unresolved_conflicts(), 0);
+        key(&mut session, KeyCode::Esc);
 
         click_gutter_control(&mut session, symbol);
 
@@ -498,16 +504,216 @@ fn conflict_choices_use_the_chosen_bytes_and_allow_submission_only_after_resolut
             ReviewOutcome::UnresolvedConflicts(1)
         );
         assert_eq!(session.unresolved_conflicts(), 1);
-        key(&mut session, KeyCode::Char(choice));
+        assert_eq!(
+            key(&mut session, KeyCode::Char(choice)),
+            ReviewOutcome::Continue
+        );
         assert_eq!(session.unresolved_conflicts(), 0);
         assert_eq!(session.pane_text(Pane::Result), expected);
         assert_eq!(session.pane_text(Pane::Ours), "head\nours\ntail\n");
         assert_eq!(session.pane_text(Pane::Theirs), "head\ntheirs\ntail\n");
         assert!(matches!(
-            key(&mut session, KeyCode::Char('s')),
+            key(&mut session, KeyCode::Char('y')),
             ReviewOutcome::Submitted(submission) if submission.result.as_deref() == Some(expected)
         ));
     }
+}
+
+#[test]
+fn merge_confirmation_is_offered_when_accepting_a_deletion_leaves_the_preview_unchanged() {
+    let mut session =
+        ReviewSession::three_way("head\nbase\ntail\n", "head\ntail\n", "head\ntheirs\ntail\n");
+    assert_eq!(session.unresolved_conflicts(), 1);
+    assert_eq!(session.pane_text(Pane::Result), "head\ntail\n");
+
+    assert_eq!(
+        key(&mut session, KeyCode::Char('o')),
+        ReviewOutcome::Continue
+    );
+    assert_eq!(session.pane_text(Pane::Result), "head\ntail\n");
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Submitted(submission)
+            if submission.result.as_deref() == Some("head\ntail\n")
+    ));
+}
+
+#[test]
+fn merge_confirmation_is_offered_after_resolving_the_final_conflict_with_the_mouse() {
+    let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+
+    assert_eq!(
+        click_gutter_control(&mut session, "«"),
+        ReviewOutcome::Continue
+    );
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Submitted(submission)
+            if submission.result.as_deref() == Some("theirs\n")
+    ));
+}
+
+#[test]
+fn merge_confirmation_cannot_accept_remaining_conflicts() {
+    let mut session = ReviewSession::three_way(
+        "head\nbase-one\nkeep\nstay\nbase-two\ntail\n",
+        "head\nours-one\nkeep\nstay\nours-two\ntail\n",
+        "head\ntheirs-one\nkeep\nstay\ntheirs-two\ntail\n",
+    );
+    assert_eq!(session.unresolved_conflicts(), 2);
+    key(&mut session, KeyCode::Char('o'));
+
+    assert_eq!(session.unresolved_conflicts(), 1);
+    assert_eq!(
+        key(&mut session, KeyCode::Char('s')),
+        ReviewOutcome::UnresolvedConflicts(1)
+    );
+    assert_eq!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Continue
+    );
+    assert_eq!(session.unresolved_conflicts(), 1);
+
+    assert_eq!(
+        key(&mut session, KeyCode::Char('t')),
+        ReviewOutcome::Continue
+    );
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Submitted(submission)
+            if submission.result.as_deref()
+                == Some("head\nours-one\nkeep\nstay\ntheirs-two\ntail\n")
+    ));
+}
+
+#[test]
+fn merge_confirmation_can_be_cancelled_then_reopened_to_submit_further_edits() {
+    for cancel in [KeyCode::Char('n'), KeyCode::Esc] {
+        let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+        key(&mut session, KeyCode::Char('o'));
+
+        assert_eq!(key(&mut session, cancel), ReviewOutcome::Continue);
+        assert_eq!(
+            key(&mut session, KeyCode::Char('y')),
+            ReviewOutcome::Continue
+        );
+        assert_eq!(session.pane_text(Pane::Result), "ours\n");
+        assert_eq!(session.unresolved_conflicts(), 0);
+
+        session.go_to(Pane::Result, 0, 0);
+        key(&mut session, KeyCode::Char('i'));
+        key(&mut session, KeyCode::Char('X'));
+        key(&mut session, KeyCode::Esc);
+        assert_eq!(session.pane_text(Pane::Result), "Xours\n");
+        assert_eq!(
+            key(&mut session, KeyCode::Char('s')),
+            ReviewOutcome::Continue
+        );
+        assert!(matches!(
+            key(&mut session, KeyCode::Char('y')),
+            ReviewOutcome::Submitted(submission)
+                if submission.result.as_deref() == Some("Xours\n")
+        ));
+    }
+}
+
+#[test]
+fn merge_confirmation_requires_explicit_acceptance_of_an_automatically_merged_result() {
+    let mut session = ReviewSession::three_way(
+        "one\r\ntwo\r\nthree",
+        "ONE\r\ntwo\r\nthree",
+        "one\r\ntwo\r\nTHREE",
+    );
+    assert_eq!(session.unresolved_conflicts(), 0);
+
+    assert_eq!(
+        key(&mut session, KeyCode::Char('s')),
+        ReviewOutcome::Continue
+    );
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Submitted(submission)
+            if submission.result.as_deref() == Some("ONE\r\ntwo\r\nTHREE")
+    ));
+}
+
+#[test]
+fn merge_confirmation_is_offered_again_after_undo_and_redo_of_the_final_choice() {
+    let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+    key(&mut session, KeyCode::Char('o'));
+    key(&mut session, KeyCode::Esc);
+    key(&mut session, KeyCode::Char('u'));
+
+    assert_eq!(session.unresolved_conflicts(), 1);
+    assert_eq!(
+        key(&mut session, KeyCode::Char('s')),
+        ReviewOutcome::UnresolvedConflicts(1)
+    );
+    assert_eq!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Continue
+    );
+    assert_eq!(ctrl_r(&mut session), ReviewOutcome::Continue);
+    assert_eq!(session.unresolved_conflicts(), 0);
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Submitted(submission)
+            if submission.result.as_deref() == Some("ours\n")
+    ));
+}
+
+#[test]
+fn merge_confirmation_does_not_submit_a_result_while_its_latest_alignment_is_pending() {
+    let original: String = (0..20_000).map(|line| format!("line{line:05}\n")).collect();
+    let mut session = ReviewSession::three_way(&original, &original, &original);
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('s')),
+        ReviewOutcome::Continue
+    ));
+
+    let revised = original.replace("line10000", "reviewed result");
+    session.replace_pane_text(Pane::Result, &revised).unwrap();
+    assert!(session.is_local_diff_pending());
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::LocalDiffPending
+    ));
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('s')),
+        ReviewOutcome::LocalDiffPending
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.is_local_diff_pending() && Instant::now() < deadline {
+        session.poll_background();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!session.is_local_diff_pending());
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('s')),
+        ReviewOutcome::Continue
+    ));
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Submitted(submission)
+            if submission.result.as_deref() == Some(revised.as_str())
+    ));
+}
+
+#[test]
+fn merge_confirmation_prevents_edit_keys_and_paste_from_changing_the_result() {
+    let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+    key(&mut session, KeyCode::Char('o'));
+
+    key(&mut session, KeyCode::Char('i'));
+    session.handle(ReviewInput::Paste("accidental edit\n".to_owned()));
+    key(&mut session, KeyCode::Char('t'));
+    assert_eq!(session.pane_text(Pane::Result), "ours\n");
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('y')),
+        ReviewOutcome::Submitted(submission)
+            if submission.result.as_deref() == Some("ours\n")
+    ));
 }
 
 #[test]
@@ -521,11 +727,14 @@ fn manually_edited_result_is_a_distinct_conflict_choice() {
     key(&mut session, KeyCode::Esc);
     assert_eq!(session.pane_text(Pane::Result), "Xours\n");
     assert_eq!(session.unresolved_conflicts(), 1);
-    key(&mut session, KeyCode::Char('r'));
+    assert_eq!(
+        key(&mut session, KeyCode::Char('r')),
+        ReviewOutcome::Continue
+    );
 
     assert_eq!(session.unresolved_conflicts(), 0);
     assert!(matches!(
-        key(&mut session, KeyCode::Char('s')),
+        key(&mut session, KeyCode::Char('y')),
         ReviewOutcome::Submitted(submission) if submission.result.as_deref() == Some("Xours\n")
     ));
 }
@@ -672,6 +881,7 @@ fn undoing_a_conflict_choice_restores_unresolved_merge_state() {
     key(&mut session, KeyCode::Char('t'));
     assert_eq!(session.pane_text(Pane::Result), "theirs\n");
     assert_eq!(session.unresolved_conflicts(), 0);
+    key(&mut session, KeyCode::Esc);
 
     key(&mut session, KeyCode::Char('u'));
     assert_eq!(session.pane_text(Pane::Result), "ours\n");
@@ -734,6 +944,7 @@ fn undoing_a_deletion_choice_preserves_an_earlier_text_changing_resolution() {
     assert_eq!(session.unresolved_conflicts(), 1);
     key(&mut session, KeyCode::Char('o'));
     assert_eq!(session.unresolved_conflicts(), 0);
+    key(&mut session, KeyCode::Esc);
 
     key(&mut session, KeyCode::Char('u'));
     assert_eq!(session.pane_text(Pane::Result), first_resolved);

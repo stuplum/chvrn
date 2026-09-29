@@ -42,6 +42,8 @@ Each pane displays continuous real lines rather than blank alignment rows. Shade
 
 Click `»` or `«` to copy only that source hunk across a two-way comparison, or choose that source for one unresolved merge conflict. Accepted sources have no gutter control. The remaining source offers one insert-below control: `↘` from ours or `↙` from theirs. Inserting that source consumes its control; choosing both leaves neither control. Insertion preserves manual edits and duplicate lines, supports undo/redo of both text and available controls, and leaves unrelated conflicts untouched. Merge choices remain undoable even when they leave the text unchanged, including accepting a deletion. Saving remains explicit.
 
+Resolving the final conflict opens a confirmation prompt; `s` opens it manually, including for a conflict-free merge. Press `y` to write the result and exit, or `n`/Escape to continue reviewing, editing or inserting another source. Other keys, mouse actions and paste do not change the result while confirmation is open. Unresolved conflicts block confirmation and report how many remain. The input files and output destination are revalidated when the write is confirmed.
+
 Truecolour terminals give the intended palette. `NO_COLOR` disables colours. No Powerline/Nerd Font is required; connectors use ordinary Unicode block characters and arrows. Terminal cells approximate diagonal edges rather than reproducing a graphical editor's smooth curves.
 
 The normal footer highlights shortcuts before a dimmed, right-aligned filename. Two-way comparisons show the focused file; merges show the output file. Filenames shorten before essential save, quit and help shortcuts are dropped. Merge-choice hints appear only for a selected unresolved conflict; insert mode shows editing controls instead. Warnings and host status messages take precedence over the normal footer.
@@ -63,7 +65,8 @@ Press `?` for editor help, including full source and output paths. Help wraps lo
 | Home, End, PageUp, PageDown | Navigate |
 | Shift-Left / Shift-Right | Horizontal scroll |
 | `w` | Cycle exact, ignore-edge, ignore-all and ignore-blank-lines matching |
-| `s` | Save/submit explicitly |
+| `s` | Save/submit a two-way review, or open merge confirmation |
+| `y`, `n` / Escape | At merge confirmation, write and exit or return to review |
 | `q` | Quit without approval; dirty buffers require `y` to discard |
 | `R` | Explicitly discard local edits and load a conflicting external refresh |
 | `o`, `t`, `b` | Resolve selected merge conflict with ours, theirs or both |

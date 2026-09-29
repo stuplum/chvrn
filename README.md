@@ -25,12 +25,10 @@ Chvrn keeps comparison and editing in the same view. Follow a change across conn
 
 ## Install
 
-Build from source with **stable Rust and Git**:
+Install directly from GitHub with **stable Rust and Git**. Cargo downloads and compiles the source; no manual clone is needed:
 
 ```sh
-git clone https://github.com/stuplum/chvrn.git
-cd chvrn
-cargo install --locked --path crates/chvrn-cli
+cargo install --locked --git https://github.com/stuplum/chvrn.git chvrn-cli
 chvrn --help
 ```
 

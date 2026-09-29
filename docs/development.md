@@ -6,14 +6,22 @@
 
 Use stable Rust and Git. The workspace declares Rust `1.85` as its minimum and uses edition `2024`; the configured CI jobs use stable Rust, not a separate minimum-version matrix. The current integration crate depends on Unix APIs, so do not assume the standalone binary builds on Windows merely because a particular command does not use a socket.
 
-From the repository root, build without installing:
+Install directly from GitHub without maintaining a local checkout:
 
 ```sh
+cargo install --locked --git https://github.com/stuplum/chvrn.git chvrn-cli
+```
+
+For development, clone the repository and build without installing:
+
+```sh
+git clone https://github.com/stuplum/chvrn.git
+cd chvrn
 cargo build --release --locked
 "$PWD/target/release/chvrn" --help
 ```
 
-Or install the executable into Cargo's binary directory:
+Or install from that local checkout into Cargo's binary directory:
 
 ```sh
 cargo install --locked --path crates/chvrn-cli

@@ -35,6 +35,15 @@ Headless repository equality is based on compared content and deletion state. An
 
 ## Two-way comparison
 
+Try a comparison using disposable files:
+
+```sh
+demo=$(mktemp -d)
+printf 'Hello\nKeep this line\n' > "$demo/before.txt"
+printf 'Welcome\nKeep this line\nOne more line\n' > "$demo/after.txt"
+chvrn diff "$demo/before.txt" "$demo/after.txt"
+```
+
 Both files are editable in `diff`. Click `»` or `«` beside a hunk to copy that source region into the other buffer, or focus the source pane and press `a`. This is a selected-hunk operation, not whole-file replacement. Edit either pane with `i`, then press Escape to return to navigation.
 
 `s` writes changed files and exits. `q` does not save pending edits; dirty buffers require explicit discard confirmation. A multi-file save is not atomic across both files. Source files are checked again before saving, and a partial failure names files already written.
@@ -115,7 +124,17 @@ Patch processing validates paths and preimages, preserves CRLF and missing final
 
 ## Git difftool and mergetool
 
-Configure the current repository as shown in the [README](../README.md#use-with-git), then run:
+Run these inside the repository where you want Chvrn as your diff and merge tool. They change repository-local Git configuration:
+
+```sh
+git config diff.tool chvrn
+git config difftool.chvrn.cmd 'chvrn difftool "$LOCAL" "$REMOTE"'
+git config merge.tool chvrn
+git config mergetool.chvrn.cmd 'chvrn mergetool --base "$BASE" --ours "$LOCAL" --theirs "$REMOTE" --output "$MERGED"'
+git config mergetool.chvrn.trustExitCode true
+```
+
+Then run:
 
 ```sh
 git difftool

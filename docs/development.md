@@ -29,6 +29,8 @@ cargo install --locked --path crates/chvrn-cli
 
 The package is named `chvrn-cli`; the executable is **`chvrn`**. The source-install route is documented rather than an unverified package-manager command or release-binary URL.
 
+Cargo installs `chvrn` into its binary directory, normally `~/.cargo/bin`; that directory must be on `PATH`.
+
 The release profile uses thin LTO and strips debug information. A local macOS Rust toolchain has reported a `rust-objcopy` missing-`libLLVM.dylib` stripping warning while still producing a working binary. That is a toolchain diagnostic, not a reason to suppress build failures or claim every installation is verified.
 
 ## Checks
@@ -72,3 +74,7 @@ Optional Jev-assisted merge choices remain a [backlog item](../TODO.md), not a s
 - [Demo guide](demo.md): disposable fixtures, expected states and visual capture instructions.
 
 Keep claims tied to observable behaviour. Distinguish library APIs, CLI features, automated checks and real-terminal verification rather than presenting them as interchangeable evidence.
+
+## Licence
+
+Chvrn is licensed under the [GNU General Public License, version 3 only](../LICENSE) (`GPL-3.0-only`). Commercial use is permitted. Distributing Chvrn or a modified version requires compliance with the GPLv3 source-code and notice requirements. Using Chvrn to review or edit your own code does not change that code's licence.

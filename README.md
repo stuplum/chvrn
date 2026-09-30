@@ -114,3 +114,11 @@ Text editing requires UTF-8. Binary content is identified rather than rewritten.
 - [Integrations](docs/integrations.md): optional language servers, Herdr and local socket access.
 - [Demo and capture guide](docs/demo.md): reproducible merge and Git-review scenes.
 - [Development](docs/development.md): builds, checks, workspace structure and implementation contracts.
+
+## Licence
+
+Copyright (c) 2026 Stuart Plumbley.
+
+Chvrn is licensed under the [GNU General Public License, version 3 only](LICENSE) (`GPL-3.0-only`).
+
+Commercial use is permitted. If you distribute Chvrn or a modified version, you must comply with the GPLv3 source-code and notice requirements. Using Chvrn to review or edit your own code does not change that code's licence.

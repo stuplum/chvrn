@@ -2,9 +2,9 @@
 
 **Editable diffs, three-way merges and Git review in your terminal.**
 
-[![Three-way merge capture placeholder: Ours, Merged result and Theirs, with connected change regions.](docs/assets/merge-preview.svg)](docs/demo.md)
+[![Chvrn merging TypeScript files across Ours, Merged result and Theirs, with connected change regions.](docs/assets/merge-terminal-capture.png)](docs/assets/merge-terminal-capture.png)
 
-*Visual placeholder, not a screenshot. [Reproduce the scene and capture the demo.](docs/demo.md)*
+*Rendered from captured Chvrn terminal output, not a native-window screenshot. [Reproduce the demo.](docs/demo.md)*
 
 Chvrn keeps comparison and editing in the same view. Follow a change across connected panes, copy just the hunk you want, or edit the result directly. Review and resolve without switching between a diff viewer and an editor.
 

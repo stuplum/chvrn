@@ -2,7 +2,7 @@
 
 [Back to Chvrn](../README.md) · [User guide](usage.md)
 
-The README reserves one prominent visual for a three-way merge. Its current SVG is explicitly a layout placeholder, not a screenshot. Replace it with a real terminal capture of the scene below. One image is enough for the landing page; an optional Git-review capture belongs in the user guide only if it adds useful context.
+The README shows a [three-way merge capture](assets/merge-terminal-capture.png) reconstructed from Chvrn's actual terminal output. Text, positions and colours come from the running application; full- and half-block characters are drawn to their cell boundaries. It is not a native-window screenshot. One image is enough for the landing page; an optional Git-review capture belongs in the user guide only if it adds useful context.
 
 ## Prerequisites
 
@@ -109,7 +109,7 @@ The frame should contain:
 
 Capture **before** inserting the remaining source or resolving `reviewers`. Do not capture a help overlay or a confirmation prompt as the primary image: both hide the interaction the image is meant to explain.
 
-Save the final image as `docs/assets/merge-preview.png` within your Chvrn checkout. Replace the README image link with that asset, use the alt text below, and remove both the placeholder caption and the old SVG:
+For a future native-window capture, save the final image as `docs/assets/merge-terminal-capture.png` within your Chvrn checkout. Keep the README image link pointing to that asset, use the alt text below, and update the caption and this guide to describe the new capture method:
 
 > Chvrn merging TypeScript files: a resolved notification list with an insert-below control, beside an unresolved reviewer list across Ours, Merged result and Theirs.
 

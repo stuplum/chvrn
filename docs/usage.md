@@ -31,7 +31,7 @@ Headless diff and repository review inspect without changing files. **Headless m
 | `1` | Detected headless differences, unresolved merge conflicts, a declined patch or interactive quit. |
 | `2` | Operational or usage error. |
 
-Headless repository equality is based on compared content and deletion state. An added empty file or mode-only change can report equal and exit `0`; do not use that result as a complete Git cleanliness check.
+Headless review compares content using the selected whitespace policy, plus file existence and Git file mode. Empty-file additions/deletions and permission-only changes count as differences even when there are no textual hunks.
 
 ## Two-way comparison
 
@@ -118,7 +118,7 @@ chvrn review --base HEAD --export-patch /tmp/chvrn-export.patch
 
 `--patch` opens a preview, including files not already changed in the worktree. Accept every preview file with `s` to apply the candidate. `x` declines a preview; unlike `x` in ordinary revision review, it does not restore a worktree hunk. Headless patch review only prints the preview.
 
-Patch export requires a revision-based review and `P`. Merely supplying `--export-patch` does not create a file. Likewise, `--report` writes only on completed interactive submission. Neither option creates its output in headless review.
+Patch export requires a revision-based interactive review and `P`. `--report` writes only on completed interactive submission. In headless mode, either option fails with exit code `2` and an explanation rather than silently omitting the output. Omit these options to inspect changes without an interactive review.
 
 Patch processing validates paths and preimages, preserves CRLF and missing final-newline markers, and does not stage or commit. Binary patches are not supported. Preflight validation is not a multi-file filesystem transaction; later write failures can leave earlier files changed and are reported.
 
@@ -183,12 +183,10 @@ The header distinguishes `modified` and `INSERT` with labels as well as colour. 
 
 ## Safety and current limitations
 
-- **Text fidelity:** UTF-8 text is editable; binary or invalid UTF-8 inputs are identified rather than lossily decoded. Original line endings and final-newline state are retained. Whitespace matching modes do not normalise saved bytes.
-- **Write guards:** The relevant operation checks inspected content, reference and destination state. Unsafe paths and symlink targets are refused. These checks do not constitute a filesystem-wide lock against arbitrary concurrent writers.
 - **Per-file replacement:** Replacement is atomic per file, not across a collection of files. Partial filesystem failures are reported. Do not assume a failed multi-file operation wrote nothing.
 - **Large files:** Large local diff/syntax refreshes use a coalescing background worker. Hunk actions and submission wait for current alignment. Startup and initial merge construction still run before the first frame. No general speed advantage has been measured.
 - **Language scope:** Tree-sitter highlighting covers `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py` and `.json`. Other UTF-8 files use textual comparison. The core library also classifies top-level structural changes; these classifications are not displayed by the TUI and are not semantic refactoring or syntax-aware merge.
-- **Git scope:** Review is worktree-versus-index or worktree-versus-revision, not a three-layer Git dashboard. Headless equality has the empty-file/mode-only caveat above. TUI staging/rejection requires textual hunks. Report/export flags require interactive actions.
+- **Git scope:** Review compares the worktree with the index or a revision, not all three at once. Interactive staging/restoring requires textual hunks. Report and patch-file export require interactive review.
 - **Platforms:** Interactive checks have exercised macOS arm64. Linux/macOS CI configuration does not establish Linux terminal behaviour. Windows is not a supported claim; the current integration crate uses Unix APIs. Native non-UTF-8 path tests exclude Apple filesystems, which rejected the fixture itself.
 - **Integrations:** Previous real-server checks exercised clangd and Herdr 0.9.0. Other language-server combinations are not runtime-verified. See the [integration guide](integrations.md) for language IDs, explicit setup and delivery limits.
 

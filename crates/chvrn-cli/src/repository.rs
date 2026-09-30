@@ -55,7 +55,8 @@ struct PatchPreview {
 }
 
 pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
-    if matches!(options.herdr, Some(HerdrMode::Gate)) && !options.interactive() {
+    let interactive = options.interactive();
+    if matches!(options.herdr, Some(HerdrMode::Gate)) && !interactive {
         return Err(
             "an explicit review gate requires an interactive terminal; no review was accepted"
                 .into(),
@@ -64,6 +65,12 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
     let repo = Repository::discover(&std::env::current_dir()?)?;
     if args.open_companion {
         return herdr_ui::open_companion(&args, options, repo.root());
+    }
+    if !interactive && (args.report.is_some() || args.export_patch.is_some()) {
+        return Err(
+            "--report and --export-patch require an interactive terminal and review actions; omit these options for headless review"
+                .into(),
+        );
     }
     let patch = args.patch.as_deref().map(read_bytes).transpose()?;
     let inspected = match &patch {
@@ -81,21 +88,24 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
             })
         })
         .transpose()?;
-    if !options.interactive() {
+    if !interactive {
         let files: Vec<Value> = match &preview {
             Some(preview) => preview
                 .candidates
                 .iter()
                 .map(|candidate| {
-                    let before = inspected
-                        .file(&candidate.path)
-                        .and_then(|file| file.worktree.as_deref())
-                        .unwrap_or_default();
+                    let file = inspected.file(&candidate.path);
+                    let before = file.and_then(|file| file.worktree.as_deref());
                     let mut value = diff_value(
-                        before,
+                        before.unwrap_or_default(),
                         candidate.bytes.as_deref().unwrap_or_default(),
                         &candidate.path,
                         options.whitespace.into(),
+                    );
+                    value["equal"] = json!(
+                        value["equal"] == true
+                            && before.is_some() == candidate.bytes.is_some()
+                            && file.and_then(|file| file.mode) == candidate.mode
                     );
                     value["path"] = json!(candidate.path.to_string_lossy());
                     value["path_bytes"] = path_value(&candidate.path);
@@ -113,6 +123,11 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
                         &file.path,
                         options.whitespace.into(),
                     );
+                    value["equal"] = json!(
+                        value["equal"] == true
+                            && file.base.is_some() == file.worktree.is_some()
+                            && file.base_mode == file.mode
+                    );
                     value["path"] = json!(file.path.to_string_lossy());
                     value["path_bytes"] = path_value(&file.path);
                     value["deleted"] = json!(file.worktree.is_none());
@@ -120,9 +135,7 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
                 })
                 .collect(),
         };
-        let different = files
-            .iter()
-            .any(|file| file["equal"] != true || file["deleted"] == true);
+        let different = files.iter().any(|file| file["equal"] != true);
         print_value(
             &json!({"base": args.base, "patch_preview": preview.is_some(), "files": files}),
             options.format,

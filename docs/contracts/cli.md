@@ -24,11 +24,11 @@ Interactive merging shows ours/result/theirs with read-only source panes. Confli
 
 `--base index` compares worktree content with the inspected index. A revision base such as `HEAD` compares the worktree with its resolved tree. Positional review paths are repository-relative. The review retains index/worktree/reference state for the operations that validate it.
 
-Headless review emits `{base, patch_preview, files}` or a text summary, without staging, rejecting, importing a patch or submitting a report. Its equality/exit calculation compares content and deletion state; empty-file additions and mode-only differences may report equal. It is not a complete Git cleanliness predicate.
+Headless review emits `{base, patch_preview, files}` or a text summary, without staging, rejecting, importing a patch or submitting a report. Each file's `equal` combines content comparison under the selected whitespace policy with matching file existence and Git file mode. Empty-file additions/deletions and mode-only changes are unequal even without textual hunks. The exit code is `1` if any file is unequal, otherwise `0`. Patch previews compare the inspected worktree with the proposed bytes, existence and mode; ordinary review compares the selected base with the worktree.
 
 Interactive `S` stages an exact textual hunk from an index review. Interactive `x` restores a textual hunk from a revision review, or declines an active patch preview. Both Git mutations are distinct from `s` review submission; quitting does not undo completed mutations. No action implicitly commits.
 
-`--patch FILE` previews candidate changes; interactive acceptance of every candidate file is required before application. `--export-patch PATH` needs revision-based interactive review and `P`. `--report PATH` writes after completed interactive submission. Merely passing export/report flags in headless mode does not produce those artefacts.
+`--patch FILE` previews candidate changes; interactive acceptance of every candidate file is required before application. `--export-patch PATH` needs revision-based interactive review and `P`. `--report PATH` writes after completed interactive submission. Either output option in headless review fails with exit code `2` and an actionable diagnostic before inspecting changed files or accessing output destinations. `--open-companion` retains its separate launcher behaviour and forwards these options to the interactive companion.
 
 ## Git tools
 

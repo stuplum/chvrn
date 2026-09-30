@@ -83,12 +83,12 @@ pub struct Change {
 pub struct ReviewedFile {
     pub path: PathBuf,
     pub base: Option<Vec<u8>>,
+    pub base_mode: Option<u32>,
     pub index: Option<Vec<u8>>,
     pub worktree: Option<Vec<u8>>,
     pub mode: Option<u32>,
     pub content: ContentKind,
     hunks: Vec<Hunk>,
-    base_mode: Option<u32>,
     worktree_mode: Option<u32>,
 }
 

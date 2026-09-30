@@ -334,3 +334,196 @@ fn merge_refuses_symlink_output_without_touching_its_target() {
             .is_symlink()
     );
 }
+
+fn repository(entries: &[(&str, &[u8])]) -> TempDir {
+    let root = files(entries);
+    git(root.path(), &["init", "-q"]);
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "initial"]);
+    root
+}
+
+fn assert_metadata_difference(output: Output, path: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["files"][0]["path"], path);
+    assert_eq!(result["files"][0]["equal"], false);
+    assert_eq!(result["files"][0]["hunks"], serde_json::json!([]));
+}
+
+#[test]
+fn repository_review_detects_empty_file_additions() {
+    let root = repository(&[("note.txt", b"same\n")]);
+    fs::write(root.path().join("empty.txt"), b"").unwrap();
+
+    for base in ["index", "HEAD"] {
+        assert_metadata_difference(
+            invoke(root.path(), &["review", "--base", base]),
+            "empty.txt",
+        );
+        let output = invoke(root.path(), &["review", "--base", base, "--format", "text"]);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("! "));
+    }
+    assert_eq!(fs::read(root.path().join("empty.txt")).unwrap(), b"");
+    assert_eq!(git(root.path(), &["ls-files"]).stdout, b"note.txt\n");
+}
+
+#[test]
+fn repository_review_marks_deleted_empty_files_as_different() {
+    let root = repository(&[("empty.txt", b"")]);
+    fs::remove_file(root.path().join("empty.txt")).unwrap();
+
+    for base in ["index", "HEAD"] {
+        assert_metadata_difference(
+            invoke(root.path(), &["review", "--base", base]),
+            "empty.txt",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_review_detects_permission_changes_without_text_changes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = files(&[("script.sh", b"echo hello\n")]);
+    let path = root.path().join("script.sh");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    git(root.path(), &["init", "-q"]);
+    git(root.path(), &["config", "core.filemode", "true"]);
+    git(root.path(), &["add", "script.sh"]);
+    git(root.path(), &["commit", "-qm", "initial"]);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+
+    for base in ["index", "HEAD"] {
+        assert_metadata_difference(
+            invoke(root.path(), &["review", "--base", base]),
+            "script.sh",
+        );
+    }
+    assert_eq!(fs::read(&path).unwrap(), b"echo hello\n");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(
+        git(root.path(), &["ls-files", "--stage"])
+            .stdout
+            .starts_with(b"100644 ")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn whitespace_filtering_does_not_hide_permission_changes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = files(&[("note.txt", b"same\n")]);
+    let path = root.path().join("note.txt");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    git(root.path(), &["init", "-q"]);
+    git(root.path(), &["config", "core.filemode", "true"]);
+    git(root.path(), &["add", "note.txt"]);
+    git(root.path(), &["commit", "-qm", "initial"]);
+    fs::write(&path, b"  same  \n").unwrap();
+
+    let args = ["review", "--whitespace", "ignore-edge", "note.txt"];
+    let output = invoke(root.path(), &args);
+    assert_eq!(output.status.code(), Some(0));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["files"][0]["equal"], true);
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_metadata_difference(invoke(root.path(), &args), "note.txt");
+}
+
+#[test]
+fn patch_preview_detects_empty_file_creation_and_deletion_without_applying_them() {
+    for (mode, existing) in [("new", false), ("deleted", true)] {
+        let root = repository(&[("note.txt", b"same\n")]);
+        let patch = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            patch.path(),
+            format!("diff --git a/empty.txt b/empty.txt\n{mode} file mode 100644\n"),
+        )
+        .unwrap();
+        if existing {
+            fs::write(root.path().join("empty.txt"), b"").unwrap();
+        }
+
+        assert_metadata_difference(
+            invoke(
+                root.path(),
+                &["review", "--patch", patch.path().to_str().unwrap()],
+            ),
+            "empty.txt",
+        );
+        assert_eq!(root.path().join("empty.txt").exists(), existing);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn patch_preview_detects_permission_changes_without_applying_them() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = repository(&[("script.sh", b"echo hello\n")]);
+    let path = root.path().join("script.sh");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let patch = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        patch.path(),
+        b"diff --git a/script.sh b/script.sh\nold mode 100644\nnew mode 100755\n",
+    )
+    .unwrap();
+
+    assert_metadata_difference(
+        invoke(
+            root.path(),
+            &["review", "--patch", patch.path().to_str().unwrap()],
+        ),
+        "script.sh",
+    );
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
+#[test]
+fn headless_review_rejects_report_and_export_requests_without_touching_destinations() {
+    let root = repository(&[("note.txt", b"same\n")]);
+    fs::write(root.path().join("note.txt"), b"changed\n").unwrap();
+    let destination = tempfile::NamedTempFile::new().unwrap();
+    fs::write(destination.path(), b"previous output\n").unwrap();
+
+    for flag in ["--report", "--export-patch"] {
+        let output = invoke(
+            root.path(),
+            &[
+                "review",
+                "--base",
+                "HEAD",
+                flag,
+                destination.path().to_str().unwrap(),
+            ],
+        );
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(flag));
+        assert!(error.contains("interactive"));
+        assert_eq!(fs::read(destination.path()).unwrap(), b"previous output\n");
+        assert_eq!(
+            fs::read(root.path().join("note.txt")).unwrap(),
+            b"changed\n"
+        );
+        assert_eq!(git(root.path(), &["show", ":note.txt"]).stdout, b"same\n");
+    }
+}

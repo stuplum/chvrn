@@ -133,9 +133,12 @@ struct ReviewArgs {
     patch: Option<PathBuf>,
     #[arg(long)]
     socket: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Set patch export destination (interactive revision review; press P)"
+    )]
     export_patch: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Write a report after completed interactive review")]
     report: Option<PathBuf>,
     #[arg(long)]
     open_companion: bool,

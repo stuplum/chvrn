@@ -58,6 +58,7 @@ impl Review {
 pub struct ReviewedFile {
     pub path: PathBuf,
     pub base: Option<Vec<u8>>,
+    pub base_mode: Option<u32>,
     pub index: Option<Vec<u8>>,
     pub worktree: Option<Vec<u8>>,
     pub mode: Option<u32>,
@@ -121,6 +122,8 @@ pub enum GitError {
 `Base::Index` compares the exact inspected index entries against worktree bytes and modes, including staged content on the same path. `Base::Revision` compares the named tree against worktree bytes and modes; the revision is resolved and pinned when creating the review. `changes(base)` compares a named revision against index and worktree combined: a path is reported if either layer differs, with rename source in `old_path`, and reports untracked files. A binary file (NUL or invalid UTF-8) is labelled `Binary`; text operations on its hunks are unavailable. Rename reporting is based on Git's rename detection, not just delete/add names. Paths with non-UTF-8 bytes are preserved as native paths on Unix.
 
 `ReviewedFile::base` contains bytes from the selected index/revision, `index` contains staged bytes and `worktree` contains inspected filesystem bytes. Absence is `None`, distinct from an empty file. `mode` describes inspected worktree permissions (Git file mode), and `content` marks binary/invalid UTF-8 rather than rewriting it. `Review::resolved_revision` exposes the pinned tree ID. `save_worktree` and `save_files` validate reviewed snapshots before atomic per-file worktree replacement, preserve executable permissions, and never stage. `review_patch` captures every path touched by a validated patch even on a clean worktree or absent new target. `preview_patch` returns target bytes and modes without writing the worktree or index; `import_patch` applies those same validated candidates subject to another stale check.
+
+`base_mode` captures the selected base's Git file mode. Compare it with `mode` to detect permission changes even when the compared bytes are identical.
 
 `review_after_changes(before, changes)` is the post-mutation re-inspection path for review acceptance. Each candidate names a repository-relative path and the exact authorised post-write bytes and Git mode (`None`/`None` for deletion); paths may be newly introduced, but duplicate or unsafe paths are rejected. It checks the original pinned revision and exact index snapshot, requires every other inspected worktree file to remain unchanged, and requires each candidate to match the actual post-write bytes and mode. It returns a fresh review covering the union of all originally inspected paths and candidate paths, even if some are now equal to the base or absent. A mismatch returns `StaleReview`, never a newly approved snapshot; the returned review supports `validate_review` at asynchronous feedback delivery. This method does not write files or index entries.
 

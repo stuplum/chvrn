@@ -1,6 +1,7 @@
 pub mod diff;
 pub mod edit;
 pub mod merge;
+pub mod merge_advice;
 pub mod structural;
 
 use std::sync::Arc;

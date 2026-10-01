@@ -20,6 +20,10 @@ Interactive file comparison permits editing both buffers. `s` explicitly saves c
 
 Interactive merging shows ours/result/theirs with read-only source panes. Conflicts require source selection or manual acceptance. Resolving the final conflict opens confirmation; `s` can request confirmation manually. Only explicit `y` confirmation submits a resolved result for a guarded write. `n` or Escape returns to review.
 
+`merge --jev` and `mergetool --jev` enable on-demand suggestions only in a TTY with `--format auto` and without `--non-interactive`. Other output modes fail with exit `2` before writing. Only opted-in runs read `TYPESAFE_API_KEY`; a missing or invalid key is an error, while ordinary merging requires none.
+
+The host routes `J` to a single-flight background client. Responses enter the TUI's snapshot-bound advice lifecycle and cannot mutate or submit a result themselves. A cancelled request retains its network slot until completion; dropping the host does not join the network thread. Entering an LSP definition view cancels advice before parking the original session. Help, suggestion review in the footer and write/discard dialogs own input ahead of host shortcuts; an external-refresh conflict is not such a modal, so host-owned `R` recovery remains reachable.
+
 ## Repository review
 
 `--base index` compares worktree content with the inspected index. A revision base such as `HEAD` compares the worktree with its resolved tree. Positional review paths are repository-relative. The review retains index/worktree/reference state for the operations that validate it.

@@ -1,10 +1,10 @@
 # Integrations public API
 
-Production APIs are drafted against the approved behavioural tests. The coordinator owns build, test, and runtime verification after integration. `chvrn-integrations` exposes three independent modules: `herdr`, `socket`, and `lsp`. None sends an approval keystroke, stages a change, or silently writes a reviewed file.
+Production APIs follow the approved behavioural tests. The coordinator owns build, test, and runtime verification after integration. `chvrn-integrations` exposes four independent modules: `herdr`, `socket`, `lsp`, and `jev`. None sends an approval keystroke, stages a change, or silently writes a reviewed file.
 
 ## Dependencies for implementation and tests
 
-Library: `chvrn-core`, `serde` with `derive`, `serde_json`. Tests: `tempfile` and `serde_json`; otherwise standard library. Unix socket tests use `std::os::unix`, and are Unix-targeted. Runtime uses the installed herdr 0.9 `agent get`, `agent explain --json`, `agent prompt`, `pane get`, `pane split`, `pane run` and Unix socket `pane.focus` APIs; no guessed flags.
+Library: `chvrn-core`, `serde` with `derive`, `serde_json`, `url`, and pinned `ureq =3.4.2` with rustls and default features disabled. Tests: `tempfile` and `serde_json`; otherwise standard library. Unix socket tests use `std::os::unix`, and are Unix-targeted. Runtime uses the installed herdr 0.9 `agent get`, `agent explain --json`, `agent prompt`, `pane get`, `pane split`, `pane run` and Unix socket `pane.focus` APIs; no guessed flags.
 
 ## `chvrn_integrations::herdr`
 
@@ -186,3 +186,41 @@ The preceding `format_proposal`/`apply_to_buffer` sequence is the library API pa
 `replace_text` accepts unchanged bytes with a fresh snapshot ID: edit/undo can return to equal text without restoring the old snapshot's authority. It still advances the document version and invalidates previous diagnostics. The CLI caches diagnostics only for the currently bound core snapshot and consumes incoming messages until that snapshot has a diagnostic batch, instead of waiting for a new notification on every repeated diagnostics request.
 
 Herdr lifecycle, socket framing, and LSP framing remain separate. The CLI and TUI compose them after coordinator verification; no automatic approval follows any protocol response.
+
+## `chvrn_integrations::jev`
+
+```rust
+use std::time::Duration;
+use chvrn_core::merge_advice::{MergeAdviceInput, MergeAdviceSuggestion};
+
+pub struct JevConfig {
+    pub api_key: String,
+    pub endpoint: String,
+    pub timeout: Duration,
+}
+
+pub enum JevError {
+    InvalidConfiguration,
+    InvalidInput,
+    RequestTooLarge,
+    HttpStatus(u16),
+    Timeout,
+    Transport,
+    ResponseTooLarge,
+    InvalidResponse,
+}
+
+pub struct JevClient;
+impl JevClient {
+    pub fn new(config: JevConfig) -> Result<Self, JevError>;
+    pub fn suggest(&self, input: &MergeAdviceInput) -> Result<MergeAdviceSuggestion, JevError>;
+}
+```
+
+Construction validates configuration without making a request. HTTPS is required except for literal loopback-IP HTTP endpoints used by local protocol fixtures. Embedded URL credentials, fragments, invalid bearer-key characters and zero timeouts are rejected. The CLI fixes the production endpoint and a 30-second deadline; it exposes no endpoint override.
+
+`suggest` is synchronous and must run off the terminal thread. It validates zero-based half-open source line ranges with the core parser's LF/CRLF/bare-CR semantics, then borrows the complete conflict and up to 20 lines before and after each region. It rejects raw selected/context bytes over 24 KiB before serialisation and checks the complete JSON body against the same limit before transmitting. No conflict truncation or line-ending normalisation occurs.
+
+The request uses bearer authentication, `jev-1.13.0` and one choice question named `resolution`. Redirects and retries are disabled; the configured timeout is global. At most 64 KiB of response data is accepted before decoding. The response must contain the expected choice answer and all three probabilities; confidence and probabilities must be finite numbers in `[0,1]`. Choices are exactly ours, theirs or leave unresolved. Returned model metadata must be non-empty and contain no control characters. Malformed responses never default to a side; errors omit remote bodies and credentials.
+
+Protocol tests use bounded real loopback HTTP peers. The client returns only data; review authority, application, undo and write confirmation belong to the TUI and CLI contracts.

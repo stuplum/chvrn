@@ -104,7 +104,7 @@ pub fn run(session: &mut ReviewSession, host: &mut impl ReviewHost) -> Result<u8
                 continue;
             }
         }
-        if !session.is_confirming_merge() {
+        if !session.is_review_modal() {
             match host.input(session, &event) {
                 Ok(true) => continue,
                 Err(error) => {

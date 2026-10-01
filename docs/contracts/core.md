@@ -188,6 +188,17 @@ pub mod structural {
 
 Explicit grammar registration maps `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py` and `.json` to real Tree-sitter grammars. Other paths return `None` and ordinary textual diff/edit remains available; structural comparison or highlighting with `None` returns `UnsupportedLanguage`. `highlight` runs compiled Tree-sitter grammar queries and returns byte ranges into the original snapshot; callers convert them to grapheme and terminal-cell positions. Structural comparison parses actual syntax trees rather than a fake parser or line-only heuristic. Changed byte locations in `before` and `after` refer to their respective snapshots. A moved unchanged named syntax unit is `Move`; a syntax unit with unchanged token stream but changed layout is `Reflow`; changing only a declaration's name with unchanged body is `Renamed`; changing a call target or other token content is `ChangedTokens`. A changed literal must not be called a rename, move or reflow. Changes are reported at the affected top-level syntax-unit level, without nested duplicate records for the same edit. Structure is informational and never authorises a byte-inexact hunk application.
 
+## Merge advice data
+
+`chvrn_core::merge_advice` contains network-independent shared values:
+
+- `MergeAdviceSource { snapshot: TextSnapshot, lines: Range<usize> }` binds a zero-based half-open line range to immutable source text.
+- `MergeAdviceInput { base, ours, theirs }` carries three such sources for one conflict.
+- `MergeAdviceChoice` is `Ours`, `Theirs` or `LeaveUnresolved`.
+- `MergeAdviceSuggestion { choice, confidence: f64, model: String }` carries the proposed side and returned metadata.
+
+These values do not grant mutation authority. The TUI binds a request to a particular session, conflict and result capture; the integrations client bounds disclosure and validates the external reply.
+
 ## Dependencies proposed for implementation
 
 Runtime: `ropey` 1.6, `similar` 2.7 for Myers fallback and intraline matching, `tree-sitter` 0.25, compatible `tree-sitter-rust`, `tree-sitter-typescript` (TypeScript and TSX), `tree-sitter-javascript` (JS and JSX), `tree-sitter-python`, `tree-sitter-json`, and `unicode-segmentation` 1 for grapheme-safe intraline coalescing. `std` suffices for all core integration tests: no test-only dependencies. The coordinator owns manifest versions and verification.

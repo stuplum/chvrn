@@ -1,4 +1,5 @@
 use crate::files::{GuardedFile, read_bytes};
+use crate::jev_ui::JevUi;
 use crate::language::LanguageUi;
 use crate::terminal::{self, ReviewHost};
 use crate::watch::{BackgroundDiff, FileWatch};
@@ -7,10 +8,12 @@ use chvrn_core::TextSnapshot;
 use chvrn_core::diff::{Diff, WhitespacePolicy};
 use chvrn_core::merge::Merge;
 use chvrn_core::structural::{Language, StructuralAnalysis};
+use chvrn_integrations::jev::{JevClient, JevConfig};
 use chvrn_tui::{Pane, ReviewInput, ReviewOutcome, ReviewSession, ReviewSubmission};
 use crossterm::event::{Event, KeyCode};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub fn snapshot(bytes: &[u8]) -> Result<TextSnapshot> {
     TextSnapshot::from_bytes(bytes)
@@ -271,6 +274,23 @@ impl ReviewHost for FileHost {
 }
 
 pub fn merge(args: MergeArgs, options: &Options) -> Result<u8> {
+    let jev = if args.jev {
+        if !options.interactive() {
+            return Err("--jev requires interactive merge or mergetool; output unchanged".into());
+        }
+        let api_key = std::env::var("TYPESAFE_API_KEY")
+            .map_err(|_| "--jev requires TYPESAFE_API_KEY to be set to a valid UTF-8 API key")?;
+        if api_key.trim().is_empty() {
+            return Err("--jev requires a non-empty TYPESAFE_API_KEY".into());
+        }
+        Some(JevUi::new(JevClient::new(JevConfig {
+            api_key,
+            endpoint: "https://api.typesafe.ai/v1/systemone".into(),
+            timeout: Duration::from_secs(30),
+        })?))
+    } else {
+        None
+    };
     let base = GuardedFile::read(&args.base)?;
     let ours = GuardedFile::read(&args.ours)?;
     let theirs = GuardedFile::read(&args.theirs)?;
@@ -299,6 +319,7 @@ pub fn merge(args: MergeArgs, options: &Options) -> Result<u8> {
     session.set_read_only(Pane::Ours, true);
     session.set_read_only(Pane::Theirs, true);
     session.set_output_path(&output.path);
+    session.set_merge_advice_enabled(jev.is_some());
     let language = LanguageUi::new(options, output.path.parent().ok_or("output has no parent")?)?;
     let mut host = MergeHost {
         base,
@@ -306,6 +327,7 @@ pub fn merge(args: MergeArgs, options: &Options) -> Result<u8> {
         theirs,
         output,
         language,
+        jev,
     };
     terminal::run(&mut session, &mut host)
 }
@@ -316,6 +338,7 @@ struct MergeHost {
     theirs: GuardedFile,
     output: GuardedFile,
     language: LanguageUi,
+    jev: Option<JevUi>,
 }
 
 impl ReviewHost for MergeHost {
@@ -325,10 +348,21 @@ impl ReviewHost for MergeHost {
             Pane::Theirs => &self.theirs.path,
             _ => &self.output.path,
         };
-        self.language.tick(session, path)
+        self.language.tick(session, path)?;
+        if let Some(jev) = &mut self.jev {
+            jev.tick(session);
+        }
+        Ok(())
     }
 
     fn input(&mut self, session: &mut ReviewSession, event: &Event) -> Result<bool> {
+        if !self.language.viewing_definition() {
+            if let Some(jev) = &mut self.jev {
+                if jev.input(session, event) {
+                    return Ok(true);
+                }
+            }
+        }
         let path = match session.focus() {
             Pane::Ours => &self.ours.path,
             Pane::Theirs => &self.theirs.path,

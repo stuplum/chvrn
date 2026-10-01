@@ -10,6 +10,7 @@ The crate owns input dispatch, editable review buffers and Ratatui rendering. `c
 use std::{ops::Range, path::Path};
 use crossterm::event::{KeyEvent, MouseEvent};
 use chvrn_core::{edit::CapturedText, TextSnapshot};
+use chvrn_core::merge_advice::{MergeAdviceInput, MergeAdviceSuggestion};
 use ratatui::Frame;
 use chvrn_tui::{Language, WhitespacePolicy};
 
@@ -68,6 +69,12 @@ pub enum ReviewEditError {
 pub struct DiffRequest;
 pub struct DiffCompletion;
 pub struct ReviewSession;
+pub struct MergeAdviceRequest;
+pub enum MergeAdviceError { Disabled, Unavailable, Busy }
+
+impl MergeAdviceRequest {
+    pub fn input(&self) -> &MergeAdviceInput;
+}
 
 impl ReviewSession {
     pub fn two_way(left: &str, right: &str) -> Self;
@@ -101,6 +108,15 @@ impl ReviewSession {
     pub fn set_message(&mut self, message: impl Into<String>);
     pub fn replace_pane_text(&mut self, pane: Pane, text: &str) -> Result<(), ReviewEditError>;
     pub fn go_to(&mut self, pane: Pane, line: usize, grapheme: usize);
+    pub fn set_merge_advice_enabled(&mut self, enabled: bool);
+    pub fn begin_merge_advice(&mut self) -> Result<MergeAdviceRequest, MergeAdviceError>;
+    pub fn receive_merge_advice(
+        &mut self,
+        request: MergeAdviceRequest,
+        reply: Result<MergeAdviceSuggestion, String>,
+    ) -> bool;
+    pub fn cancel_merge_advice(&mut self);
+    pub fn is_review_modal(&self) -> bool;
 }
 
 impl DiffRequest {
@@ -146,6 +162,16 @@ Manual confirmation requests and confirmed submissions both check for `RefreshCo
 `q` on a clean session returns `Quit`; on a dirty session it returns `DiscardRequired` without discarding or submitting. Escape dismisses that discard confirmation and retains edits. Only `ConfirmDiscard` while discard confirmation is active returns `Quit` and drops the review without a submission. `Submitted` and `Quit` are distinct terminal outcomes. The review host must not infer approval from a quit.
 
 `LocalDiffPending` is not approval or a terminal outcome; the review remains open. Dismiss merge confirmation before further editing, navigation or an explicit quit.
+
+## Optional merge advice
+
+Advice is disabled initially. `begin_merge_advice` captures the selected unresolved conflict, immutable source snapshots, result buffer capture and private session/request authority. It refuses disabled, busy or unavailable states. The host runs the service request off the terminal thread using `MergeAdviceRequest::input`.
+
+`receive_merge_advice` returns false for stale or foreign authority without changing the result or displaying an obsolete error. Current successful advice opens an input-modal footer, not an edit or overlay. Selection changes, edits, undo/redo, resolutions, cancellation and disabling assistance invalidate earlier authority, even after returning to equal text. Hosts must cancel advice before parking a session for a nested view.
+
+The footer shows the choice, informational confidence and Apply/Ignore controls. It omits provider branding, model version, title and disclaimer; help retains service and disclosure details. Enter applies ours/theirs through the normal selected-conflict resolution path, including metadata-only undo when bytes do not change. Leave-unresolved advice has no apply action. Escape/`q` ignores advice without quitting. Underlying navigation, edits, mouse actions, paste and host actions are blocked until dismissal or application; resize remains available. The footer wraps into additional reserved rows at compact sizes, keeping the choice, confidence and controls visible at 20×7 without overlaying the remaining merge viewport.
+
+`is_review_modal` covers help, discard confirmation, merge confirmation and suggestion review in the footer. Hosts must defer input and delayed LSP results while it is true. It deliberately excludes external-refresh conflicts so the host can handle explicit discard/reload. Receiving or applying advice never writes files; resolving the final conflict still opens ordinary write confirmation.
 
 ## Rendering contract
 

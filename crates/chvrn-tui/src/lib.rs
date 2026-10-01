@@ -1,4 +1,5 @@
 mod input;
+mod merge_advice;
 mod render;
 mod session;
 mod text;
@@ -8,6 +9,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 pub use chvrn_core::diff::WhitespacePolicy;
 pub use chvrn_core::structural::Language;
 pub use input::ReviewEditError;
+pub use merge_advice::{MergeAdviceError, MergeAdviceRequest};
 pub use session::{DiffCompletion, DiffRequest, RepositoryReviewMode, ReviewSession};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

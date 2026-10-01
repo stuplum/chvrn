@@ -500,6 +500,7 @@ pub struct ReviewSession {
     pub(crate) local_generation: u64,
     pub(crate) local_pending: bool,
     local_worker: Option<LocalWorker>,
+    pub(crate) merge_advice: crate::merge_advice::MergeAdviceState,
 }
 
 impl ReviewSession {
@@ -545,6 +546,7 @@ impl ReviewSession {
             local_generation: 0,
             local_pending: false,
             local_worker: None,
+            merge_advice: crate::merge_advice::MergeAdviceState::default(),
         };
         session.rebuild_rows();
         session
@@ -619,6 +621,7 @@ impl ReviewSession {
             local_generation: 0,
             local_pending: false,
             local_worker: None,
+            merge_advice: crate::merge_advice::MergeAdviceState::default(),
         };
         session.rebuild_rows();
         session
@@ -945,6 +948,7 @@ impl ReviewSession {
     }
 
     pub(crate) fn refresh_after_edit(&mut self, pane: Pane) {
+        self.cancel_merge_advice();
         self.changed = true;
         self.refresh_alignment();
         if self.local_pending {

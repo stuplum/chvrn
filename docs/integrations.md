@@ -1,6 +1,22 @@
 # Optional integrations
 
-[Chvrn](../README.md) works as a standalone file comparison, merge and local Git-review tool. Language servers, Herdr and the local socket add capabilities without replacing explicit review and submission.
+[Chvrn](../README.md) works as a standalone file comparison, merge and local Git-review tool. Jev, language servers, Herdr and the local socket add capabilities without replacing explicit review and submission.
+
+## Jev merge suggestions
+
+Jev is optional on interactive `merge` and `mergetool` through `--jev`. Supply `TYPESAFE_API_KEY` in the process environment; there is no API-key argument. Missing, empty or invalid credentials fail without writing the output. A configured key without `--jev` is ignored. Headless use of `--jev` fails with exit `2`, including conflict-free inputs.
+
+Press `J` on an unresolved conflict to send a request to `https://api.typesafe.ai/v1/systemone` using `jev-1.13.0`. Source disclosure is limited to the complete base/ours/theirs conflict and up to 20 surrounding lines before and after each region. LF, CRLF, bare CR and missing final newlines retain their original bytes. Source is not redacted: inspect it before requesting advice.
+
+The request body is capped at 24 KiB, the response at 64 KiB, and the global request deadline is 30 seconds. Oversized requests fail before transmission. Redirects, automatic requests and retries are disabled. Errors do not include the credential or remote response body.
+
+Only one network request can be active. Editing, undo, conflict selection changes, resolution, cancellation and entry into a nested definition view invalidate advice authority. Returning to equal text or the original selection does not revive it. Invalidating advice does not abort the network request or free its slot before completion; quitting does not wait for that request.
+
+Replies offer ours, theirs or leave unresolved. They cannot generate combined text, apply themselves or write the output. A compact footer shows the choice, confidence and Apply/Ignore controls without covering the merge. Enter applies a proposed side as an undoable choice; Escape/`q` ignores it. Abstentions have no apply action. The suggestion retains exclusive input until applied or ignored, blocking underlying editing and language-server actions; final write confirmation remains separate. Manual merging remains available after a request failure.
+
+Runtime verification used synthetic source, the live TypeSafe service and a real PTY on macOS arm64. It exercised request/review/dismiss/apply, undo/redo, explicit saving, missing credentials, manual operation, resizing down to 20×7 and quitting with a request in flight. These checks establish the integration flow, not model correctness or a confidence threshold for automatic acceptance.
+
+A real clangd nested-definition check also verified that leaving the merge during an outstanding request does not expose advice in the nested view or revive it on return. This does not establish compatibility with other language servers.
 
 ## Language server
 

@@ -1,5 +1,6 @@
 mod files;
 mod herdr_ui;
+mod jev_ui;
 mod language;
 mod repository;
 mod socket_ui;
@@ -110,6 +111,11 @@ enum Command {
         theirs: Option<PathBuf>,
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Enable on-demand Jev suggestions via TypeSafe (interactive only)"
+        )]
+        jev: bool,
     },
 }
 
@@ -123,6 +129,11 @@ struct MergeArgs {
     theirs: PathBuf,
     #[arg(long)]
     output: PathBuf,
+    #[arg(
+        long,
+        help = "Enable on-demand Jev suggestions via TypeSafe (interactive only)"
+    )]
+    jev: bool,
 }
 
 #[derive(Args, Default)]
@@ -168,12 +179,14 @@ fn execute(cli: Cli) -> Result<u8> {
             ours,
             theirs,
             output,
+            jev,
         }) => standalone::merge(
             MergeArgs {
                 base: environment_path(base, "BASE")?,
                 ours: environment_path(ours, "LOCAL")?,
                 theirs: environment_path(theirs, "REMOTE")?,
                 output: environment_path(output, "MERGED")?,
+                jev,
             },
             options,
         ),

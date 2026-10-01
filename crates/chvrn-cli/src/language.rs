@@ -186,6 +186,9 @@ impl LanguageUi {
     }
 
     pub fn tick(&mut self, session: &mut ReviewSession, path: &Path) -> Result<()> {
+        if session.is_review_modal() {
+            return Ok(());
+        }
         for response in self.responses.try_iter() {
             if self.previous.is_some()
                 || response.path != path
@@ -206,6 +209,7 @@ impl LanguageUi {
                         .set_message("Formatting applied as one undoable edit; s saves, u undoes");
                 }
                 Ok(ResponseValue::Definition(view)) => {
+                    session.cancel_merge_advice();
                     self.previous = Some(std::mem::replace(session, *view));
                 }
             }

@@ -9,7 +9,9 @@ use crate::{HerdrMode, Options, Result, ReviewArgs};
 use chvrn_core::TextSnapshot;
 use chvrn_git::{Base, ContentKind, PatchCandidate, Repository, Review};
 use chvrn_integrations::herdr::{HunkRange, ReviewedFile};
-use chvrn_tui::{Pane, ReviewInput, ReviewOutcome, ReviewSession, ReviewSubmission};
+use chvrn_tui::{
+    Pane, RepositoryReviewMode, ReviewInput, ReviewOutcome, ReviewSession, ReviewSubmission,
+};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -258,11 +260,25 @@ impl RepositoryHost<'_> {
             .ok_or_else(|| "no file is selected".into())
     }
 
+    fn configure_footer(&self, session: &mut ReviewSession) {
+        let mode = if self.preview.is_some() {
+            RepositoryReviewMode::PatchPreview
+        } else if self.args.base == "index" {
+            RepositoryReviewMode::Index
+        } else {
+            RepositoryReviewMode::Revision
+        };
+        let count = self.paths().len();
+        let position = if count == 0 { 0 } else { self.selected + 1 };
+        session.set_repository_review(mode, format!("{position}/{count}"));
+    }
+
     fn session(&self) -> Result<ReviewSession> {
         if self.paths.is_empty() {
             let mut session = ReviewSession::two_way("", "");
             session.set_read_only(Pane::Left, true);
             session.set_read_only(Pane::Right, true);
+            self.configure_footer(&mut session);
             session.set_message("No changes. Watching for new snapshots; q exits without approval");
             return Ok(session);
         }
@@ -301,17 +317,7 @@ impl RepositoryHost<'_> {
         session.set_whitespace_policy(self.options.whitespace.into());
         session.set_read_only(Pane::Left, true);
         session.set_read_only(Pane::Right, binary || self.preview.is_some());
-        session.set_message(format!(
-            "{}/{} {} | Ctrl-N/P files; S stage; x reject; s accept; c comment{}",
-            self.selected + 1,
-            self.paths().len(),
-            path.display(),
-            if self.preview.is_some() {
-                " | PATCH PREVIEW: no disk changes until all files accepted"
-            } else {
-                ""
-            }
-        ));
+        self.configure_footer(&mut session);
         Ok(session)
     }
 
@@ -327,6 +333,7 @@ impl RepositoryHost<'_> {
             *session = ReviewSession::two_way("", "");
             session.set_read_only(Pane::Left, true);
             session.set_read_only(Pane::Right, true);
+            self.configure_footer(session);
             session.set_message("No remaining differences. q exits without sending approval");
         } else {
             *session = self.session()?;
@@ -455,6 +462,7 @@ impl RepositoryHost<'_> {
                 session.set_paths(&path, &path);
                 session.set_read_only(Pane::Left, true);
             }
+            self.configure_footer(session);
             if let Some(socket) = &self.socket {
                 socket.refresh(&self.inspected, &self.snapshot)?;
             }
@@ -931,4 +939,202 @@ fn same_review(left: &Review, right: &Review) -> bool {
                     && left.mode == right.mode
             })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{OutputFormat, Whitespace};
+    use crossterm::event::KeyEvent;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::{fs, process::Command};
+
+    fn with_host(base_name: &str, preview: bool, check: impl FnOnce(&mut RepositoryHost<'_>)) {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["first.rs", "last.rs"] {
+            fs::write(root.path().join(name), "fn before() {}\n").unwrap();
+        }
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "initial"],
+        ] {
+            let output = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for name in ["first.rs", "last.rs"] {
+            fs::write(root.path().join(name), "fn after() {}\n").unwrap();
+        }
+        let options = Options {
+            format: OutputFormat::Auto,
+            non_interactive: false,
+            herdr: None,
+            agent: None,
+            whitespace: Whitespace::Exact,
+            lsp: None,
+            lsp_args: Vec::new(),
+        };
+        let repo = Repository::discover(root.path()).unwrap();
+        let inspected = repo.review(base(base_name), &[]).unwrap();
+        let preview = preview.then(|| {
+            let patch = b"diff --git a/first.rs b/first.rs\n--- a/first.rs\n+++ b/first.rs\n@@ -1 +1 @@\n-fn after() {}\n+fn candidate() {}\n".to_vec();
+            PatchPreview {
+                candidates: repo.preview_patch(&inspected, &patch).unwrap(),
+                patch,
+                snapshot: snapshot_id(),
+                socket_snapshot: None,
+            }
+        });
+        let mut host = RepositoryHost {
+            repo,
+            inspected: Arc::new(inspected),
+            args: ReviewArgs {
+                base: base_name.into(),
+                ..ReviewArgs::default()
+            },
+            options: &options,
+            selected: 0,
+            preview,
+            decisions: BTreeMap::new(),
+            accepted_paths: BTreeSet::new(),
+            comment: String::new(),
+            editing_comment: false,
+            snapshot: snapshot_id(),
+            report: None,
+            export: None,
+            paths: Vec::new(),
+            watch: FileWatch::new(&[root.path()], true).unwrap(),
+            language: LanguageUi::new(&options, root.path()).unwrap(),
+            herdr: None,
+            socket: None,
+            socket_candidates: VecDeque::new(),
+            loading: None,
+            needs_refresh: false,
+            background: BackgroundDiff::new(),
+            pending_review: None,
+            pending_generation: 0,
+            refresh_conflict: false,
+            finished: None,
+        };
+        host.reset_paths();
+        check(&mut host);
+    }
+
+    fn screen(session: &mut ReviewSession, width: u16) -> Vec<String> {
+        session.handle(ReviewInput::Resize { width, height: 12 });
+        let mut terminal = Terminal::new(TestBackend::new(width, 12)).unwrap();
+        terminal.draw(|frame| session.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..12)
+            .map(|row| {
+                (0..width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repository_footer_keeps_the_filename_right_aligned_after_switching_files() {
+        with_host("index", false, |host| {
+            let mut session = host.session().unwrap();
+            for width in [64, 80, 132] {
+                let rows = screen(&mut session, width);
+                assert!(rows[11].ends_with("first.rs"), "{}", rows[11]);
+                assert!(rows[0].contains("1/2"));
+                for key in ["[s]", "[q]", "[?]"] {
+                    assert!(rows[11].contains(key), "{}", rows[11]);
+                }
+            }
+            host.input(
+                &mut session,
+                &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            )
+            .unwrap();
+            let rows = screen(&mut session, 132);
+            assert!(rows[11].ends_with("last.rs"));
+            assert!(rows[0].contains("2/2"));
+        });
+    }
+
+    #[test]
+    fn repository_footer_offers_actions_for_the_selected_review_mode() {
+        for (base, preview, present, absent) in [
+            ("index", false, "[S]", "[x]"),
+            ("HEAD", false, "[x]", "[S]"),
+            ("index", true, "[x]", "[S]"),
+        ] {
+            with_host(base, preview, |host| {
+                let mut session = host.session().unwrap();
+                let rows = screen(&mut session, 132);
+                assert!(rows[11].contains(present), "{}", rows[11]);
+                assert!(!rows[11].contains(absent), "{}", rows[11]);
+                assert!(rows[11].contains("[Ctrl-N/P]"));
+                assert!(rows[11].contains("[c]"));
+                assert!(rows[11].ends_with("first.rs"));
+                if preview {
+                    assert!(rows[0].contains("PATCH PREVIEW"));
+                    assert!(rows[0].contains("1/1"));
+                }
+                let narrow = screen(&mut session, 32);
+                for key in ["[s]", "[q]", "[?]"] {
+                    assert!(narrow[11].contains(key), "{}", narrow[11]);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn repository_editing_and_discard_confirmation_override_navigation_shortcuts() {
+        with_host("index", false, |host| {
+            let mut session = host.session().unwrap();
+            session.go_to(Pane::Right, 0, 0);
+            session.handle(ReviewInput::Key(KeyEvent::new(
+                KeyCode::Char('i'),
+                KeyModifiers::NONE,
+            )));
+            let rows = screen(&mut session, 132);
+            assert!(rows[11].contains("[Esc]"));
+            assert!(rows[11].ends_with("first.rs"));
+            for key in ["[S]", "[x]", "[c]", "[s]", "[q]"] {
+                assert!(!rows[11].contains(key));
+            }
+            session.handle(ReviewInput::Paste("edited ".into()));
+            session.handle(ReviewInput::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(
+                session.handle(ReviewInput::Key(KeyEvent::new(
+                    KeyCode::Char('q'),
+                    KeyModifiers::NONE
+                ))),
+                ReviewOutcome::DiscardRequired,
+            );
+            let rows = screen(&mut session, 132);
+            assert!(rows[11].contains("discards"));
+            assert!(!rows[11].contains("first.rs"));
+            assert!(!rows[11].contains("[s]"));
+        });
+    }
 }

@@ -454,6 +454,18 @@ pub(crate) struct HistoryAction {
     pub(crate) has_text_history: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum RepositoryReviewMode {
+    Index,
+    Revision,
+    PatchPreview,
+}
+
+pub(crate) struct RepositoryReview {
+    pub(crate) mode: RepositoryReviewMode,
+    pub(crate) position: String,
+}
+
 pub struct ReviewSession {
     pub(crate) mode: Mode,
     pub(crate) rows: Vec<ViewRow>,
@@ -478,6 +490,7 @@ pub struct ReviewSession {
     pub(crate) latest_generation: u64,
     pub(crate) accepted_generation: u64,
     pub(crate) message: String,
+    pub(crate) repository_review: Option<RepositoryReview>,
     pub(crate) left_path: Option<PathBuf>,
     pub(crate) right_path: Option<PathBuf>,
     pub(crate) output_path: Option<PathBuf>,
@@ -522,6 +535,7 @@ impl ReviewSession {
             latest_generation: 0,
             accepted_generation: 0,
             message: String::new(),
+            repository_review: None,
             left_path: None,
             right_path: None,
             output_path: None,
@@ -595,6 +609,7 @@ impl ReviewSession {
             latest_generation: 0,
             accepted_generation: 0,
             message: String::new(),
+            repository_review: None,
             left_path: None,
             right_path: None,
             output_path: None,
@@ -687,6 +702,13 @@ impl ReviewSession {
 
     pub fn set_message(&mut self, message: impl Into<String>) {
         self.message = message.into();
+    }
+
+    pub fn set_repository_review(&mut self, mode: RepositoryReviewMode, position: String) {
+        self.repository_review = Some(RepositoryReview { mode, position });
+        if self.help {
+            self.prepare_help();
+        }
     }
 
     pub fn set_paths(&mut self, left: &Path, right: &Path) {

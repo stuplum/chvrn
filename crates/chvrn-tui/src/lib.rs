@@ -8,7 +8,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 pub use chvrn_core::diff::WhitespacePolicy;
 pub use chvrn_core::structural::Language;
 pub use input::ReviewEditError;
-pub use session::{DiffCompletion, DiffRequest, ReviewSession};
+pub use session::{DiffCompletion, DiffRequest, RepositoryReviewMode, ReviewSession};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Pane {

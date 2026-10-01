@@ -10,7 +10,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    Pane, WhitespacePolicy,
+    Pane, RepositoryReviewMode, WhitespacePolicy,
     session::{ChangeBand, ChangeKind, Mode, ReviewSession, ViewLine},
     text,
 };
@@ -167,9 +167,14 @@ impl ReviewSession {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let mode = match &self.mode {
-            Mode::TwoWay { .. } => "DIFF",
-            Mode::ThreeWay { .. } => "MERGE",
+        let mode = match self.repository_review.as_ref().map(|review| review.mode) {
+            Some(RepositoryReviewMode::Index) => "INDEX",
+            Some(RepositoryReviewMode::Revision) => "REVISION",
+            Some(RepositoryReviewMode::PatchPreview) => "PATCH PREVIEW",
+            None => match &self.mode {
+                Mode::TwoWay { .. } => "DIFF",
+                Mode::ThreeWay { .. } => "MERGE",
+            },
         };
         let language = if self.pane(self.focus).language.is_some() {
             "syntax"
@@ -204,6 +209,20 @@ impl ReviewSession {
         let mut x = area.x.saturating_add(1);
         for (label, style) in [
             ("chvrn  ", quiet),
+            (
+                self.repository_review
+                    .as_ref()
+                    .map_or("", |review| review.position.as_str()),
+                quiet,
+            ),
+            (
+                if self.repository_review.is_some() {
+                    "  "
+                } else {
+                    ""
+                },
+                quiet,
+            ),
             (mode, normal),
             ("  ", quiet),
             (if self.editing { "INSERT" } else { "REVIEW" }, editing),
@@ -295,6 +314,22 @@ impl ReviewSession {
             return;
         }
         let review = !self.editing;
+        let repository_mode = self.repository_review.as_ref().map(|review| review.mode);
+        let repository_hunk = repository_mode.is_some()
+            && review
+            && self.selected.is_some()
+            && !self.is_dirty()
+            && matches!(&self.mode, Mode::TwoWay { right, .. } if !right.read_only);
+        let path = match (&self.mode, self.focus) {
+            (Mode::TwoWay { .. }, Pane::Left) => self.left_path.as_deref(),
+            (Mode::TwoWay { .. }, _) => self.right_path.as_deref(),
+            (Mode::ThreeWay { .. }, _) => self.output_path.as_deref(),
+        };
+        let filename = path.map(|path| {
+            path.file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+        });
         let conflict = match &self.mode {
             Mode::ThreeWay { conflicts, .. } => {
                 self.selected.and_then(|index| conflicts.get(index))
@@ -320,6 +355,31 @@ impl ReviewSession {
                 self.editing && !self.undo_actions.is_empty(),
                 false,
             ),
+            (
+                "[Ctrl-N/P]",
+                "Files",
+                review && repository_mode.is_some(),
+                false,
+            ),
+            (
+                "[S]",
+                "Stage",
+                repository_hunk && repository_mode == Some(RepositoryReviewMode::Index),
+                false,
+            ),
+            (
+                "[x]",
+                "Restore",
+                repository_hunk && repository_mode == Some(RepositoryReviewMode::Revision),
+                false,
+            ),
+            (
+                "[x]",
+                "Decline",
+                review && repository_mode == Some(RepositoryReviewMode::PatchPreview),
+                false,
+            ),
+            ("[c]", "Comment", review && repository_mode.is_some(), false),
             ("[o]", "Ours", review && conflict.is_some(), false),
             ("[t]", "Theirs", review && conflict.is_some(), false),
             ("[b]", "Both", review && conflict.is_some(), false),
@@ -343,7 +403,16 @@ impl ReviewSession {
                 false,
             ),
             ("[Ctrl-R]", "Redo", !self.redo_actions.is_empty(), false),
-            ("[s]", "Save", review, true),
+            (
+                "[s]",
+                if repository_mode.is_some() {
+                    "Accept"
+                } else {
+                    "Save"
+                },
+                review,
+                true,
+            ),
             ("[q]", "Quit", review, true),
             ("[?]", "Help", review, true),
             ("[Tab]", "Next pane", review, false),
@@ -356,6 +425,12 @@ impl ReviewSession {
             .map(|(key, label, _, _)| key.len() + label.len() + 3)
             .sum();
         let compact = usize::from(area.width) < mandatory_width.saturating_sub(2);
+        let filename_width = filename.as_ref().map_or(0, |name| name.width());
+        let filename_reserved = filename
+            .as_ref()
+            .map_or(0, |_| filename_width.saturating_add(2).min(26))
+            .min(usize::from(area.width).saturating_sub(mandatory_width));
+        let controls_right = area.right().saturating_sub(filename_reserved as u16);
         let mut reserved: usize = shortcuts
             .iter()
             .filter(|(_, _, enabled, essential)| *enabled && *essential)
@@ -371,7 +446,7 @@ impl ReviewSession {
             if essential {
                 reserved = reserved.saturating_sub(width + 2);
             }
-            if width + reserved > usize::from(area.right().saturating_sub(x)) {
+            if width + reserved > usize::from(controls_right.saturating_sub(x)) {
                 continue;
             }
             (x, _) = buffer.set_stringn(x, area.y, key, key.len(), key_style);
@@ -381,19 +456,10 @@ impl ReviewSession {
             }
             x = x.saturating_add(2);
         }
-        let path = match (&self.mode, self.focus) {
-            (Mode::TwoWay { .. }, Pane::Left) => self.left_path.as_deref(),
-            (Mode::TwoWay { .. }, _) => self.right_path.as_deref(),
-            (Mode::ThreeWay { .. }, _) => self.output_path.as_deref(),
-        };
-        if let Some(path) = path {
-            let name = path
-                .file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy();
+        if let Some(name) = filename {
             let available = usize::from(area.right().saturating_sub(x));
             let style = normal.fg(MUTED);
-            let width = name.width();
+            let width = filename_width;
             if width <= available {
                 buffer.set_stringn(area.right() - width as u16, area.y, &name, width, style);
             } else if available >= 3 {
@@ -797,6 +863,21 @@ impl ReviewSession {
         ];
         for line in guide {
             wrap_help_line(&mut self.help_lines, line, width);
+        }
+        if let Some(review) = &self.repository_review {
+            wrap_help_line(
+                &mut self.help_lines,
+                "Ctrl-N/P: next/previous file   c: comment   s: save and accept file",
+                width,
+            );
+            let action = match review.mode {
+                RepositoryReviewMode::Index => "S: stage the selected hunk immediately",
+                RepositoryReviewMode::Revision => "x: restore the selected hunk immediately",
+                RepositoryReviewMode::PatchPreview => {
+                    "x: decline preview; no disk changes until all files are accepted"
+                }
+            };
+            wrap_help_line(&mut self.help_lines, action, width);
         }
         let (left_label, right_label) = match self.mode {
             Mode::TwoWay { .. } => ("Left:", "Right:"),

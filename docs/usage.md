@@ -179,6 +179,8 @@ Continuous source lines are connected across unequal change heights with Unicode
 
 The normal footer puts shortcuts before a dimmed, right-aligned filename: the focused file for comparisons, the output for merges. Long names shorten before essential controls disappear. Merge-choice hints appear only for an unresolved selection. Insert mode advertises editing controls. Warnings, pending work and confirmation prompts replace the normal footer.
 
+Git review uses the same footer layout. The header shows the current file position and `INDEX`, `REVISION` or `PATCH PREVIEW`. Shortcuts reflect the mode: stage in index review, restore in revision review, or decline a patch preview. At narrow widths, save/accept, quit and help take priority; `?` lists the Git controls and patch-preview acceptance rules.
+
 The header distinguishes `modified` and `INSERT` with labels as well as colour. Truecolour gives the intended palette; a non-empty `NO_COLOR` disables colours. No Powerline/Nerd Font is required. Unicode terminal cells approximate the diagonal connectors; they are not graphical curves.
 
 ## Safety and current limitations

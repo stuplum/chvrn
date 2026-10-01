@@ -65,7 +65,7 @@ The original design and later terminal-presentation plan informed the implementa
 
 The [test-first review package](review/README.md) is a historical checkpoint before production implementation, not current project status. It retains the original proposed interfaces, test-review rationale and [redacted model-routing record](review/model-routing.json). Four Jev-selected `openai-codex/gpt-6-sol` workers implemented library slices in separate Herdr panes; the coordinator composed the CLI and performed integrated verification. This implementation history is not a product dependency or a model-performance benchmark.
 
-Optional Jev-assisted merge choices remain a [backlog item](../TODO.md), not a shipped capability. Current merge choices are made by the reviewer.
+Optional Jev-assisted merge suggestions use explicit `--jev` opt-in and per-conflict requests. They remain reviewable and require explicit application and final write confirmation. See the [integration guide](integrations.md#jev-merge-suggestions) for disclosure limits and runtime evidence.
 
 ## Documentation and captures
 

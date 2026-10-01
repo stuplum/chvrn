@@ -25,6 +25,12 @@ pub enum ReviewEditError {
 
 impl ReviewSession {
     pub fn handle(&mut self, input: ReviewInput) -> ReviewOutcome {
+        if self.merge_advice.dialog.is_some()
+            && !matches!(&input, ReviewInput::Key(_) | ReviewInput::Resize { .. })
+        {
+            return ReviewOutcome::Continue;
+        }
+        let selected_before = self.selected;
         let unresolved_before = self.unresolved_conflicts();
         let outcome = match input {
             ReviewInput::Key(event)
@@ -33,10 +39,10 @@ impl ReviewSession {
                 self.handle_key(event)
             }
             ReviewInput::Key(_) => ReviewOutcome::Continue,
-            ReviewInput::Mouse(_) if self.confirming_merge => ReviewOutcome::Continue,
+            ReviewInput::Mouse(_) if self.is_review_modal() => ReviewOutcome::Continue,
             ReviewInput::Mouse(event) => self.handle_mouse(event),
             ReviewInput::Paste(text) => {
-                if self.editing && !self.confirming_merge {
+                if self.editing && !self.is_review_modal() {
                     self.insert_text(&text);
                 }
                 ReviewOutcome::Continue
@@ -70,6 +76,9 @@ impl ReviewSession {
                 ReviewOutcome::Continue
             }
         };
+        if self.selected != selected_before {
+            self.cancel_merge_advice();
+        }
         if unresolved_before > 0 && self.unresolved_conflicts() == 0 {
             self.confirming_merge = true;
             self.editing = false;
@@ -79,6 +88,7 @@ impl ReviewSession {
     }
 
     pub fn go_to(&mut self, pane: Pane, line: usize, grapheme: usize) {
+        self.cancel_merge_advice();
         let actual_line = line.min(self.pane(pane).buffer.line_count().saturating_sub(1));
         let maximum = text::buffer_line_content(&self.pane(pane).buffer, actual_line)
             .graphemes(true)
@@ -183,6 +193,9 @@ impl ReviewSession {
     }
 
     fn handle_key(&mut self, event: KeyEvent) -> ReviewOutcome {
+        if self.merge_advice.dialog.is_some() {
+            return self.handle_merge_advice_key(event);
+        }
         if self.confirming_discard {
             if event.code == KeyCode::Esc {
                 self.confirming_discard = false;
@@ -261,6 +274,7 @@ impl ReviewSession {
         match event.code {
             KeyCode::Char('s') => return self.submit(),
             KeyCode::Char('q') => {
+                self.cancel_merge_advice();
                 if self.changed {
                     self.confirming_discard = true;
                     return ReviewOutcome::DiscardRequired;
@@ -268,6 +282,7 @@ impl ReviewSession {
                 return ReviewOutcome::Quit;
             }
             KeyCode::Char('?') => {
+                self.cancel_merge_advice();
                 self.help = true;
                 self.help_scroll = 0;
                 self.prepare_help();
@@ -460,6 +475,7 @@ impl ReviewSession {
             self.message = "This pane is read-only".to_owned();
             return;
         }
+        self.cancel_merge_advice();
         let (line, column) = self.position_for_row(self.focus, self.aligned_row);
         let offset = text::buffer_position_offset(&self.pane(self.focus).buffer, line, column);
         if self.pane_mut(self.focus).buffer.set_cursor(offset).is_ok() {
@@ -714,6 +730,35 @@ impl ReviewSession {
         let Some(index) = self.selected else {
             return;
         };
+        let Mode::ThreeWay {
+            result, conflicts, ..
+        } = &self.mode
+        else {
+            return;
+        };
+        let Some(region) = conflicts.get(index) else {
+            return;
+        };
+        let choice = match key {
+            KeyCode::Char('o') => ResolutionChoice::Ours,
+            KeyCode::Char('t') => ResolutionChoice::Theirs,
+            KeyCode::Char('b') => ResolutionChoice::Both,
+            KeyCode::Char('r') if region.changed => ResolutionChoice::Manual(
+                result
+                    .buffer
+                    .slice_chars(region.chars.clone())
+                    .expect("conflict range is valid"),
+            ),
+            KeyCode::Char('r') => {
+                self.message = "Edit the result before choosing it".to_owned();
+                return;
+            }
+            _ => return,
+        };
+        self.resolve_conflict(index, choice);
+    }
+
+    pub(crate) fn resolve_conflict(&mut self, index: usize, choice: ResolutionChoice) {
         let before = self.merge_metadata();
         let Mode::ThreeWay {
             merge,
@@ -733,19 +778,6 @@ impl ReviewSession {
         let range = region.chars.clone();
         let ours = region.ours.clone();
         let theirs = region.theirs.clone();
-        let choice = match key {
-            KeyCode::Char('o') => ResolutionChoice::Ours,
-            KeyCode::Char('t') => ResolutionChoice::Theirs,
-            KeyCode::Char('b') => ResolutionChoice::Both,
-            KeyCode::Char('r') if region.changed => ResolutionChoice::Manual(
-                text::slice_chars(&result.buffer.text(), range.clone()).to_owned(),
-            ),
-            KeyCode::Char('r') => {
-                self.message = "Edit the result before choosing it".to_owned();
-                return;
-            }
-            _ => return,
-        };
         let old_preview = merge.preview();
         let Some(core_span) = merge
             .preview_conflicts()

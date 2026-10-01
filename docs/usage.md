@@ -1,6 +1,6 @@
 # User guide
 
-[Chvrn](../README.md) combines comparison and editing. This guide covers standalone files and local Git review. [Integrations](integrations.md) covers language servers, Herdr and socket clients.
+[Chvrn](../README.md) combines comparison and editing. This guide covers standalone files and local Git review. [Integrations](integrations.md) covers Jev, language servers, Herdr and socket clients.
 
 ## Commands and output modes
 
@@ -73,6 +73,23 @@ Resolving the final conflict opens confirmation automatically. `s` opens it manu
 - Unresolved conflicts report their remaining count and block submission. Pending alignment and external changes also block unsafe submission.
 
 The source files and output destination are checked again on confirmed submission. Merely opening a merge, choosing a source or dismissing confirmation does not write the output.
+
+### Optional Jev suggestions
+
+Set the `TYPESAFE_API_KEY` environment variable, then enable suggestions with `--jev`:
+
+```sh
+chvrn merge --base /path/to/base.rs --ours /path/to/ours.rs --theirs /path/to/theirs.rs --output /path/to/result.rs --jev
+```
+
+`chvrn mergetool --jev` supports the same flow. The flag is interactive-only; a configured key alone never enables requests. Manual merging needs no key.
+
+1. Select an unresolved conflict and press `J` (`Suggest`) to request one suggestion.
+2. Review the proposed side and confidence in the footer. The merge stays visible, without a popup or provider branding. Confidence is informational, not a correctness guarantee.
+3. Press Enter (`Apply`) to apply ours/theirs as one undoable choice, or Escape/`q` (`Ignore`) to return without applying. An abstention shows `Leave unresolved` with confidence and only Ignore.
+4. Resolve any remaining conflicts and confirm with `y` before the result is written.
+
+Each request sends the complete selected conflict from base, ours and theirs, plus up to 20 lines before and after each region, to TypeSafe. **This context can contain secrets.** Requests exceeding 24 KiB including JSON are refused, not truncated. There are no automatic requests or retries. See the [Jev integration boundaries](integrations.md#jev-merge-suggestions) for timeouts and stale-response handling.
 
 ## Local Git review
 

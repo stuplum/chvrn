@@ -1,4 +1,8 @@
-use chvrn_core::{merge::ConflictId, structural::HighlightKind};
+use chvrn_core::{
+    merge::ConflictId,
+    merge_advice::{MergeAdviceChoice, MergeAdviceSuggestion},
+    structural::HighlightKind,
+};
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -54,6 +58,69 @@ struct Connector {
     right: Pane,
 }
 
+struct AdviceFooter {
+    choice: &'static str,
+    confidence: u8,
+    parts: [Rect; 4],
+    height: u16,
+}
+
+impl AdviceFooter {
+    fn new(suggestion: &MergeAdviceSuggestion, width: u16) -> Self {
+        let choice = match suggestion.choice {
+            MergeAdviceChoice::Ours => "Ours",
+            MergeAdviceChoice::Theirs => "Theirs",
+            MergeAdviceChoice::LeaveUnresolved => "Leave unresolved",
+        };
+        let confidence = (suggestion.confidence * 100.0).round_ties_even() as u8;
+        let confidence_width = match confidence {
+            0..=9 => 13,
+            10..=99 => 14,
+            _ => 15,
+        };
+        let widths = [
+            choice.len() as u16,
+            confidence_width,
+            if suggestion.choice == MergeAdviceChoice::LeaveUnresolved {
+                0
+            } else {
+                13
+            },
+            12,
+        ];
+        let mut x = 0;
+        let mut y = 0;
+        let parts = std::array::from_fn(|index| {
+            let part_width = widths[index].min(width);
+            if part_width == 0 {
+                return Rect::default();
+            }
+            let gap = if x == 0 {
+                0
+            } else if index == 1 {
+                3
+            } else {
+                2
+            };
+            if part_width + gap > width.saturating_sub(x) {
+                x = 0;
+                y += 1;
+            } else {
+                x += gap;
+            }
+            let part = Rect::new(x, y, part_width, 1);
+            x += part_width;
+            part
+        });
+        Self {
+            choice,
+            confidence,
+            parts,
+            height: y + 1,
+        }
+    }
+}
+
 const SURFACE: Color = Color::Rgb(25, 27, 30);
 const HEADING: Color = Color::Rgb(34, 37, 41);
 const RAIL: Color = Color::Rgb(21, 23, 27);
@@ -91,11 +158,14 @@ pub(crate) fn visible_pane_count(session: &ReviewSession, width: u16) -> usize {
 }
 
 fn pane_areas(session: &ReviewSession, area: Rect) -> ([PaneArea; 3], [Connector; 2], usize) {
+    let footer_height = session.merge_advice.dialog.as_ref().map_or(1, |dialog| {
+        AdviceFooter::new(&dialog.suggestion, area.width).height
+    });
     let body = Rect::new(
         area.x,
         area.y.saturating_add(2),
         area.width,
-        area.height.saturating_sub(3),
+        area.height.saturating_sub(2 + footer_height),
     );
     let count = visible_pane_count(session, area.width);
     let available = body
@@ -287,6 +357,13 @@ impl ReviewSession {
 
     fn render_footer(&self, frame: &mut Frame<'_>) {
         let screen = frame.area();
+        if let Some(dialog) = &self.merge_advice.dialog {
+            self.render_merge_advice_footer(
+                frame,
+                &AdviceFooter::new(&dialog.suggestion, screen.width),
+            );
+            return;
+        }
         let area = Rect::new(screen.x, screen.bottom() - 1, screen.width, 1);
         let normal = Style::default().fg(INK).bg(HEADING);
         let key_style = normal.fg(ACCENT).add_modifier(Modifier::BOLD);
@@ -380,6 +457,7 @@ impl ReviewSession {
                 false,
             ),
             ("[c]", "Comment", review && repository_mode.is_some(), false),
+            ("[J]", "Suggest", self.can_begin_merge_advice(), true),
             ("[o]", "Ours", review && conflict.is_some(), false),
             ("[t]", "Theirs", review && conflict.is_some(), false),
             ("[b]", "Both", review && conflict.is_some(), false),
@@ -864,6 +942,15 @@ impl ReviewSession {
         for line in guide {
             wrap_help_line(&mut self.help_lines, line, width);
         }
+        if self.merge_advice_eligible() {
+            for line in [
+                "J: ask Jev for a suggestion for the selected unresolved conflict",
+                "Sends the complete base, ours and theirs conflict plus up to 20 lines before and after each to TypeSafe. Source context may contain secrets.",
+                "Model confidence is informational, not a correctness guarantee. Enter applies a suggested side; Esc/q dismisses. Writing still requires confirmation.",
+            ] {
+                wrap_help_line(&mut self.help_lines, line, width);
+            }
+        }
         if let Some(review) = &self.repository_review {
             wrap_help_line(
                 &mut self.help_lines,
@@ -899,6 +986,39 @@ impl ReviewSession {
                 .len()
                 .saturating_sub(usize::from(self.height.saturating_sub(2))),
         );
+    }
+
+    fn render_merge_advice_footer(&self, frame: &mut Frame<'_>, footer: &AdviceFooter) {
+        let screen = frame.area();
+        let height = footer.height.min(screen.height.saturating_sub(1));
+        let area = Rect::new(screen.x, screen.bottom() - height, screen.width, height);
+        let normal = Style::default().fg(INK).bg(HEADING);
+        let confidence = format!("{}% confidence", footer.confidence);
+        let values = [
+            footer.choice,
+            confidence.as_str(),
+            "[Enter] Apply",
+            "[Esc] Ignore",
+        ];
+        let buffer = frame.buffer_mut();
+        buffer.set_style(area, normal);
+        let hidden_rows = footer.height - height;
+        for (index, (part, value)) in footer.parts.iter().zip(values).enumerate() {
+            if part.width == 0 || part.y < hidden_rows {
+                continue;
+            }
+            let x = area.x + part.x;
+            let y = area.y + part.y - hidden_rows;
+            let style = match index {
+                1 => normal.fg(MUTED),
+                2 | 3 => normal.fg(ACCENT).add_modifier(Modifier::BOLD),
+                _ => normal,
+            };
+            if index == 1 && part.x >= 3 {
+                buffer.set_stringn(x - 2, y, "·", 1, normal.fg(MUTED));
+            }
+            buffer.set_stringn(x, y, value, usize::from(part.width), style);
+        }
     }
 
     fn render_help(&self, frame: &mut Frame<'_>) {

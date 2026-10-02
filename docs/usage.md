@@ -220,6 +220,57 @@ Git review uses the same footer layout. The header shows the current file positi
 
 The header distinguishes `modified` and `INSERT` with labels as well as colour. Truecolour gives the intended palette; a non-empty `NO_COLOR` disables colours. No Powerline/Nerd Font is required. Unicode terminal cells approximate the diagonal connectors; they are not graphical curves.
 
+### Themes
+
+Choose a theme for any interactive command:
+
+```sh
+chvrn --theme darcula
+chvrn review --theme catppuccin_mocha
+chvrn diff before.rs after.rs --theme solarized_light
+```
+
+Bundled themes are embedded in the executable and work offline. No Helix installation is needed.
+
+| Name | Appearance |
+| --- | --- |
+| `chvrn` | Original Chvrn dark palette; default |
+| `darcula` | Darcula |
+| `catppuccin_latte` | Catppuccin light |
+| `catppuccin_frappe`, `catppuccin_macchiato`, `catppuccin_mocha` | Catppuccin dark flavours |
+| `gruvbox` | Gruvbox Dark |
+| `tokyonight` | Tokyo Night |
+| `github_light` | GitHub Light |
+| `solarized_dark`, `solarized_light` | Solarized Dark and Light |
+
+Save your default in `$XDG_CONFIG_HOME/chvrn/config.toml`, or `$HOME/.config/chvrn/config.toml` when `XDG_CONFIG_HOME` is unset or not absolute:
+
+```toml
+theme = "darcula"
+```
+
+`--theme` overrides the saved selection and bypasses configuration-file parsing. `--theme chvrn` selects the original appearance. Themes are loaded at launch, not watched for changes. Theme selection follows repository file changes, review-to-merge transitions, definition views and companion launches. Headless output remains uncoloured, but invalid theme selections or configuration still fail with exit `2`.
+
+For an external Helix-compatible theme, put `personal.toml` in the `themes` directory beside `config.toml` and use `--theme personal`. Alternatively, pass a file with `--theme /path/to/personal.toml`. Relative file paths on the command line use the launch directory; relative paths in `config.toml` use its directory. User theme names override bundled names except the reserved `chvrn`.
+
+Theme files support palette references, hex/ANSI/indexed colours, foreground/background styles, modifiers, underline colours and scope fallback. `inherits` resolves sibling files, the user themes directory and bundled themes; child palettes also recolour inherited scopes. Missing files, invalid styles and inheritance cycles produce errors instead of silently selecting another theme. Helix's internal `default` and `base16_default` themes are not bundled. The legacy `chvrn` palette cannot be an inheritance parent. Curled, dotted, dashed and double underlines render as a single underline with the current terminal backend.
+
+Chvrn maps Helix syntax, UI and diff scopes to its complete interface, deriving diff shading from the selected background and semantic colours. Terminal palette colours remain terminal colours rather than guessed RGB values. Override Chvrn-specific regions when needed:
+
+```toml
+inherits = "darcula"
+"chvrn.diff.conflict.result.selected" = { bg = "#533d30" }
+"chvrn.diff.conflict.result.selected.inline" = { bg = "#745239" }
+"chvrn.connector.conflict" = { bg = "#bd884e" }
+```
+
+For diff regions, use `chvrn.diff.R`, where `R` is `modified.old`, `modified`, `added`, `removed`, `conflict.result`, `conflict` or `resolved`. Add `.selected`, `.inline` or `.selected.inline` for explicit variants. `modified.old` applies to Left/Ours; `conflict.result` applies to the merged result. Selected inline overrides take precedence over ordinary inline overrides.
+
+Other overrides are `chvrn.surface`, `heading`, `muted`, `accent`, `notice`, `rail`, `help`, `cursor`, `linenr`, `overview` and `overview.viewport`, all with the `chvrn.` prefix. `chvrn.connector.K`, `chvrn.action.K`, `chvrn.overview.K` and `chvrn.overview.K.viewport` accept `K` = `modified`, `added`, `removed`, `conflict` or `resolved`. Connector fills use `bg` before `fg`. Ordinary scopes fall back to their dotted parents; diff variant overrides require their explicit scope.
+
+Bundled definitions and licences are preserved in [the theme attribution](../crates/chvrn-tui/themes/ATTRIBUTION.txt), with a pinned upstream source link. Helix theme adaptations remain MPL-2.0; Chvrn's own code remains GPL-3.0-only.
+
+
 ## Safety and current limitations
 
 - **Per-file replacement:** Replacement is atomic per file, not across a collection of files. Partial filesystem failures are reported. Do not assume a failed multi-file operation wrote nothing.

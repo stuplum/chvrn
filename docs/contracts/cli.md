@@ -8,6 +8,8 @@ The commands are `diff`, `merge`, `review`, `difftool` and `mergetool`. No subco
 
 Operational/usage failures exit `2`. Quitting an interactive session exits `1`, never approval. Successful explicit interactive submission exits `0`. Repository submission can advance through multiple files before the process completes.
 
+Global `--theme NAME_OR_FILE` takes precedence over the optional `theme` value in `config.toml`. Configuration lives under an absolute `XDG_CONFIG_HOME/chvrn`, otherwise `$HOME/.config/chvrn`. An explicit flag bypasses saved-config parsing. Missing configuration uses the original `chvrn` palette; malformed configuration and invalid selections fail before command side effects, including in headless mode. The CLI loads once, shares the theme across initial and replacement sessions, and supplies it to LSP definition views. Companion arguments retain the resolved selection, using the absolute source path for external themes so a changed working directory cannot select a different file. Relative saved file paths are relative to the configuration directory; explicit CLI paths are relative to the launch directory.
+
 ## File comparison
 
 `chvrn diff LEFT RIGHT --format json` reads explicit paths and never modifies either input. Missing input is an error, not an empty file. Text JSON contains `equal: bool` and `hunks: [{left: {start, end}, right: {start, end}}]`, using zero-based half-open line ranges. Binary/invalid UTF-8 content is identified rather than opened for text editing. Equal content exits `0`; differences exit `1`. JSON has no terminal control sequences outside JSON strings.

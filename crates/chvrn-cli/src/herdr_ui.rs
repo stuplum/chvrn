@@ -351,6 +351,10 @@ pub fn open_companion(args: &ReviewArgs, options: &Options, root: &Path, base: &
     if options.jev {
         words.push("--jev".into());
     }
+    if let Some(theme) = &options.theme {
+        words.push("--theme".into());
+        words.push(theme.into());
+    }
     for (flag, path) in [
         ("--patch", &args.patch),
         ("--socket", &args.socket),

@@ -96,6 +96,7 @@ pub fn diff(left: PathBuf, right: PathBuf, options: &Options) -> Result<u8> {
     let left_text = snapshot(left_file.bytes())?;
     let right_text = snapshot(right_file.bytes())?;
     let mut session = ReviewSession::two_way(left_text.text(), right_text.text());
+    session.set_theme(std::sync::Arc::clone(&options.loaded_theme));
     session.set_paths(&left_file.path, &right_file.path);
     session.set_whitespace_policy(options.whitespace.into());
     let watch = FileWatch::new(&[&left_file.path, &right_file.path], false)?;
@@ -297,6 +298,7 @@ pub fn merge(args: MergeArgs, options: &Options) -> Result<u8> {
     }
     let mut session =
         ReviewSession::three_way(base_text.text(), ours_text.text(), theirs_text.text());
+    session.set_theme(std::sync::Arc::clone(&options.loaded_theme));
     session.set_paths(&ours.path, &theirs.path);
     session.set_read_only(Pane::Ours, true);
     session.set_read_only(Pane::Theirs, true);

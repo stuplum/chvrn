@@ -9,6 +9,7 @@ fn command(root: &Path, args: &[&str]) -> Command {
     command
         .args(args)
         .current_dir(root)
+        .env("XDG_CONFIG_HOME", root.join("config-home"))
         .env_remove("CHVRN_BASE_BRANCH")
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")
@@ -246,6 +247,7 @@ fn difftool_reads_git_environment_without_changing_either_file() {
     let root = files(&[("old.txt", b"before\n"), ("new.txt", b"after\n")]);
     let output = Command::new(env!("CARGO_BIN_EXE_chvrn"))
         .args(["difftool", "--format", "json"])
+        .env("XDG_CONFIG_HOME", root.path().join("config-home"))
         .env_remove("HERDR_ENV")
         .env("LOCAL", root.path().join("old.txt"))
         .env("REMOTE", root.path().join("new.txt"))
@@ -274,6 +276,7 @@ fn mergetool_resolves_git_environment_into_merged_without_overwriting_sources() 
     ]);
     let output = Command::new(env!("CARGO_BIN_EXE_chvrn"))
         .args(["mergetool", "--non-interactive"])
+        .env("XDG_CONFIG_HOME", root.path().join("config-home"))
         .env_remove("HERDR_ENV")
         .env("BASE", root.path().join("base.txt"))
         .env("LOCAL", root.path().join("local.txt"))

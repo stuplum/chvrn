@@ -315,6 +315,7 @@ impl RepositoryHost<'_> {
     fn session(&self) -> Result<ReviewSession> {
         if self.paths.is_empty() {
             let mut session = ReviewSession::two_way("", "");
+            session.set_theme(Arc::clone(&self.options.loaded_theme));
             session.set_read_only(Pane::Left, true);
             session.set_read_only(Pane::Right, true);
             self.configure_footer(&mut session);
@@ -352,6 +353,7 @@ impl RepositoryHost<'_> {
         } else {
             ReviewSession::two_way(std::str::from_utf8(left)?, std::str::from_utf8(right)?)
         };
+        session.set_theme(Arc::clone(&self.options.loaded_theme));
         session.set_paths(&path, &path);
         session.set_whitespace_policy(self.options.whitespace.into());
         session.set_read_only(Pane::Left, true);
@@ -385,6 +387,7 @@ impl RepositoryHost<'_> {
             std::str::from_utf8(source.ours())?,
             std::str::from_utf8(source.theirs())?,
         );
+        merge.set_theme(Arc::clone(&self.options.loaded_theme));
         merge.set_paths(&path, &path);
         merge.set_output_path(&path);
         merge.set_read_only(Pane::Ours, true);
@@ -427,6 +430,7 @@ impl RepositoryHost<'_> {
             .unwrap_or(0);
         if self.paths.is_empty() {
             *session = ReviewSession::two_way("", "");
+            session.set_theme(Arc::clone(&self.options.loaded_theme));
             session.set_read_only(Pane::Left, true);
             session.set_read_only(Pane::Right, true);
             self.configure_footer(session);
@@ -1132,6 +1136,8 @@ mod tests {
             format: OutputFormat::Auto,
             non_interactive: false,
             jev: false,
+            theme: None,
+            loaded_theme: Arc::default(),
             herdr: None,
             agent: None,
             whitespace: Whitespace::Exact,

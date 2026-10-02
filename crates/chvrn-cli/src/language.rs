@@ -208,8 +208,9 @@ impl LanguageUi {
                     session
                         .set_message("Formatting applied as one undoable edit; s saves, u undoes");
                 }
-                Ok(ResponseValue::Definition(view)) => {
+                Ok(ResponseValue::Definition(mut view)) => {
                     session.cancel_merge_advice();
+                    view.set_theme(std::sync::Arc::clone(session.theme()));
                     self.previous = Some(std::mem::replace(session, *view));
                 }
             }

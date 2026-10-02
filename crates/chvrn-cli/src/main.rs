@@ -6,6 +6,7 @@ mod repository;
 mod socket_ui;
 mod standalone;
 mod terminal;
+mod theme_config;
 mod watch;
 
 use chvrn_core::diff::WhitespacePolicy;
@@ -21,7 +22,8 @@ type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Resu
 #[command(
     name = "chvrn",
     version,
-    about = "Editable, snapshot-safe terminal diff and merge"
+    about = "Editable, snapshot-safe terminal diff and merge",
+    after_help = "Bundled Helix themes are available under MPL-2.0. Theme source and licence:\nhttps://github.com/helix-editor/helix/tree/ba40e547426b0f9896c8bdc699a4ab11f2b37dbc"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,6 +44,14 @@ struct Options {
         help = "Enable on-demand Jev suggestions via TypeSafe (interactive only)"
     )]
     jev: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Select a bundled theme name or a Helix-compatible TOML file"
+    )]
+    theme: Option<String>,
+    #[arg(skip)]
+    loaded_theme: std::sync::Arc<chvrn_tui::Theme>,
     #[arg(long, global = true, value_enum)]
     herdr: Option<HerdrMode>,
     #[arg(long, global = true)]
@@ -161,7 +171,11 @@ fn environment_path(path: Option<PathBuf>, name: &str) -> Result<PathBuf> {
 }
 
 fn execute(cli: Cli) -> Result<u8> {
-    let options = &cli.options;
+    let mut options = cli.options;
+    let theme = theme_config::load_theme(options.theme.as_deref())?;
+    options.loaded_theme = theme.theme;
+    options.theme = Some(theme.argument);
+    let options = &options;
     if options.jev && !options.interactive() {
         return Err("--jev requires an interactive session; output unchanged".into());
     }

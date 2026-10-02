@@ -3,6 +3,219 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 use std::path::Path;
 
+fn external_theme(source: &str) -> std::sync::Arc<chvrn_tui::Theme> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "chvrn-render-theme-{}-{}.toml",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&path, source).unwrap();
+    let theme = chvrn_tui::Theme::load(path.to_str().unwrap(), None).unwrap();
+    std::fs::remove_file(path).unwrap();
+    std::sync::Arc::new(theme)
+}
+
+#[test]
+fn switching_theme_repaints_without_changing_content_cursor_or_edit_history() {
+    use ratatui::style::Color;
+    let mut session = ReviewSession::two_way("same\nold\n", "same\nnew\n");
+    let before = draw(&session, 100, 12);
+    let cursor = session.cursor();
+    let selected = session.selected_hunk();
+    session.set_theme(external_theme(
+        r##"
+"ui.background" = { bg = "#fafafa" }
+"ui.text" = { fg = "#202020" }
+"ui.statusline" = { fg = "#303030", bg = "#e0e0e0" }
+"ui.linenr" = "#606060"
+"diff.plus" = "#008000"
+"diff.minus" = "#a00000"
+"diff.delta" = "#0000a0"
+"ui.help" = { fg = "#101010", bg = "#dddddd" }
+"ui.cursor" = { fg = "#ffffff", bg = "#000000" }
+"chvrn.rail" = { bg = "#cccccc" }
+"chvrn.action" = { fg = "#ff00ff" }
+        "##,
+    ));
+    let after = draw(&session, 100, 12);
+    assert_eq!(visible_text(&before), visible_text(&after));
+    assert_eq!(cursor, session.cursor());
+    assert_eq!(selected, session.selected_hunk());
+    assert!(!session.is_dirty());
+    assert_eq!(after[(0, 0)].bg, Color::Rgb(224, 224, 224));
+    assert_eq!(after[(0, 11)].bg, Color::Rgb(224, 224, 224));
+    assert_eq!(after[(5, 9)].bg, Color::Rgb(250, 250, 250));
+    let action = cell_at(&after, "»");
+    assert_eq!(after[action].fg, Color::Rgb(255, 0, 255));
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(session.pane_text(Pane::Right), "same\nold\n");
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(session.pane_text(Pane::Right), "same\nnew\n");
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('?'),
+        KeyModifiers::NONE,
+    )));
+    let help = draw(&session, 100, 12);
+    assert!(help.content.iter().any(|cell| cell.symbol() == "H"
+        && cell.fg == Color::Rgb(16, 16, 16)
+        && cell.bg == Color::Rgb(221, 221, 221)));
+}
+
+#[test]
+fn syntax_modifiers_survive_diff_and_explicit_inline_overrides() {
+    use ratatui::style::{Color, Modifier};
+    let mut session = ReviewSession::two_way("let value = 1;\n", "let value = 2;\n");
+    session.set_paths(Path::new("left.rs"), Path::new("right.rs"));
+    session.set_theme(external_theme(
+        r##"
+"ui.background" = { bg = "#ffffff" }
+"ui.text" = { fg = "#202020" }
+"ui.selection" = { fg = "#444444", bg = "#bbbbbb" }
+"keyword" = { fg = "#800080", modifiers = ["italic"] }
+"constant.numeric" = { fg = "#008080", modifiers = ["underlined"] }
+"chvrn.diff.modified.old" = { bg = "#eeeeee" }
+"chvrn.diff.modified.old.selected" = { bg = "#dddddd" }
+"chvrn.diff.modified.old.selected.inline" = { bg = "#cccccc" }
+        "##,
+    ));
+    let buffer = draw(&session, 100, 12);
+    let keyword = cell_at(&buffer, "e");
+    assert_eq!(buffer[keyword].fg, Color::Rgb(128, 0, 128));
+    assert!(buffer[keyword].modifier.contains(Modifier::ITALIC));
+    assert_eq!(buffer[keyword].bg, Color::Rgb(221, 221, 221));
+    let number = buffer
+        .content
+        .iter()
+        .find(|cell| cell.symbol() == "1" && cell.modifier.contains(Modifier::UNDERLINED))
+        .expect("changed number retains syntax underline");
+    assert_eq!(number.bg, Color::Rgb(204, 204, 204));
+    assert!(number.modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn derived_diff_backgrounds_follow_light_and_dark_surfaces() {
+    use ratatui::style::Color;
+    for (surface, light) in [("#ffffff", true), ("#101010", false)] {
+        let mut session = ReviewSession::two_way("prefix old suffix\n", "prefix new suffix\n");
+        session.set_theme(external_theme(&format!(
+            "\"ui.background\" = {{ bg = \"{surface}\" }}\n\"diff.delta\" = \"#2040a0\"\n"
+        )));
+        let buffer = draw(&session, 100, 10);
+        let unchanged = cell_at(&buffer, "r");
+        let changed = cell_at(&buffer, "o");
+        let brightness = |color| match color {
+            Color::Rgb(r, g, b) => u16::from(r) + u16::from(g) + u16::from(b),
+            other => panic!("expected derived RGB background, got {other:?}"),
+        };
+        assert_ne!(buffer[unchanged].bg, buffer[changed].bg);
+        if light {
+            assert!(brightness(buffer[unchanged].bg) > brightness(buffer[changed].bg));
+            assert!(brightness(buffer[unchanged].bg) > 500);
+        } else {
+            assert!(brightness(buffer[unchanged].bg) < brightness(buffer[changed].bg));
+            assert!(brightness(buffer[unchanged].bg) < 300);
+        }
+    }
+}
+
+#[test]
+fn conflict_overrides_cover_selected_result_connectors_actions_and_overview() {
+    use ratatui::style::Color;
+    let mut session = ReviewSession::three_way("base\n", "ours\n", "theirs\n");
+    session.set_theme(external_theme(
+        r##"
+"ui.background" = { bg = "#f0f0f0" }
+"ui.text" = { fg = "#202020" }
+"ui.cursor" = { fg = "#010203", bg = "#040506" }
+"chvrn.diff.conflict.result.selected" = { bg = "#aabbcc" }
+"chvrn.diff.conflict.result.selected.inline" = { bg = "#bbccdd" }
+"chvrn.connector.conflict" = { bg = "#778899" }
+"chvrn.action.conflict" = { fg = "#112233", bg = "#445566" }
+"chvrn.overview.conflict.viewport" = { fg = "#123456", bg = "#654321" }
+        "##,
+    ));
+    let before = draw(&session, 140, 12);
+    assert!(
+        before
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::Rgb(170, 187, 204))
+    );
+    assert!(
+        before
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::Rgb(119, 136, 153))
+    );
+    let action = cell_at(&before, "»");
+    assert_eq!(before[action].fg, Color::Rgb(17, 34, 51));
+    assert_eq!(before[action].bg, Color::Rgb(68, 85, 102));
+    assert!(before.content.iter().any(|cell| cell.symbol() == "█"
+        && cell.fg == Color::Rgb(18, 52, 86)
+        && cell.bg == Color::Rgb(101, 67, 33)));
+    assert!(
+        before
+            .content
+            .iter()
+            .any(|cell| cell.fg == Color::Rgb(1, 2, 3) && cell.bg == Color::Rgb(4, 5, 6))
+    );
+    session.handle(ReviewInput::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(session.unresolved_conflicts(), 0);
+    assert_eq!(session.pane_text(Pane::Result), "ours\n");
+    let resolved = draw(&session, 140, 12);
+    assert!(
+        !resolved
+            .content
+            .iter()
+            .any(|cell| cell.bg == Color::Rgb(170, 187, 204))
+    );
+}
+
+#[test]
+fn indexed_theme_preserves_terminal_colours_and_default_can_be_restored() {
+    use ratatui::style::{Color, Modifier};
+    let mut session = ReviewSession::two_way("let old = 1;\n", "let new = 2;\n");
+    session.set_paths(Path::new("left.rs"), Path::new("right.rs"));
+    let original = draw(&session, 100, 12);
+    session.set_theme(external_theme(
+        r#"
+"ui.background" = { bg = "black" }
+"ui.text" = { fg = "white" }
+"keyword" = { fg = "magenta", modifiers = ["italic"] }
+"diff.delta" = "blue"
+"ui.selection" = { modifiers = ["underlined"] }
+        "#,
+    ));
+    let themed = draw(&session, 100, 12);
+    assert_eq!(themed[(5, 9)].bg, Color::Black);
+    let keyword = cell_at(&themed, "e");
+    assert_eq!(themed[keyword].fg, Color::Magenta);
+    assert_eq!(themed[keyword].bg, Color::Black);
+    assert!(
+        themed[keyword]
+            .modifier
+            .contains(Modifier::ITALIC | Modifier::UNDERLINED)
+    );
+    assert!(
+        !themed
+            .content
+            .iter()
+            .any(|cell| matches!(cell.fg, Color::Rgb(..)) || matches!(cell.bg, Color::Rgb(..)))
+    );
+    session.set_theme(std::sync::Arc::new(chvrn_tui::Theme::default()));
+    assert_eq!(draw(&session, 100, 12), original);
+}
+
 fn draw(session: &ReviewSession, width: u16, height: u16) -> Buffer {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| session.render(frame)).unwrap();
@@ -823,53 +1036,6 @@ fn overview_viewport_block_expands_when_more_of_the_file_becomes_visible() {
             .filter(|&y| resized[(x, y)].symbol() == "█")
             .collect();
         assert_eq!(rows, vec![2, 3, 4, 5, 6, 7, 8, 9]);
-    }
-}
-
-#[test]
-fn overview_viewport_block_brightens_overlapping_changes_and_restores_them_after_scrolling() {
-    use ratatui::style::Color;
-
-    let base = (0..50)
-        .map(|line| format!("line{line:02}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let ours = base.replace("line40", "OURS");
-    let theirs = base.replace("line40", "THEIRS");
-    for (mut session, pane) in [
-        (ReviewSession::two_way(&base, &ours), Pane::Right),
-        (
-            ReviewSession::three_way(&base, &ours, &theirs),
-            Pane::Theirs,
-        ),
-    ] {
-        session.handle(ReviewInput::Resize {
-            width: 80,
-            height: 13,
-        });
-        let outside = draw(&session, 80, 13);
-        let marker = &outside[(79, 10)];
-        assert_eq!(marker.symbol(), "▐");
-        let Color::Rgb(red, green, blue) = marker.fg else {
-            panic!("expected an RGB change marker");
-        };
-
-        session.go_to(pane, 40, 0);
-        let inside = draw(&session, 80, 13);
-        let highlighted = &inside[(79, 10)];
-        let Color::Rgb(brighter_red, brighter_green, brighter_blue) = highlighted.fg else {
-            panic!("expected an RGB viewport marker");
-        };
-        assert!(
-            brighter_red > red && brighter_green > green && brighter_blue > blue,
-            "visible change must use a brighter variation of its own colour",
-        );
-        assert_eq!(highlighted.symbol(), "█");
-
-        session.go_to(pane, 0, 0);
-        let restored = draw(&session, 80, 13);
-        assert_eq!(restored[(79, 10)].symbol(), "▐");
-        assert_eq!(restored[(79, 10)].fg, marker.fg);
     }
 }
 

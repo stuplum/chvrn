@@ -1,0 +1,25 @@
+Gruvbox upstream author and licence declaration
+
+The following author notice is preserved verbatim from colors/gruvbox.vim at:
+https://github.com/morhetz/gruvbox/blob/ef8864bb42bf244f0295d1c5a403b27e3d139695/colors/gruvbox.vim
+
+" -----------------------------------------------------------------------------
+" File: gruvbox.vim
+" Description: Retro groove color scheme for Vim
+" Author: morhetz <morhetz@gmail.com>
+" Source: https://github.com/morhetz/gruvbox
+" Last Modified: 12 Aug 2017
+" -----------------------------------------------------------------------------
+
+The following licence declaration is preserved verbatim from README.md at:
+https://github.com/morhetz/gruvbox/blob/ef8864bb42bf244f0295d1c5a403b27e3d139695/README.md
+
+License
+-------
+[MIT/X11][]
+
+   [MIT/X11]: https://en.wikipedia.org/wiki/MIT_License
+
+That revision does not provide a separate licence file or copyright statement
+in colors/gruvbox.vim. The Helix adaptation is distributed with the Helix
+MPL-2.0 licence; see ../ATTRIBUTION.txt and helix-MPL-2.0.txt.

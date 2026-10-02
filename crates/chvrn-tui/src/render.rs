@@ -14,7 +14,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    Pane, RepositoryReviewMode, WhitespacePolicy,
+    Pane, RepositoryReviewMode, Theme, WhitespacePolicy,
     session::{ChangeBand, ChangeKind, Mode, ReviewSession, ViewLine},
     text,
 };
@@ -129,6 +129,350 @@ const MUTED: Color = Color::Rgb(108, 115, 122);
 const ACCENT: Color = Color::Rgb(112, 194, 210);
 const MODIFIED: Color = Color::Rgb(222, 180, 106);
 const CONNECTOR_WIDTH: u16 = 5;
+
+#[derive(Clone, Copy)]
+struct RegionPaint {
+    normal: Style,
+    inline: Style,
+}
+
+pub(crate) struct RenderPalette {
+    surface: Style,
+    heading: Style,
+    quiet: Style,
+    accent: Style,
+    notice: Style,
+    rail: Style,
+    line_number: Style,
+    help: Style,
+    cursor: Style,
+    overview: [Style; 2],
+    bands: [Color; 5],
+    actions: [Style; 5],
+    overview_bands: [[Style; 2]; 5],
+    regions: [[RegionPaint; 2]; 7],
+    neutral: RegionPaint,
+    syntax: [Style; 8],
+}
+
+impl RenderPalette {
+    pub(crate) fn compile(theme: &Theme) -> Self {
+        if theme.name() == "chvrn" {
+            return Self::legacy();
+        }
+        let surface = Style::default()
+            .fg(Color::Reset)
+            .bg(Color::Reset)
+            .patch(theme.style("ui.background"))
+            .patch(theme.style("ui.text"))
+            .patch(theme.style("chvrn.surface"));
+        let heading = surface
+            .patch(theme.style("ui.statusline"))
+            .patch(theme.style("chvrn.heading"));
+        let muted = theme.style("ui.linenr");
+        let quiet = heading.patch(muted).patch(theme.style("chvrn.muted"));
+        let accent = heading
+            .add_modifier(Modifier::BOLD)
+            .patch(theme.style("ui.text.focus"))
+            .patch(theme.style("chvrn.accent"));
+        let notice = heading
+            .patch(theme.style("warning"))
+            .patch(theme.style("chvrn.notice"));
+        let rail = surface
+            .patch(muted)
+            .patch(theme.style("ui.virtual.whitespace"))
+            .patch(theme.style("chvrn.rail"));
+        let help = heading
+            .patch(theme.style("ui.popup"))
+            .patch(theme.style("ui.help"))
+            .patch(theme.style("chvrn.help"));
+        let cursor = theme.style("ui.cursor").patch(theme.style("chvrn.cursor"));
+        let cursor = if cursor.fg.is_none() && cursor.bg.is_none() {
+            Style::default()
+                .add_modifier(Modifier::REVERSED)
+                .patch(cursor)
+        } else {
+            cursor
+        };
+        let selection = theme.style("ui.selection");
+        let region_selection = Style {
+            fg: None,
+            ..selection
+        };
+        let semantics = [
+            theme.style("diff.delta"),
+            theme.style("diff.plus"),
+            theme.style("diff.minus"),
+            theme.style("diff.delta.conflict"),
+            theme.style("diff.plus"),
+        ];
+        let names = ["modified", "added", "removed", "conflict", "resolved"];
+        let bands = std::array::from_fn(|i| {
+            let semantic = semantics[i]
+                .fg
+                .unwrap_or(surface.fg.unwrap_or(Color::Reset));
+            let style = theme.style(&format!("chvrn.connector.{}", names[i]));
+            style.bg.or(style.fg).unwrap_or(semantic)
+        });
+        let overview = [
+            rail.patch(theme.style("ui.virtual.ruler"))
+                .patch(theme.style("chvrn.overview")),
+            rail.patch(selection)
+                .patch(theme.style("chvrn.overview.viewport")),
+        ];
+        let actions = std::array::from_fn(|i| {
+            let background = bands[i];
+            let foreground = match background {
+                Color::Rgb(r, g, b)
+                    if u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114 > 128_000 =>
+                {
+                    Color::Black
+                }
+                Color::Rgb(..) => Color::White,
+                _ => surface.bg.unwrap_or(Color::Reset),
+            };
+            Style::default()
+                .fg(foreground)
+                .bg(background)
+                .add_modifier(Modifier::BOLD)
+                .patch(theme.style(&format!("chvrn.action.{}", names[i])))
+        });
+        let overview_bands = std::array::from_fn(|i| {
+            std::array::from_fn(|viewport| {
+                let mut style = rail.fg(bands[i]);
+                if viewport == 1 {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                style.patch(theme.style(&format!(
+                    "chvrn.overview.{}{}",
+                    names[i],
+                    if viewport == 1 { ".viewport" } else { "" }
+                )))
+            })
+        });
+        let region_names = [
+            "modified.old",
+            "modified",
+            "added",
+            "removed",
+            "conflict.result",
+            "conflict",
+            "resolved",
+        ];
+        let semantic_indices = [0, 0, 1, 2, 3, 3, 4];
+        let regions = std::array::from_fn(|i| {
+            let semantic = semantics[semantic_indices[i]];
+            let tint = if i == 0 {
+                semantics[2].fg.or(semantic.fg)
+            } else {
+                semantic.fg
+            }
+            .unwrap_or(bands[semantic_indices[i]]);
+            let scope = format!("chvrn.diff.{}", region_names[i]);
+            let background = surface.bg.unwrap_or(Color::Reset);
+            let base = match blend(background, tint, if i == 4 { 22 } else { 16 }) {
+                Some(color) => Style::default().bg(color),
+                None => Style::default().bg(background),
+            }
+            .patch(theme.style(&scope));
+            std::array::from_fn(|selected| {
+                let normal = if selected == 1 {
+                    let style = match blend(base.bg.unwrap_or(background), tint, 11) {
+                        Some(color) => base.patch(region_selection).bg(color),
+                        None => base.patch(region_selection).add_modifier(Modifier::BOLD),
+                    };
+                    style.patch(
+                        theme
+                            .exact_style(&format!("{scope}.selected"))
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    base
+                };
+                let inline = match blend(normal.bg.unwrap_or(background), tint, 25) {
+                    Some(color) => normal.bg(color),
+                    None => normal.add_modifier(Modifier::REVERSED),
+                }
+                .add_modifier(Modifier::BOLD)
+                .patch(
+                    theme
+                        .exact_style(&format!("{scope}.inline"))
+                        .unwrap_or_default(),
+                );
+                let inline = if selected == 1 {
+                    inline.patch(
+                        theme
+                            .exact_style(&format!("{scope}.selected.inline"))
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    inline
+                };
+                RegionPaint { normal, inline }
+            })
+        });
+        let syntax = [
+            "keyword",
+            "variable",
+            "string",
+            "constant.numeric",
+            "comment",
+            "type",
+            "function",
+            "punctuation",
+        ]
+        .map(|scope| theme.style(scope));
+        Self {
+            surface,
+            heading,
+            quiet,
+            accent,
+            notice,
+            rail,
+            help,
+            cursor,
+            line_number: muted.patch(theme.style("chvrn.linenr")),
+            overview,
+            bands,
+            actions,
+            overview_bands,
+            regions,
+            syntax,
+            neutral: RegionPaint {
+                normal: Style::default(),
+                inline: region_selection.add_modifier(Modifier::BOLD),
+            },
+        }
+    }
+
+    fn legacy() -> Self {
+        let kinds = [
+            ChangeKind::Modified,
+            ChangeKind::Added,
+            ChangeKind::Removed,
+            ChangeKind::Conflict,
+            ChangeKind::Resolved,
+        ];
+        let bands = kinds.map(band_color);
+        let region_kinds = [
+            (ChangeKind::Modified, Pane::Left),
+            (ChangeKind::Modified, Pane::Right),
+            (ChangeKind::Added, Pane::Right),
+            (ChangeKind::Removed, Pane::Left),
+            (ChangeKind::Conflict, Pane::Result),
+            (ChangeKind::Conflict, Pane::Ours),
+            (ChangeKind::Resolved, Pane::Result),
+        ];
+        let regions = region_kinds.map(|(kind, pane)| {
+            std::array::from_fn(|selected| {
+                let background = region_color(kind, pane, selected == 1);
+                RegionPaint {
+                    normal: Style::default().bg(background),
+                    inline: Style::default()
+                        .bg(intraline_color(Some(kind), background))
+                        .add_modifier(Modifier::BOLD),
+                }
+            })
+        });
+        let surface = Style::default().fg(INK).bg(SURFACE);
+        let heading = Style::default().fg(INK).bg(HEADING);
+        Self {
+            surface,
+            heading,
+            quiet: heading.fg(MUTED),
+            accent: heading.fg(ACCENT).add_modifier(Modifier::BOLD),
+            notice: heading.fg(MODIFIED),
+            rail: Style::default().fg(MUTED).bg(RAIL),
+            line_number: Style::default().fg(MUTED),
+            help: heading,
+            cursor: Style::default().add_modifier(Modifier::REVERSED),
+            overview: [
+                Style::default().fg(Color::Rgb(47, 51, 57)).bg(RAIL),
+                Style::default().fg(Color::Rgb(91, 110, 125)).bg(RAIL),
+            ],
+            bands,
+            actions: bands.map(|color| {
+                Style::default()
+                    .fg(Color::Rgb(225, 220, 188))
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD)
+            }),
+            overview_bands: bands.map(|color| {
+                [
+                    Style::default().fg(color).bg(RAIL),
+                    Style::default().fg(brighten(color, 40)).bg(RAIL),
+                ]
+            }),
+            regions,
+            neutral: RegionPaint {
+                normal: Style::default(),
+                inline: Style::default()
+                    .bg(intraline_color(None, SURFACE))
+                    .add_modifier(Modifier::BOLD),
+            },
+            syntax: [
+                HighlightKind::Keyword,
+                HighlightKind::Identifier,
+                HighlightKind::String,
+                HighlightKind::Number,
+                HighlightKind::Comment,
+                HighlightKind::Type,
+                HighlightKind::Function,
+                HighlightKind::Punctuation,
+            ]
+            .map(|kind| Style::default().fg(syntax_color(&kind))),
+        }
+    }
+
+    fn region(&self, kind: ChangeKind, pane: Pane, selected: bool) -> RegionPaint {
+        let index = match (kind, pane) {
+            (ChangeKind::Modified, Pane::Left | Pane::Ours) => 0,
+            (ChangeKind::Modified, _) => 1,
+            (ChangeKind::Added, _) => 2,
+            (ChangeKind::Removed, _) => 3,
+            (ChangeKind::Conflict, Pane::Result) => 4,
+            (ChangeKind::Conflict, _) => 5,
+            (ChangeKind::Resolved, _) => 6,
+        };
+        self.regions[index][usize::from(selected)]
+    }
+
+    fn syntax(&self, kind: &HighlightKind) -> Style {
+        self.syntax[match kind {
+            HighlightKind::Keyword => 0,
+            HighlightKind::Identifier => 1,
+            HighlightKind::String => 2,
+            HighlightKind::Number => 3,
+            HighlightKind::Comment => 4,
+            HighlightKind::Type => 5,
+            HighlightKind::Function => 6,
+            HighlightKind::Punctuation => 7,
+        }]
+    }
+}
+
+fn blend(background: Color, foreground: Color, percent: u16) -> Option<Color> {
+    let (Color::Rgb(br, bg, bb), Color::Rgb(fr, fg, fb)) = (background, foreground) else {
+        return None;
+    };
+    let channel =
+        |base, tint| ((u16::from(base) * (100 - percent) + u16::from(tint) * percent) / 100) as u8;
+    Some(Color::Rgb(
+        channel(br, fr),
+        channel(bg, fg),
+        channel(bb, fb),
+    ))
+}
+
+fn kind_index(kind: ChangeKind) -> usize {
+    match kind {
+        ChangeKind::Modified => 0,
+        ChangeKind::Added => 1,
+        ChangeKind::Removed => 2,
+        ChangeKind::Conflict => 3,
+        ChangeKind::Resolved => 4,
+    }
+}
 
 fn wrap_help_line(lines: &mut Vec<String>, text: &str, width: usize) {
     if width == 0 {
@@ -257,22 +601,19 @@ impl ReviewSession {
             WhitespacePolicy::IgnoreAll => "IgnoreAll",
             WhitespacePolicy::IgnoreBlankLines => "IgnoreBlankLines",
         };
+        frame.buffer_mut().set_style(area, self.palette.surface);
         frame
             .buffer_mut()
-            .set_style(area, Style::default().fg(INK).bg(SURFACE));
-        frame.buffer_mut().set_style(
-            Rect::new(area.x, area.y, area.width, 1),
-            Style::default().fg(MUTED).bg(HEADING),
-        );
-        let quiet = Style::default().fg(MUTED).bg(HEADING);
-        let normal = Style::default().fg(INK).bg(HEADING);
+            .set_style(Rect::new(area.x, area.y, area.width, 1), self.palette.quiet);
+        let quiet = self.palette.quiet;
+        let normal = self.palette.heading;
         let editing = if self.editing {
-            normal.fg(ACCENT).add_modifier(Modifier::BOLD)
+            self.palette.accent
         } else {
             quiet
         };
         let modified = if self.changed {
-            normal.fg(MODIFIED).add_modifier(Modifier::BOLD)
+            self.palette.notice.add_modifier(Modifier::BOLD)
         } else {
             quiet
         };
@@ -316,15 +657,13 @@ impl ReviewSession {
             for pane_area in panes.iter().take(count) {
                 frame.buffer_mut().set_style(
                     Rect::new(pane_area.outer.x, area.y + 1, pane_area.outer.width, 1),
-                    Style::default().bg(HEADING),
+                    self.palette.heading,
                 );
-                let style = Style::default()
-                    .fg(if pane_area.pane == self.focus {
-                        INK
-                    } else {
-                        MUTED
-                    })
-                    .bg(HEADING);
+                let style = if pane_area.pane == self.focus {
+                    self.palette.heading
+                } else {
+                    self.palette.quiet
+                };
                 if pane_area.pane == self.focus {
                     frame
                         .buffer_mut()
@@ -365,8 +704,8 @@ impl ReviewSession {
             return;
         }
         let area = Rect::new(screen.x, screen.bottom() - 1, screen.width, 1);
-        let normal = Style::default().fg(INK).bg(HEADING);
-        let key_style = normal.fg(ACCENT).add_modifier(Modifier::BOLD);
+        let normal = self.palette.heading;
+        let key_style = self.palette.accent;
         let buffer = frame.buffer_mut();
         buffer.set_style(area, normal);
         let message = if self.confirming_discard {
@@ -386,7 +725,7 @@ impl ReviewSession {
                 area.y,
                 message,
                 usize::from(area.width),
-                normal.fg(MODIFIED),
+                self.palette.notice,
             );
             return;
         }
@@ -546,7 +885,7 @@ impl ReviewSession {
         }
         if let Some(name) = filename {
             let available = usize::from(area.right().saturating_sub(x));
-            let style = normal.fg(MUTED);
+            let style = self.palette.quiet;
             let width = filename_width;
             if width <= available {
                 buffer.set_stringn(area.right() - width as u16, area.y, &name, width, style);
@@ -587,8 +926,8 @@ impl ReviewSession {
             };
             let projection_index = self.pane_top(pane) + offset;
             let region = self.pane_region(pane, projection_index);
-            let background = region.map_or(SURFACE, |(kind, selected)| {
-                region_color(kind, pane, selected)
+            let paint = region.map_or(self.palette.neutral, |(kind, selected)| {
+                self.palette.region(kind, pane, selected)
             });
             let y = pane_area.content.y + offset as u16;
             frame.buffer_mut().set_style(
@@ -598,7 +937,7 @@ impl ReviewSession {
                     pane_area.outer.width.saturating_sub(1),
                     1,
                 ),
-                Style::default().fg(INK).bg(background),
+                self.palette.surface.patch(paint.normal),
             );
             render_line_number(
                 frame.buffer_mut(),
@@ -606,7 +945,10 @@ impl ReviewSession {
                 y,
                 pane_area.gutter,
                 line.number + 1,
-                background,
+                self.palette
+                    .surface
+                    .patch(paint.normal)
+                    .patch(self.palette.line_number),
             );
             let horizontal = *self.horizontal.get(&pane).unwrap_or(&0);
             render_line(
@@ -616,14 +958,14 @@ impl ReviewSession {
                 line,
                 &view.syntax,
                 horizontal,
-                background,
-                region.map(|(kind, _)| kind),
+                &self.palette,
+                paint,
             );
             if row_index == self.aligned_row && pane == self.focus {
                 if let Some(x) = cursor_cell(pane_area.content, Some(line), self.column, horizontal)
                 {
                     let cell = &mut frame.buffer_mut()[(x, y)];
-                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                    cell.set_style(cell.style().patch(self.palette.cursor));
                 }
             }
         }
@@ -648,7 +990,7 @@ impl ReviewSession {
                 y,
                 pane_area.gutter,
                 number + 1,
-                SURFACE,
+                self.palette.surface.patch(self.palette.line_number),
             );
             let cursor = (pane == self.focus && number == self.aligned_row)
                 .then_some(source.cursor().clamp(start, end));
@@ -672,19 +1014,28 @@ impl ReviewSession {
                     content.x,
                     y,
                     "‹",
-                    Style::default().fg(MUTED).bg(SURFACE),
+                    self.palette.surface.patch(self.palette.line_number),
                 );
                 content.x += 1;
                 content.width -= 1;
             }
             let line = ViewLine::new(number, snippet, 0);
-            render_line(frame.buffer_mut(), content, y, &line, &[], 0, SURFACE, None);
+            render_line(
+                frame.buffer_mut(),
+                content,
+                y,
+                &line,
+                &[],
+                0,
+                &self.palette,
+                self.palette.neutral,
+            );
             if let Some(cursor) = cursor {
                 let relative = cursor.saturating_sub(first).min(line.text.chars().count());
                 let column = text::grapheme_column(&line.text, relative);
                 if let Some(x) = cursor_cell(content, Some(&line), column, 0) {
                     let cell = &mut frame.buffer_mut()[(x, y)];
-                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                    cell.set_style(cell.style().patch(self.palette.cursor));
                 }
             }
         }
@@ -759,18 +1110,13 @@ impl ReviewSession {
             };
             let in_viewport = (viewport_start..viewport_end).contains(&offset);
             let y = pane_area.outer.y + offset as u16;
-            let (symbol, color) = match (kind, in_viewport) {
-                (Some(kind), true) => ("█", brighten(band_color(kind), 40)),
-                (Some(kind), false) => ("▐", band_color(kind)),
-                (None, true) => ("█", Color::Rgb(91, 110, 125)),
-                (None, false) => ("│", Color::Rgb(47, 51, 57)),
+            let (symbol, style) = match (kind, in_viewport) {
+                (Some(kind), true) => ("█", self.palette.overview_bands[kind_index(kind)][1]),
+                (Some(kind), false) => ("▐", self.palette.overview_bands[kind_index(kind)][0]),
+                (None, true) => ("█", self.palette.overview[1]),
+                (None, false) => ("│", self.palette.overview[0]),
             };
-            buffer.set_string(
-                pane_area.overview_x,
-                y,
-                symbol,
-                Style::default().fg(color).bg(RAIL),
-            );
+            buffer.set_string(pane_area.overview_x, y, symbol, style);
         }
     }
 
@@ -780,7 +1126,7 @@ impl ReviewSession {
         }
         frame
             .buffer_mut()
-            .set_style(connector.area, Style::default().fg(MUTED).bg(RAIL));
+            .set_style(connector.area, self.palette.rail);
         let left_top = self.pane_top(connector.left);
         let right_top = self.pane_top(connector.right);
         let height = usize::from(connector.area.height);
@@ -800,6 +1146,7 @@ impl ReviewSession {
                 band,
                 left_top,
                 right_top,
+                self.palette.bands[kind_index(band.kind)],
             );
         }
         let action_bands = self.action_bands(connector.left, connector.right);
@@ -810,10 +1157,7 @@ impl ReviewSession {
                         action.x,
                         action.y,
                         action.symbol,
-                        Style::default()
-                            .fg(Color::Rgb(225, 220, 188))
-                            .bg(band_color(band.kind))
-                            .add_modifier(Modifier::BOLD),
+                        self.palette.actions[kind_index(band.kind)],
                     );
                 }
             }
@@ -1009,7 +1353,7 @@ impl ReviewSession {
         let screen = frame.area();
         let height = footer.height.min(screen.height.saturating_sub(1));
         let area = Rect::new(screen.x, screen.bottom() - height, screen.width, height);
-        let normal = Style::default().fg(INK).bg(HEADING);
+        let normal = self.palette.heading;
         let confidence = format!("{}% confidence", footer.confidence);
         let values = [
             footer.choice,
@@ -1027,12 +1371,12 @@ impl ReviewSession {
             let x = area.x + part.x;
             let y = area.y + part.y - hidden_rows;
             let style = match index {
-                1 => normal.fg(MUTED),
-                2 | 3 => normal.fg(ACCENT).add_modifier(Modifier::BOLD),
+                1 => self.palette.quiet,
+                2 | 3 => self.palette.accent,
                 _ => normal,
             };
             if index == 1 && part.x >= 3 {
-                buffer.set_stringn(x - 2, y, "·", 1, normal.fg(MUTED));
+                buffer.set_stringn(x - 2, y, "·", 1, self.palette.quiet);
             }
             buffer.set_stringn(x, y, value, usize::from(part.width), style);
         }
@@ -1048,7 +1392,7 @@ impl ReviewSession {
             width,
             height,
         );
-        let style = Style::default().fg(INK).bg(HEADING);
+        let style = self.palette.help;
         frame.render_widget(Clear, box_area);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1142,7 +1486,7 @@ fn render_line_number(
     y: u16,
     gutter: u16,
     number: usize,
-    background: Color,
+    style: Style,
 ) {
     let width = usize::from(gutter.saturating_sub(1));
     if width == 0 {
@@ -1157,13 +1501,7 @@ fn render_line_number(
         value /= 10;
     }
     let visible = std::str::from_utf8(&digits[digits.len() - width..]).expect("decimal digits");
-    buffer.set_stringn(
-        x,
-        y,
-        visible,
-        width,
-        Style::default().fg(MUTED).bg(background),
-    );
+    buffer.set_stringn(x, y, visible, width, style);
 }
 
 fn pane_name(pane: Pane) -> &'static str {
@@ -1182,6 +1520,7 @@ fn draw_connector_band(
     band: &ChangeBand,
     left_top: usize,
     right_top: usize,
+    color: Color,
 ) {
     let left_start = band.left.start as i64 - left_top as i64;
     let right_start = band.right.start as i64 - right_top as i64;
@@ -1193,7 +1532,6 @@ fn draw_connector_band(
         .min(i64::from(area.height));
     let last = left_end.max(right_end).max(0).min(i64::from(area.height));
     let steps = i64::from(area.width.saturating_sub(2)).max(1);
-    let color = band_color(band.kind);
     for x in 0..area.width {
         let start = i64::from(x.saturating_sub(1)).min(steps);
         let end = i64::from(x).min(steps);
@@ -1314,8 +1652,8 @@ fn render_line(
     line: &ViewLine,
     syntax: &[chvrn_core::structural::HighlightSpan],
     offset: usize,
-    background: Color,
-    region: Option<ChangeKind>,
+    palette: &RenderPalette,
+    paint: RegionPaint,
 ) {
     let stop = line.stop_at_cell(offset);
     let mut cell_position = stop.cells;
@@ -1338,22 +1676,19 @@ fn render_line(
         }
         let absolute_byte = line.byte_start + stop.byte + byte;
         let prefix = syntax.partition_point(|span| span.bytes.start <= absolute_byte);
-        let syntax_color = syntax[..prefix]
+        let syntax_style = syntax[..prefix]
             .iter()
             .rev()
             .find(|span| absolute_byte < span.bytes.end)
-            .map(|span| syntax_color(&span.kind))
-            .unwrap_or(INK);
+            .map(|span| palette.syntax(&span.kind))
+            .unwrap_or_default();
         let changed_prefix = line.changed.partition_point(|span| span.start <= current);
         let changed = changed_prefix > 0 && current < line.changed[changed_prefix - 1].end;
-        let style = if changed {
-            Style::default()
-                .fg(syntax_color)
-                .bg(intraline_color(region, background))
-                .add_modifier(Modifier::BOLD)
+        let style = palette.surface.patch(syntax_style).patch(if changed {
+            paint.inline
         } else {
-            Style::default().fg(syntax_color).bg(background)
-        };
+            paint.normal
+        });
         let x = area.x.saturating_add(visible_x as u16);
         if grapheme == "\t" {
             buffer.set_string(x, y, "→", style);
@@ -1425,7 +1760,7 @@ mod tests {
                 resolved: None,
                 kind: ChangeKind::Modified,
             };
-            draw_connector_band(&mut buffer, area, &band, 0, 0);
+            draw_connector_band(&mut buffer, area, &band, 0, 0, color);
 
             for y in 2..20 {
                 assert!(
@@ -1455,7 +1790,7 @@ mod tests {
                 resolved: None,
                 kind: ChangeKind::Modified,
             };
-            draw_connector_band(&mut buffer, area, &band, 0, 0);
+            draw_connector_band(&mut buffer, area, &band, 0, 0, color);
         }
 
         for x in 0..5 {

@@ -1,0 +1,93 @@
+Bundled Helix themes
+===================
+
+All ten .toml files in this directory are unmodified copies from one Helix
+revision, including their original author and provenance comments:
+
+Repository: https://github.com/helix-editor/helix
+Commit: ba40e547426b0f9896c8bdc699a4ab11f2b37dbc
+Source directory:
+https://github.com/helix-editor/helix/tree/ba40e547426b0f9896c8bdc699a4ab11f2b37dbc/runtime/themes
+
+Files: darcula.toml, catppuccin_latte.toml, catppuccin_frappe.toml,
+catppuccin_macchiato.toml, catppuccin_mocha.toml, gruvbox.toml,
+tokyonight.toml, github_light.toml, solarized_dark.toml, solarized_light.toml.
+
+Inheritance is fully contained here: catppuccin_latte, catppuccin_frappe and
+catppuccin_macchiato inherit catppuccin_mocha. The other files have no parent.
+No network access or installed Helix is required at runtime.
+
+Helix licensing and source availability
+--------------------------------------
+Helix declares MPL-2.0 in its workspace Cargo.toml and provides the Mozilla
+Public License Version 2.0 in its root LICENSE. The complete, unmodified
+licence text is included as licenses/helix-MPL-2.0.txt. These vendored Helix
+adaptations remain available under that licence; this is not a claim that
+all original theme projects share a single licence or that the rest of
+Chvrn is relicensed.
+
+The Source Code Form of the embedded themes is the unmodified .toml files
+shipped in this directory. It is also available at the pinned upstream
+source-directory URL above. Redistributors of executables must preserve
+these notices and inform recipients where they can obtain that Source Code
+Form under MPL-2.0, as required by section 3.2. Keep the source files and
+licences with source distributions; any future modifications to these files
+must comply with MPL-2.0.
+
+Evidence at the same pinned Helix revision:
+https://github.com/helix-editor/helix/blob/ba40e547426b0f9896c8bdc699a4ab11f2b37dbc/Cargo.toml
+https://github.com/helix-editor/helix/blob/ba40e547426b0f9896c8bdc699a4ab11f2b37dbc/LICENSE
+https://github.com/helix-editor/helix/blob/ba40e547426b0f9896c8bdc699a4ab11f2b37dbc/runtime/themes/README.md
+
+The themes README asks contributors to retain authors and add licences for
+previously published themes under runtime/themes/licenses. That directory
+contains no separate licence for any of these ten filenames at this commit.
+Additional original-project notices are therefore preserved below rather
+than assuming their absence means unrestricted use.
+
+Per-theme attribution and original-project evidence
+--------------------------------------------------
+darcula:
+  Helix author: Nick Ogden <nick@nickogden.org>.
+  No separate licence is supplied for this file in Helix; the Helix MPL-2.0
+  distribution terms and its preserved in-file author notice apply.
+
+catppuccin_latte, catppuccin_frappe, catppuccin_macchiato, catppuccin_mocha:
+  The mocha file identifies catppuccin/helix as its synchronization source.
+  Original-project MIT licence: Copyright (c) 2022 Spaxly.
+  Preserved verbatim in licenses/catppuccin-MIT.txt.
+  https://github.com/catppuccin/helix/blob/91e071bf9b9b2b8ae176a5581fcb61c789c55cab/LICENSE
+
+ gruvbox:
+  Helix author: Jakub Bartodziej <kubabartodziej@gmail.com>.
+  The file credits the morhetz/gruvbox dark palette with standard contrast.
+  Original author: morhetz <morhetz@gmail.com>.
+  Upstream README declares MIT/X11, but the upstream revision has no separate
+  licence file. Exact declaration and author notice are preserved in
+  licenses/gruvbox-notice.txt, with pinned source URLs. No copyright date
+  or copyright statement has been invented for that project.
+
+ tokyonight:
+  Helix author: Paul Graydon <untimely.creation97@proton.me>.
+  Original Tokyo Night palette project: tokyo-night/tokyo-night-vscode-theme
+  (formerly enkia/tokyo-night-vscode-theme).
+  Original-project MIT licence: Copyright (c) 2018-present Enkia.
+  Preserved verbatim in licenses/tokyo-night-MIT.txt.
+  https://github.com/tokyo-night/tokyo-night-vscode-theme/blob/7c0f11eaef322f293621ca7befe462214b7ea468/LICENSE.txt
+
+ github_light:
+  Helix author: OwOSwordsman <owoswordsman@gmail.com>.
+  The file credits Primer primitives and primer/github-vscode-theme.
+  Original-project MIT licence: Copyright (c) 2020 Primer.
+  Preserved verbatim in licenses/github-vscode-theme-MIT.txt.
+  https://github.com/primer/github-vscode-theme/blob/cd78e5e4e7bcf132a6f428ae0f32264bb1b729cf/LICENSE
+
+ solarized_dark, solarized_light:
+  Original Solarized palette: Ethan Schoonover.
+  Original-project MIT licence: Copyright (c) 2011 Ethan Schoonover.
+  Preserved verbatim in licenses/solarized-MIT.txt.
+  https://github.com/altercation/solarized/blob/62f656a02f93c5190a8753159e34b385588d5ff3/LICENSE
+
+The additional licence-evidence revisions above pin notices, not theme
+sources: every bundled theme definition comes exclusively from the single
+Helix commit recorded at the top of this file.

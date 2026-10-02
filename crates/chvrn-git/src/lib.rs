@@ -237,11 +237,7 @@ impl Repository {
                 content: classify(bytes.as_deref()),
             });
         }
-        let untracked = self.git(
-            &words(&["ls-files", "--others", "--exclude-standard", "-z"]),
-            None,
-            None,
-        )?;
+        let untracked = self.untracked_output()?;
         for raw in nul_fields(&untracked)? {
             let path = path_from_git(raw)?;
             if changes.iter().any(|change| change.path == path) {
@@ -282,11 +278,7 @@ impl Repository {
                     for raw in nul_fields(&changed)? {
                         discovered.insert(path_from_git(raw)?);
                     }
-                    let others = self.git(
-                        &words(&["ls-files", "--others", "--exclude-standard", "-z"]),
-                        None,
-                        None,
-                    )?;
+                    let others = self.untracked_output()?;
                     for raw in nul_fields(&others)? {
                         discovered.insert(path_from_git(raw)?);
                     }
@@ -562,6 +554,28 @@ impl Repository {
         Ok(vec![b'0'; width])
     }
 
+    fn untracked_output(&self) -> Result<Vec<u8>, GitError> {
+        let config = git_command(&self.root)
+            .args(["config", "--null", "--path", "--get", "core.excludesFile"])
+            .output()
+            .map_err(|_| GitError::GitFailure)?;
+        let mut args = Vec::with_capacity(6);
+        if config.status.success() {
+            let value = config
+                .stdout
+                .strip_suffix(&[0])
+                .ok_or(GitError::GitFailure)?;
+            let mut setting = OsString::from("core.excludesFile=");
+            setting.push(path_from_git(value)?);
+            args.push("-c".into());
+            args.push(setting);
+        } else if config.status.code() != Some(1) {
+            return Err(GitError::GitFailure);
+        }
+        args.extend(["ls-files", "--others", "--exclude-standard", "-z"].map(OsString::from));
+        self.git(&args, None, None)
+    }
+
     fn git(
         &self,
         args: &[OsString],
@@ -654,17 +668,10 @@ fn git_output(
     git_output_with_objects(root, args, input, index, None)
 }
 
-fn git_output_with_objects(
-    root: &Path,
-    args: &[OsString],
-    input: Option<&[u8]>,
-    index: Option<&Path>,
-    objects: Option<(&Path, &Path)>,
-) -> Result<Vec<u8>, GitError> {
+fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .current_dir(root)
-        .args(args)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -672,14 +679,27 @@ fn git_output_with_objects(
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .env_remove("GIT_CONFIG_PARAMETERS")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command
+}
+
+fn git_output_with_objects(
+    root: &Path,
+    args: &[OsString],
+    input: Option<&[u8]>,
+    index: Option<&Path>,
+    objects: Option<(&Path, &Path)>,
+) -> Result<Vec<u8>, GitError> {
+    let mut command = git_command(root);
+    command
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);
     }

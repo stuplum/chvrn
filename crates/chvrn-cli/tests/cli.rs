@@ -701,3 +701,135 @@ fn headless_review_rejects_report_and_export_requests_without_touching_destinati
         assert_eq!(git(root.path(), &["show", ":note.txt"]).stdout, b"same\n");
     }
 }
+
+#[test]
+fn repository_review_honours_global_ignores_without_hiding_tracked_changes() {
+    let root = repository(&[
+        ("tracked.out", b"committed\n"),
+        (".gitignore", b"!visible.out\nrepo-only.txt\n"),
+    ]);
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("gitconfig");
+    fs::write(&config, "[core]\nexcludesFile = ~/global ignores\n").unwrap();
+    fs::write(home.path().join("global ignores"), b"*.out\n").unwrap();
+    fs::write(root.path().join(".git/info/exclude"), b"info-only.txt\n").unwrap();
+    for name in [
+        "tracked.out",
+        "ignored.out",
+        "visible.out",
+        "fresh.txt",
+        "repo-only.txt",
+        "info-only.txt",
+    ] {
+        fs::write(root.path().join(name), b"new content\n").unwrap();
+    }
+
+    for base in ["HEAD", "index"] {
+        let output = command(root.path(), &["review", "--base", base, "--format", "json"])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let paths: Vec<_> = result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["fresh.txt", "tracked.out", "visible.out"], "{base}");
+    }
+}
+
+#[test]
+fn repository_review_uses_local_excludes_instead_of_global_excludes() {
+    let root = repository(&[("note.txt", b"committed\n")]);
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("gitconfig");
+    fs::write(&config, "[core]\nexcludesFile = ~/global-ignore\n").unwrap();
+    fs::write(home.path().join("global-ignore"), b"global.txt\n").unwrap();
+    let local_ignore = home.path().join("local-ignore");
+    fs::write(&local_ignore, b"local.txt\n").unwrap();
+    git(
+        root.path(),
+        &[
+            "config",
+            "core.excludesFile",
+            local_ignore.to_str().unwrap(),
+        ],
+    );
+    fs::write(root.path().join("global.txt"), b"visible\n").unwrap();
+    fs::write(root.path().join("local.txt"), b"ignored\n").unwrap();
+
+    let output = command(
+        root.path(),
+        &["review", "--base", "HEAD", "--format", "json"],
+    )
+    .env("HOME", home.path())
+    .env("XDG_CONFIG_HOME", home.path())
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_GLOBAL", &config)
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let paths: Vec<_> = result["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["global.txt"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_review_does_not_run_a_globally_configured_fsmonitor() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = repository(&[("note.txt", b"committed\n")]);
+    let home = tempfile::tempdir().unwrap();
+    let monitor = home.path().join("monitor");
+    fs::write(
+        &monitor,
+        b"#!/bin/sh\nprintf invoked > \"$0.ran\"\nprintf 'token\\0'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&monitor, fs::Permissions::from_mode(0o755)).unwrap();
+    let config = home.path().join("gitconfig");
+    fs::write(
+        &config,
+        format!(
+            "[core]\nfsmonitor = {}\nexcludesFile = ~/global-ignore\n",
+            monitor.display()
+        ),
+    )
+    .unwrap();
+    fs::write(home.path().join("global-ignore"), b"ignored.txt\n").unwrap();
+    fs::write(root.path().join("ignored.txt"), b"ignored\n").unwrap();
+    fs::write(root.path().join("note.txt"), b"changed\n").unwrap();
+
+    let output = command(
+        root.path(),
+        &["review", "--base", "HEAD", "--format", "json"],
+    )
+    .env("HOME", home.path())
+    .env("XDG_CONFIG_HOME", home.path())
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_GLOBAL", &config)
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!home.path().join("monitor.ran").exists());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let paths: Vec<_> = result["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["note.txt"]);
+}

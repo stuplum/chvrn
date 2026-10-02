@@ -113,6 +113,8 @@ An explicit `--base` takes precedence over the environment variable and retains 
 
 A missing target, an empty or invalid `CHVRN_BASE_BRANCH`, or no common ancestor exits with an error rather than falling back to the index or another branch. Chvrn does not fetch branches automatically.
 
+Untracked-file discovery honours `.gitignore`, `.git/info/exclude` and Git's effective `core.excludesFile`, including global ignore rules and repository-local overrides. Tracked changes remain visible even when their paths match an ignore rule. Branch review includes committed changes as well as local edits, so its file count can differ from `git status`; use `--base HEAD` to review only current uncommitted differences and non-ignored untracked files.
+
 The base pane is read-only; the worktree pane is editable. Review proceeds file by file. `s` saves any edits to the current file, records its acceptance and advances to the next undecided file. Final submission writes a report when `--report` was supplied. A report contains reviewed files, accepted/rejected ranges and a comment; it is not a GitHub pull-request review. Put report and export destinations outside the reviewed worktree to avoid introducing new review targets.
 
 `--base index` compares with the current index, including already staged content on a changed path. Staged-only changes are not shown when the worktree equals the index. `--base HEAD` compares the selected revision with the worktree, not a separate staged-versus-unstaged dashboard. Named revisions are resolved at inspection and checked before submission; an immutable commit ID avoids following a moving reference.

@@ -1,8 +1,10 @@
+use crate::{Options, Result as CliResult};
 use chvrn_core::merge_advice::MergeAdviceSuggestion;
-use chvrn_integrations::jev::JevClient;
+use chvrn_integrations::jev::{JevClient, JevConfig};
 use chvrn_tui::{MergeAdviceError, MergeAdviceRequest, ReviewSession};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 type Reply = Result<MergeAdviceSuggestion, String>;
 
@@ -17,6 +19,25 @@ pub struct JevUi {
 }
 
 impl JevUi {
+    pub fn from_options(options: &Options) -> CliResult<Option<Self>> {
+        if !options.jev {
+            return Ok(None);
+        }
+        if !options.interactive() {
+            return Err("--jev requires an interactive session; output unchanged".into());
+        }
+        let api_key = std::env::var("TYPESAFE_API_KEY")
+            .map_err(|_| "--jev requires TYPESAFE_API_KEY to be set to a valid UTF-8 API key")?;
+        if api_key.trim().is_empty() {
+            return Err("--jev requires a non-empty TYPESAFE_API_KEY".into());
+        }
+        Ok(Some(Self::new(JevClient::new(JevConfig {
+            api_key,
+            endpoint: "https://api.typesafe.ai/v1/systemone".into(),
+            timeout: Duration::from_secs(30),
+        })?)))
+    }
+
     pub fn new(client: JevClient) -> Self {
         Self {
             client: Arc::new(client),

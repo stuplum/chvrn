@@ -4,16 +4,21 @@ use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::TempDir;
 
-fn invoke(root: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_chvrn"))
+fn command(root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_chvrn"));
+    command
         .args(args)
         .current_dir(root)
+        .env_remove("CHVRN_BASE_BRANCH")
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")
         .env_remove("HERDR_WORKSPACE_ID")
-        .env_remove("HERDR_TAB_ID")
-        .output()
-        .expect("run chvrn")
+        .env_remove("HERDR_TAB_ID");
+    command
+}
+
+fn invoke(root: &Path, args: &[&str]) -> Output {
+    command(root, args).output().expect("run chvrn")
 }
 
 fn files(entries: &[(&str, &[u8])]) -> TempDir {
@@ -343,6 +348,153 @@ fn repository(entries: &[(&str, &[u8])]) -> TempDir {
     root
 }
 
+#[test]
+fn default_review_includes_committed_and_uncommitted_work_but_not_main_only_changes() {
+    let root = repository(&[("note.txt", b"initial\n")]);
+    git(root.path(), &["branch", "-M", "main"]);
+    let base = git(root.path(), &["rev-parse", "HEAD"]);
+    git(root.path(), &["checkout", "-qb", "task"]);
+    fs::write(root.path().join("committed.txt"), b"task change\n").unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "task"]);
+    git(root.path(), &["checkout", "-q", "main"]);
+    fs::write(root.path().join("main-only.txt"), b"upstream change\n").unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "upstream"]);
+    git(root.path(), &["checkout", "-q", "task"]);
+    fs::write(root.path().join("note.txt"), b"staged\n").unwrap();
+    git(root.path(), &["add", "note.txt"]);
+    fs::write(root.path().join("note.txt"), b"unstaged\n").unwrap();
+    fs::write(root.path().join("untracked.txt"), b"new\n").unwrap();
+
+    for args in [
+        &["review", "--format", "json"][..],
+        &["--format", "json"][..],
+    ] {
+        let output = invoke(root.path(), args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["base"], String::from_utf8_lossy(&base.stdout).trim());
+        let paths: Vec<_> = result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, ["committed.txt", "note.txt", "untracked.txt"]);
+    }
+    assert_eq!(git(root.path(), &["show", ":note.txt"]).stdout, b"staged\n");
+    assert_eq!(
+        fs::read(root.path().join("note.txt")).unwrap(),
+        b"unstaged\n"
+    );
+}
+
+#[test]
+fn branch_override_reviews_only_changes_since_the_selected_branch_fork() {
+    let root = repository(&[("note.txt", b"initial\n")]);
+    git(root.path(), &["branch", "-M", "main"]);
+    git(root.path(), &["checkout", "-qb", "develop"]);
+    fs::write(root.path().join("develop.txt"), b"development\n").unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "development"]);
+    let base = git(root.path(), &["rev-parse", "HEAD"]);
+    git(root.path(), &["checkout", "-qb", "task"]);
+    fs::write(root.path().join("task.txt"), b"task\n").unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "task"]);
+    git(root.path(), &["checkout", "-q", "develop"]);
+    fs::write(root.path().join("upstream.txt"), b"upstream\n").unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "upstream"]);
+    git(root.path(), &["checkout", "-q", "task"]);
+
+    let output = command(root.path(), &["review", "--format", "json"])
+        .env("CHVRN_BASE_BRANCH", "develop")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["base"], String::from_utf8_lossy(&base.stdout).trim());
+    let paths: Vec<_> = result["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["task.txt"]);
+}
+
+#[test]
+fn explicit_base_bypasses_branch_override_and_preserves_direct_revision_comparison() {
+    let root = repository(&[("note.txt", b"initial\n")]);
+    git(root.path(), &["branch", "-M", "main"]);
+    git(root.path(), &["checkout", "-qb", "task"]);
+    git(root.path(), &["checkout", "-q", "main"]);
+    fs::write(root.path().join("main-only.txt"), b"upstream\n").unwrap();
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-qm", "upstream"]);
+    git(root.path(), &["checkout", "-q", "task"]);
+
+    for (base, code, paths) in [
+        ("index", 0, vec![]),
+        ("HEAD", 0, vec![]),
+        ("main", 1, vec!["main-only.txt"]),
+    ] {
+        let output = command(root.path(), &["review", "--base", base, "--format", "json"])
+            .env("CHVRN_BASE_BRANCH", "missing")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{output:?}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["base"], base);
+        let actual: Vec<_> = result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| file["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, paths);
+    }
+}
+
+#[test]
+fn missing_main_fails_instead_of_reviewing_the_index() {
+    let root = repository(&[("note.txt", b"initial\n")]);
+    git(root.path(), &["branch", "-M", "task"]);
+    let output = invoke(root.path(), &["review"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("main"));
+}
+
+#[test]
+fn invalid_branch_override_fails_without_falling_back_to_main() {
+    let root = repository(&[("note.txt", b"initial\n")]);
+    git(root.path(), &["branch", "-M", "main"]);
+    for branch in ["missing", "", "--all"] {
+        let output = command(root.path(), &["review"])
+            .env("CHVRN_BASE_BRANCH", branch)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("CHVRN_BASE_BRANCH"));
+    }
+}
+
+#[test]
+fn unrelated_branch_fails_instead_of_reviewing_a_different_base() {
+    let root = repository(&[("note.txt", b"initial\n")]);
+    git(root.path(), &["branch", "-M", "main"]);
+    git(root.path(), &["checkout", "--orphan", "unrelated"]);
+    git(root.path(), &["commit", "-qm", "independent root"]);
+    let output = invoke(root.path(), &["review"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("merge base"));
+}
+
 fn assert_metadata_difference(output: Output, path: &str) {
     assert_eq!(
         output.status.code(),
@@ -433,7 +585,14 @@ fn whitespace_filtering_does_not_hide_permission_changes() {
     git(root.path(), &["commit", "-qm", "initial"]);
     fs::write(&path, b"  same  \n").unwrap();
 
-    let args = ["review", "--whitespace", "ignore-edge", "note.txt"];
+    let args = [
+        "review",
+        "--base",
+        "index",
+        "--whitespace",
+        "ignore-edge",
+        "note.txt",
+    ];
     let output = invoke(root.path(), &args);
     assert_eq!(output.status.code(), Some(0));
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -460,7 +619,13 @@ fn patch_preview_detects_empty_file_creation_and_deletion_without_applying_them(
         assert_metadata_difference(
             invoke(
                 root.path(),
-                &["review", "--patch", patch.path().to_str().unwrap()],
+                &[
+                    "review",
+                    "--base",
+                    "index",
+                    "--patch",
+                    patch.path().to_str().unwrap(),
+                ],
             ),
             "empty.txt",
         );
@@ -486,7 +651,13 @@ fn patch_preview_detects_permission_changes_without_applying_them() {
     assert_metadata_difference(
         invoke(
             root.path(),
-            &["review", "--patch", patch.path().to_str().unwrap()],
+            &[
+                "review",
+                "--base",
+                "index",
+                "--patch",
+                patch.path().to_str().unwrap(),
+            ],
         ),
         "script.sh",
     );

@@ -11,6 +11,28 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
+type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+
+struct Options {
+    jev: bool,
+}
+
+impl Options {
+    fn interactive(&self) -> bool {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    }
+}
+
+#[test]
+fn unopted_headless_sessions_do_not_require_assistance_configuration() {
+    assert!(
+        JevUi::from_options(&Options { jev: false })
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn fixture() -> (JevUi, ReviewSession, TcpListener) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -136,6 +158,19 @@ fn source_is_sent_only_after_request_and_a_reply_still_requires_application() {
     assert_eq!(session.pane_text(Pane::Result), "theirs\n");
     assert_eq!(session.unresolved_conflicts(), 0);
     assert!(session.is_confirming_merge());
+}
+
+#[test]
+fn requesting_advice_outside_a_merge_never_sends_source() {
+    let (mut ui, _, listener) = fixture();
+    let mut session = ReviewSession::two_way("before\n", "after\n");
+    session.set_merge_advice_enabled(true);
+
+    assert!(ui.input(&mut session, &request_event()));
+    assert!(!ui.tick(&mut session));
+    assert_no_queued_connection(&listener);
+    assert_eq!(session.pane_text(Pane::Left), "before\n");
+    assert_eq!(session.pane_text(Pane::Right), "after\n");
 }
 
 #[test]

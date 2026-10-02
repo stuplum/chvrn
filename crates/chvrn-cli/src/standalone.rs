@@ -8,12 +8,10 @@ use chvrn_core::TextSnapshot;
 use chvrn_core::diff::{Diff, WhitespacePolicy};
 use chvrn_core::merge::Merge;
 use chvrn_core::structural::{Language, StructuralAnalysis};
-use chvrn_integrations::jev::{JevClient, JevConfig};
 use chvrn_tui::{Pane, ReviewInput, ReviewOutcome, ReviewSession, ReviewSubmission};
 use crossterm::event::{Event, KeyCode};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 pub fn snapshot(bytes: &[u8]) -> Result<TextSnapshot> {
     TextSnapshot::from_bytes(bytes)
@@ -274,23 +272,7 @@ impl ReviewHost for FileHost {
 }
 
 pub fn merge(args: MergeArgs, options: &Options) -> Result<u8> {
-    let jev = if args.jev {
-        if !options.interactive() {
-            return Err("--jev requires interactive merge or mergetool; output unchanged".into());
-        }
-        let api_key = std::env::var("TYPESAFE_API_KEY")
-            .map_err(|_| "--jev requires TYPESAFE_API_KEY to be set to a valid UTF-8 API key")?;
-        if api_key.trim().is_empty() {
-            return Err("--jev requires a non-empty TYPESAFE_API_KEY".into());
-        }
-        Some(JevUi::new(JevClient::new(JevConfig {
-            api_key,
-            endpoint: "https://api.typesafe.ai/v1/systemone".into(),
-            timeout: Duration::from_secs(30),
-        })?))
-    } else {
-        None
-    };
+    let jev = JevUi::from_options(options)?;
     let base = GuardedFile::read(&args.base)?;
     let ours = GuardedFile::read(&args.ours)?;
     let theirs = GuardedFile::read(&args.theirs)?;

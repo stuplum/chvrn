@@ -322,7 +322,7 @@ fn run_worker(
     }
 }
 
-pub fn open_companion(args: &ReviewArgs, options: &Options, root: &Path) -> Result<u8> {
+pub fn open_companion(args: &ReviewArgs, options: &Options, root: &Path, base: &str) -> Result<u8> {
     let process = HerdrProcess::from_environment()?;
     let target = options
         .agent
@@ -337,7 +337,7 @@ pub fn open_companion(args: &ReviewArgs, options: &Options, root: &Path) -> Resu
         binary.into_os_string(),
         "review".into(),
         "--base".into(),
-        args.base.clone().into(),
+        base.into(),
         "--herdr".into(),
         match options.herdr.unwrap_or(HerdrMode::Auto) {
             HerdrMode::Auto => "auto",
@@ -348,6 +348,9 @@ pub fn open_companion(args: &ReviewArgs, options: &Options, root: &Path) -> Resu
         "--agent".into(),
         target.into(),
     ];
+    if options.jev {
+        words.push("--jev".into());
+    }
     for (flag, path) in [
         ("--patch", &args.patch),
         ("--socket", &args.socket),

@@ -1,5 +1,6 @@
 use crate::files::{GuardedFile, read_bytes};
 use crate::herdr_ui::{self, HerdrUi, Notice};
+use crate::jev_ui::JevUi;
 use crate::language::LanguageUi;
 use crate::socket_ui::SocketUi;
 use crate::standalone::{diff_value, print_value, snapshot};
@@ -7,7 +8,7 @@ use crate::terminal::{self, ReviewHost};
 use crate::watch::{BackgroundDiff, FileWatch};
 use crate::{HerdrMode, Options, Result, ReviewArgs};
 use chvrn_core::TextSnapshot;
-use chvrn_git::{Base, ContentKind, PatchCandidate, Repository, Review};
+use chvrn_git::{Base, ConflictSnapshot, ContentKind, PatchCandidate, Repository, Review};
 use chvrn_integrations::herdr::{HunkRange, ReviewedFile};
 use chvrn_tui::{
     Pane, RepositoryReviewMode, ReviewInput, ReviewOutcome, ReviewSession, ReviewSubmission,
@@ -37,6 +38,24 @@ fn base(name: &str) -> Base {
     }
 }
 
+fn review_base(repo: &Repository, explicit: Option<&str>) -> Result<Base> {
+    if let Some(name) = explicit {
+        return Ok(base(name));
+    }
+    let branch = match std::env::var("CHVRN_BASE_BRANCH") {
+        Ok(branch) => branch,
+        Err(std::env::VarError::NotPresent) => "main".into(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("CHVRN_BASE_BRANCH must contain a valid UTF-8 branch name".into());
+        }
+    };
+    repo.merge_base(&branch).map(Base::Revision).map_err(|_| {
+        format!(
+            "cannot find a merge base between HEAD and {branch:?} (CHVRN_BASE_BRANCH, default main); ensure both refs exist and share history, or supply --base <revision|index>"
+        ).into()
+    })
+}
+
 fn path_value(path: &Path) -> Value {
     #[cfg(unix)]
     {
@@ -58,6 +77,7 @@ struct PatchPreview {
 
 pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
     let interactive = options.interactive();
+    let jev = JevUi::from_options(options)?;
     if matches!(options.herdr, Some(HerdrMode::Gate)) && !interactive {
         return Err(
             "an explicit review gate requires an interactive terminal; no review was accepted"
@@ -65,8 +85,13 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
         );
     }
     let repo = Repository::discover(&std::env::current_dir()?)?;
+    let review_base = review_base(&repo, args.base.as_deref())?;
     if args.open_companion {
-        return herdr_ui::open_companion(&args, options, repo.root());
+        let base_name = match &review_base {
+            Base::Index => "index",
+            Base::Revision(name) => name,
+        };
+        return herdr_ui::open_companion(&args, options, repo.root(), base_name);
     }
     if !interactive && (args.report.is_some() || args.export_patch.is_some()) {
         return Err(
@@ -76,8 +101,8 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
     }
     let patch = args.patch.as_deref().map(read_bytes).transpose()?;
     let inspected = match &patch {
-        Some(patch) => repo.review_patch(base(&args.base), patch)?,
-        None => repo.review(base(&args.base), &args.paths)?,
+        Some(patch) => repo.review_patch(review_base, patch)?,
+        None => repo.review(review_base, &args.paths)?,
     };
     let preview = patch
         .map(|patch| -> Result<PatchPreview> {
@@ -137,9 +162,13 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
                 })
                 .collect(),
         };
+        let base_name = match inspected.base() {
+            Base::Index => "index",
+            Base::Revision(name) => name,
+        };
         let different = files.iter().any(|file| file["equal"] != true);
         print_value(
-            &json!({"base": args.base, "patch_preview": preview.is_some(), "files": files}),
+            &json!({"base": base_name, "patch_preview": preview.is_some(), "files": files}),
             options.format,
         )?;
         return Ok(u8::from(different));
@@ -155,7 +184,7 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
         .map(GuardedFile::capture)
         .transpose()?;
     let snapshot = snapshot_id();
-    let watch = FileWatch::new(&[repo.root()], true)?;
+    let watch = FileWatch::new(&[repo.root(), repo.index_path()], true)?;
     let language = LanguageUi::new(options, repo.root())?;
     let herdr = HerdrUi::new(options)?;
     let socket = args
@@ -169,6 +198,8 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
         args,
         options,
         selected: 0,
+        jev,
+        merge: None,
         preview,
         decisions: BTreeMap::new(),
         accepted_paths: BTreeSet::new(),
@@ -203,12 +234,20 @@ struct RepositoryRefresh {
     text: Option<(TextSnapshot, TextSnapshot)>,
 }
 
+struct RepositoryMerge {
+    source: ConflictSnapshot,
+    output: GuardedFile,
+    stale: bool,
+}
+
 struct RepositoryHost<'a> {
     repo: Repository,
     inspected: Arc<Review>,
     args: ReviewArgs,
     options: &'a Options,
     selected: usize,
+    jev: Option<JevUi>,
+    merge: Option<RepositoryMerge>,
     preview: Option<PatchPreview>,
     decisions: BTreeMap<PathBuf, Vec<Value>>,
     accepted_paths: BTreeSet<PathBuf>,
@@ -263,7 +302,7 @@ impl RepositoryHost<'_> {
     fn configure_footer(&self, session: &mut ReviewSession) {
         let mode = if self.preview.is_some() {
             RepositoryReviewMode::PatchPreview
-        } else if self.args.base == "index" {
+        } else if matches!(self.inspected.base(), Base::Index) {
             RepositoryReviewMode::Index
         } else {
             RepositoryReviewMode::Revision
@@ -321,9 +360,66 @@ impl RepositoryHost<'_> {
         Ok(session)
     }
 
+    fn open_merge(&mut self, session: &mut ReviewSession) -> Result<()> {
+        if session.is_dirty()
+            || session.is_local_diff_pending()
+            || self.preview.is_some()
+            || self.refresh_conflict
+            || self.pending_review.is_some()
+            || self.loading.is_some()
+            || self.herdr.as_ref().is_some_and(|herdr| herdr.pending)
+        {
+            return Err("finish or discard edits, previews and pending review updates before opening a merge".into());
+        }
+        self.repo.validate_review(&self.inspected)?;
+        let path = self.current_path()?;
+        let source = self.repo.conflict(&path).map_err(|error| match error {
+            chvrn_git::GitError::MissingConflictSide { .. } => "modify/delete conflicts require an explicit keep/delete decision in Git; nothing changed".to_owned(),
+            chvrn_git::GitError::NonRegularConflict { .. } | chvrn_git::GitError::BinaryContent => "only regular UTF-8 text conflicts can open in merge mode; resolve this file with Git".to_owned(),
+            _ => error.to_string(),
+        })?.ok_or("selected file has no unresolved Git conflict")?;
+        let output = GuardedFile::capture(&self.repo.root().join(source.path()))?;
+        self.repo.validate_conflict(&source)?;
+        let mut merge = ReviewSession::three_way(
+            std::str::from_utf8(source.base())?,
+            std::str::from_utf8(source.ours())?,
+            std::str::from_utf8(source.theirs())?,
+        );
+        merge.set_paths(&path, &path);
+        merge.set_output_path(&path);
+        merge.set_read_only(Pane::Ours, true);
+        merge.set_read_only(Pane::Theirs, true);
+        merge.set_whitespace_policy(self.options.whitespace.into());
+        merge.set_merge_advice_enabled(self.jev.is_some());
+        session.cancel_merge_advice();
+        self.merge = Some(RepositoryMerge {
+            source,
+            output,
+            stale: false,
+        });
+        *session = merge;
+        Ok(())
+    }
+
+    fn leave_merge(&mut self, session: &mut ReviewSession) -> Result<()> {
+        if session.is_dirty() {
+            return Err(
+                "merge has unsaved changes; save it, undo changes, or quit and confirm discard"
+                    .into(),
+            );
+        }
+        session.cancel_merge_advice();
+        self.reload(session)?;
+        self.merge = None;
+        Ok(())
+    }
+
     fn reload(&mut self, session: &mut ReviewSession) -> Result<()> {
         let path = self.current_path().ok();
-        self.inspected = Arc::new(self.repo.review(base(&self.args.base), &self.args.paths)?);
+        self.inspected = Arc::new(
+            self.repo
+                .review(self.inspected.base().clone(), &self.args.paths)?,
+        );
         self.reset_paths();
         self.invalidate()?;
         self.selected = path
@@ -487,6 +583,20 @@ impl ReviewHost for RepositoryHost<'_> {
         if self.language.viewing_definition() {
             return Ok(());
         }
+        if let Some(merge) = &mut self.merge {
+            if self.watch.changed()? && self.repo.validate_conflict(&merge.source).is_err() {
+                merge.stale = true;
+                session.set_merge_advice_enabled(false);
+                session.set_message("Git conflict inputs changed. Saving is blocked; return to review or quit and reopen");
+            }
+            if let Some(jev) = &mut self.jev {
+                jev.tick(session);
+            }
+            return Ok(());
+        }
+        if let Some(jev) = &mut self.jev {
+            jev.tick(session);
+        }
         if let Some(herdr) = &mut self.herdr {
             for notice in herdr.notices() {
                 match notice {
@@ -550,7 +660,7 @@ impl ReviewHost for RepositoryHost<'_> {
         if self.needs_refresh && self.loading.is_none() {
             self.needs_refresh = false;
             let root = self.repo.root().to_path_buf();
-            let base = base(&self.args.base);
+            let base = self.inspected.base().clone();
             let paths = self.args.paths.clone();
             let previous = Arc::clone(&self.inspected);
             let selected = self.current_path().ok();
@@ -610,6 +720,20 @@ impl ReviewHost for RepositoryHost<'_> {
         if self.language.input(session, &path, event)? {
             return Ok(true);
         }
+        if self.merge.is_some() {
+            if let Some(jev) = &mut self.jev {
+                if jev.input(session, event) {
+                    return Ok(true);
+                }
+            }
+            if !session.is_editing()
+                && matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc && key.modifiers.is_empty())
+            {
+                self.leave_merge(session)?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         let Event::Key(key) = event else {
             return Ok(false);
         };
@@ -648,6 +772,10 @@ impl ReviewHost for RepositoryHost<'_> {
                 session.handle(ReviewInput::DiscardAndReload);
             }
             self.publish_refresh(session, self.pending_generation == 0)?;
+            return Ok(true);
+        }
+        if key.code == KeyCode::Char('m') && key.modifiers.is_empty() {
+            self.open_merge(session)?;
             return Ok(true);
         }
         if key.code == KeyCode::Char('v') {
@@ -785,6 +913,21 @@ impl ReviewHost for RepositoryHost<'_> {
         session: &mut ReviewSession,
         submission: ReviewSubmission,
     ) -> Result<bool> {
+        if let Some(merge) = &mut self.merge {
+            if merge.stale {
+                return Err("Git conflict inputs changed; nothing written".into());
+            }
+            let result = submission.result.ok_or("merge submission has no result")?;
+            self.repo.validate_conflict(&merge.source)?;
+            merge.output.write(result.as_bytes())?;
+            session.cancel_merge_advice();
+            self.reload(session)?;
+            self.merge = None;
+            session.set_message(
+                "Merged file saved; index unchanged. Use git add to stage the resolved file",
+            );
+            return Ok(false);
+        }
         if self.refresh_conflict || self.pending_review.is_some() {
             return Err(
                 "a newer repository snapshot is pending; review it before submitting".into(),
@@ -988,6 +1131,7 @@ mod tests {
         let options = Options {
             format: OutputFormat::Auto,
             non_interactive: false,
+            jev: false,
             herdr: None,
             agent: None,
             whitespace: Whitespace::Exact,
@@ -1009,11 +1153,13 @@ mod tests {
             repo,
             inspected: Arc::new(inspected),
             args: ReviewArgs {
-                base: base_name.into(),
+                base: Some(base_name.into()),
                 ..ReviewArgs::default()
             },
             options: &options,
             selected: 0,
+            jev: None,
+            merge: None,
             preview,
             decisions: BTreeMap::new(),
             accepted_paths: BTreeSet::new(),
@@ -1052,6 +1198,281 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    fn git(root: &Path, args: &[&str]) -> std::process::Output {
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(root)
+            .output()
+            .unwrap()
+    }
+
+    fn with_conflict(check: impl FnOnce(&mut RepositoryHost<'_>)) {
+        with_host("HEAD", false, |host| {
+            let root = host.repo.root();
+            for args in [
+                vec!["add", "."],
+                vec!["commit", "-qm", "common"],
+                vec!["branch", "-M", "main"],
+                vec!["checkout", "-qb", "other"],
+            ] {
+                assert!(git(root, &args).status.success());
+            }
+            fs::write(root.join("first.rs"), "fn theirs() {}\n").unwrap();
+            assert!(git(root, &["commit", "-qam", "theirs"]).status.success());
+            assert!(git(root, &["checkout", "-q", "main"]).status.success());
+            fs::write(root.join("first.rs"), "fn ours() {}\n").unwrap();
+            assert!(git(root, &["commit", "-qam", "ours"]).status.success());
+            assert_eq!(git(root, &["merge", "other"]).status.code(), Some(1));
+            host.inspected = Arc::new(
+                host.repo
+                    .review(Base::Revision("HEAD".into()), &[])
+                    .unwrap(),
+            );
+            host.reset_paths();
+            check(host);
+        });
+    }
+
+    fn key(character: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+    }
+
+    fn choose_theirs(session: &mut ReviewSession) -> ReviewSubmission {
+        session.handle(ReviewInput::Key(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::NONE,
+        )));
+        match session.handle(ReviewInput::Key(KeyEvent::new(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        ))) {
+            ReviewOutcome::Submitted(submission) => submission,
+            outcome => panic!("expected confirmed merge submission, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn repository_suggestion_requires_request_application_and_separate_save() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        with_conflict(|host| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            host.jev = Some(JevUi::new(
+                chvrn_integrations::jev::JevClient::new(chvrn_integrations::jev::JevConfig {
+                    api_key: "fixture-key".into(),
+                    endpoint: format!("http://{}/v1/systemone", listener.local_addr().unwrap()),
+                    timeout: Duration::from_secs(3),
+                })
+                .unwrap(),
+            ));
+            let path = host.repo.root().join("first.rs");
+            let original = fs::read(&path).unwrap();
+            let stages = git(host.repo.root(), &["ls-files", "--stage"]).stdout;
+            let mut session = host.session().unwrap();
+            assert!(host.input(&mut session, &key('m')).unwrap());
+            assert!(screen(&mut session, 200).join("\n").contains("[J]"));
+            host.tick(&mut session).unwrap();
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert!(host.input(&mut session, &key('J')).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "no request after J");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+                assert!(headers.len() < 8192);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            let length: usize = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .unwrap()
+                .1
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(length <= 24 * 1024);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let reply = serde_json::to_vec(&json!({
+                "model": "fixture",
+                "answers": {"resolution": {
+                    "type": "choice", "choice": "theirs", "confidence": 0.8,
+                    "probabilities": {"ours": 0.1, "theirs": 0.8, "leave_unresolved": 0.1}
+                }}
+            }))
+            .unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len()).unwrap();
+            stream.write_all(&reply).unwrap();
+            drop(stream);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !session.is_review_modal() {
+                host.tick(&mut session).unwrap();
+                assert!(Instant::now() < deadline, "suggestion did not arrive");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(session.pane_text(Pane::Result), "fn ours() {}\n");
+            assert_eq!(fs::read(&path).unwrap(), original);
+            session.handle(ReviewInput::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(session.pane_text(Pane::Result), "fn theirs() {}\n");
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let submission = match session.handle(ReviewInput::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            ))) {
+                ReviewOutcome::Submitted(submission) => submission,
+                outcome => panic!("expected save confirmation, got {outcome:?}"),
+            };
+            assert!(!host.submit(&mut session, submission).unwrap());
+            assert_eq!(fs::read(&path).unwrap(), b"fn theirs() {}\n");
+            assert_eq!(
+                git(host.repo.root(), &["ls-files", "--stage"]).stdout,
+                stages
+            );
+        });
+    }
+
+    #[test]
+    fn repository_conflict_merge_saves_only_after_confirmation_and_never_stages() {
+        with_conflict(|host| {
+            let path = host.repo.root().join("first.rs");
+            let original = fs::read(&path).unwrap();
+            let stages = git(host.repo.root(), &["ls-files", "--stage"]).stdout;
+            let mut session = host.session().unwrap();
+            assert!(host.input(&mut session, &key('m')).unwrap());
+            assert_eq!(session.unresolved_conflicts(), 1);
+            assert_eq!(session.pane_text(Pane::Ours), "fn ours() {}\n");
+            assert_eq!(session.pane_text(Pane::Theirs), "fn theirs() {}\n");
+            assert_eq!(fs::read(&path).unwrap(), original);
+            let submission = choose_theirs(&mut session);
+            assert_eq!(fs::read(&path).unwrap(), original);
+            assert!(!host.submit(&mut session, submission).unwrap());
+            assert_eq!(fs::read(&path).unwrap(), b"fn theirs() {}\n");
+            assert_eq!(
+                git(host.repo.root(), &["ls-files", "--stage"]).stdout,
+                stages
+            );
+            assert_eq!(session.pane_text(Pane::Right), "fn theirs() {}\n");
+        });
+    }
+
+    #[test]
+    fn repository_merge_does_not_overwrite_changes_made_after_entering_merge() {
+        with_conflict(|host| {
+            let path = host.repo.root().join("first.rs");
+            let mut session = host.session().unwrap();
+            assert!(host.input(&mut session, &key('m')).unwrap());
+            let submission = choose_theirs(&mut session);
+            fs::write(&path, "fn external() {}\n").unwrap();
+            assert!(host.submit(&mut session, submission).is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"fn external() {}\n");
+            assert_eq!(
+                git(host.repo.root(), &["show", ":2:first.rs"]).stdout,
+                b"fn ours() {}\n"
+            );
+        });
+    }
+
+    #[test]
+    fn leaving_repository_merge_invalidates_advice_before_reopening_the_conflict() {
+        with_conflict(|host| {
+            host.jev = Some(JevUi::new(
+                chvrn_integrations::jev::JevClient::new(chvrn_integrations::jev::JevConfig {
+                    api_key: "fixture-key".into(),
+                    endpoint: "http://127.0.0.1:9/v1/systemone".into(),
+                    timeout: std::time::Duration::from_secs(1),
+                })
+                .unwrap(),
+            ));
+            let path = host.repo.root().join("first.rs");
+            let original = fs::read(&path).unwrap();
+            let mut session = host.session().unwrap();
+            assert!(host.input(&mut session, &key('m')).unwrap());
+            let request = session.begin_merge_advice().unwrap();
+            assert!(
+                host.input(
+                    &mut session,
+                    &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                )
+                .unwrap()
+            );
+            assert!(host.input(&mut session, &key('m')).unwrap());
+            assert!(!session.receive_merge_advice(
+                request,
+                Ok(chvrn_core::merge_advice::MergeAdviceSuggestion {
+                    choice: chvrn_core::merge_advice::MergeAdviceChoice::Theirs,
+                    confidence: 0.9,
+                    model: "fixture".into(),
+                })
+            ));
+            assert_eq!(session.unresolved_conflicts(), 1);
+            assert_eq!(fs::read(&path).unwrap(), original);
+        });
+    }
+
+    #[test]
+    fn repository_merge_without_opt_in_keeps_suggestions_disabled() {
+        with_conflict(|host| {
+            let mut session = host.session().unwrap();
+            assert!(host.input(&mut session, &key('m')).unwrap());
+            assert!(matches!(
+                session.begin_merge_advice(),
+                Err(chvrn_tui::MergeAdviceError::Disabled)
+            ));
+        });
+    }
+
+    #[test]
+    fn entering_repository_merge_refuses_to_discard_unsaved_review_edits() {
+        with_conflict(|host| {
+            let path = host.repo.root().join("first.rs");
+            let original = fs::read(&path).unwrap();
+            let mut session = host.session().unwrap();
+            session
+                .replace_pane_text(Pane::Right, "local edits\n")
+                .unwrap();
+            assert!(host.input(&mut session, &key('m')).is_err());
+            assert_eq!(session.pane_text(Pane::Right), "local edits\n");
+            assert_eq!(fs::read(&path).unwrap(), original);
+        });
     }
 
     #[test]

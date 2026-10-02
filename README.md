@@ -18,7 +18,7 @@ Requires stable Rust and Git.
 cargo install --locked --git https://github.com/stuplum/chvrn.git chvrn-cli
 ```
 
-Run `chvrn` inside a Git repository to start reviewing. Press `?` for help.
+Run `chvrn` or `chvrn review` inside a Git repository to review changes since your branch diverged from `main`. Set `CHVRN_BASE_BRANCH` to use another target branch. Use `chvrn review --base index` for unstaged changes only. Press `?` for help.
 
 ## Documentation
 

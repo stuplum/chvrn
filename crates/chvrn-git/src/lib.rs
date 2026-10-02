@@ -1,6 +1,8 @@
+mod conflict;
 mod patch;
 mod transaction;
 
+pub use conflict::ConflictSnapshot;
 pub use patch::PatchCandidate;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -57,6 +59,14 @@ pub enum GitError {
     BinaryContent,
     GitFailure,
     IoFailure,
+    StaleConflict,
+    ForeignConflict,
+    MissingConflictSide {
+        stage: u8,
+    },
+    NonRegularConflict {
+        stage: u8,
+    },
     PartialWrite {
         applied: Vec<PathBuf>,
         failed: PathBuf,
@@ -172,6 +182,10 @@ impl Repository {
         &self.root
     }
 
+    pub fn index_path(&self) -> &Path {
+        &self.index_path
+    }
+
     pub fn changes(&self, base: &str) -> Result<Vec<Change>, GitError> {
         let tree = self.resolve_revision(base)?;
         let mut args = words(&[
@@ -196,7 +210,7 @@ impl Repository {
                 Some(b'A') => ChangeKind::Added,
                 Some(b'D') => ChangeKind::Deleted,
                 Some(b'R') => ChangeKind::Renamed,
-                Some(b'M' | b'T' | b'C') => ChangeKind::Modified,
+                Some(b'M' | b'T' | b'C' | b'U') => ChangeKind::Modified,
                 _ => return Err(GitError::GitFailure),
             };
             let first = path_from_git(*fields.get(index).ok_or(GitError::GitFailure)?)?;
@@ -285,6 +299,13 @@ impl Repository {
                             discovered.insert(old);
                         }
                         discovered.insert(change.path);
+                    }
+                    let unresolved =
+                        self.git(&words(&["ls-files", "--unmerged", "-z"]), None, None)?;
+                    for record in nul_fields(&unresolved)? {
+                        let (_, path) =
+                            record.split_once_byte(b'\t').ok_or(GitError::GitFailure)?;
+                        discovered.insert(path_from_git(path)?);
                     }
                 }
             }
@@ -401,6 +422,14 @@ impl Repository {
         Ok(after)
     }
 
+    pub fn merge_base(&self, revision: &str) -> Result<String, GitError> {
+        if revision.is_empty() || revision.starts_with('-') || revision.contains('\0') {
+            return Err(GitError::InvalidBase);
+        }
+        let output = self.git(&words(&["merge-base", "HEAD", revision]), None, None)?;
+        String::from_utf8(trim_newline(&output).to_vec()).map_err(|_| GitError::GitFailure)
+    }
+
     fn resolve_revision(&self, revision: &str) -> Result<String, GitError> {
         if revision.is_empty() || revision.starts_with('-') || revision.contains('\0') {
             return Err(GitError::InvalidBase);
@@ -437,38 +466,27 @@ impl Repository {
     }
 
     fn index_file(&self, path: &Path) -> Result<FileState, GitError> {
-        let args = vec![
-            "ls-files".into(),
-            "--stage".into(),
-            "-z".into(),
-            "--".into(),
-            path.as_os_str().to_os_string(),
-        ];
-        let output = self.git(&args, None, None)?;
-        let Some(record) = nul_fields(&output)?.first().copied() else {
-            return Ok(FileState::empty());
-        };
-        let (meta, recorded_path) = record.split_once_byte(b'\t').ok_or(GitError::GitFailure)?;
-        if recorded_path != path_bytes(path).as_slice() {
-            return Err(GitError::GitFailure);
+        let entries = self.index_entries(path)?;
+        match &entries[0] {
+            Some(entry) => self.blob_file(entry.mode, &entry.oid),
+            None => Ok(FileState::empty()),
         }
-        let parts: Vec<&[u8]> = meta.split(|byte| *byte == b' ').collect();
-        if parts.len() != 3 || parts[2] != b"0" {
-            return Err(GitError::GitFailure);
-        }
-        self.blob_state(parts[0], parts[1])
     }
 
     fn blob_state(&self, mode: &[u8], oid: &[u8]) -> Result<FileState, GitError> {
         let mode = std::str::from_utf8(mode).map_err(|_| GitError::GitFailure)?;
         let mode = u32::from_str_radix(mode, 8).map_err(|_| GitError::GitFailure)?;
+        let oid = std::str::from_utf8(oid).map_err(|_| GitError::GitFailure)?;
+        self.blob_file(mode, oid)
+    }
+
+    fn blob_file(&self, mode: u32, oid: &str) -> Result<FileState, GitError> {
         if mode == 0o120000 {
             return Err(GitError::UnsafePath);
         }
         if mode != 0o100644 && mode != 0o100755 {
             return Err(GitError::BinaryContent);
         }
-        let oid = std::str::from_utf8(oid).map_err(|_| GitError::GitFailure)?;
         let bytes = self.git(
             &vec!["cat-file".into(), "blob".into(), oid.into()],
             None,

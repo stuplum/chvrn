@@ -6,9 +6,10 @@
 
 | Command | Purpose |
 | --- | --- |
-| `chvrn` | Review worktree changes against the index in the current repository. |
+| `chvrn` | Review changes since `HEAD` diverged from `main`, or the branch in `CHVRN_BASE_BRANCH`. |
 | `chvrn diff LEFT RIGHT` | Compare two explicit files. Both text buffers are editable. |
 | `chvrn merge --base BASE --ours OURS --theirs THEIRS --output RESULT` | Combine three inputs into a separate merge result. |
+| `chvrn review [PATHS]...` | Review committed and current worktree changes against the target branch's merge base. |
 | `chvrn review --base index [PATHS]...` | Review unstaged worktree differences and non-ignored untracked files. |
 | `chvrn review --base REVISION [PATHS]...` | Compare the worktree with a revision such as `HEAD`. |
 | `chvrn difftool [LEFT] [RIGHT]` | File comparison using explicit paths or Git's `LOCAL`/`REMOTE`. |
@@ -79,10 +80,12 @@ The source files and output destination are checked again on confirmed submissio
 Set the `TYPESAFE_API_KEY` environment variable, then enable suggestions with `--jev`:
 
 ```sh
+chvrn --jev
+chvrn review --jev
 chvrn merge --base /path/to/base.rs --ours /path/to/ours.rs --theirs /path/to/theirs.rs --output /path/to/result.rs --jev
 ```
 
-`chvrn mergetool --jev` supports the same flow. The flag is interactive-only; a configured key alone never enables requests. Manual merging needs no key.
+`--jev` applies to the whole session, including merges opened from repository review and companion panes. In repository review, select an unresolved Git text conflict and press `m` to open it. `chvrn mergetool --jev` supports the same suggestion flow. The flag is interactive-only; a configured key alone never enables requests. Manual merging needs no key.
 
 1. Select an unresolved conflict and press `J` (`Suggest`) to request one suggestion.
 2. Review the proposed side and confidence in the footer. The merge stays visible, without a popup or provider branding. Confidence is informational, not a correctness guarantee.
@@ -96,21 +99,38 @@ Each request sends the complete selected conflict from base, ours and theirs, pl
 Run these in the repository to inspect:
 
 ```sh
+chvrn review
+CHVRN_BASE_BRANCH=develop chvrn review
 chvrn review --base index
 chvrn review --base HEAD
 chvrn review --base HEAD src/main.rs
 chvrn review --base HEAD --report /tmp/chvrn-review.json
 ```
 
+Without `--base`, Chvrn compares the worktree against the merge base of `HEAD` and `main`. Set `CHVRN_BASE_BRANCH` to select another target, such as `develop` or `origin/main`. This includes committed branch changes and current worktree changes without treating target-only commits as changes to undo. Bare `chvrn` uses the same default.
+
+An explicit `--base` takes precedence over the environment variable and retains direct comparison: `--base main` uses the current `main` revision, not its merge base. The implicit merge-base commit is resolved once and stays fixed during refreshes and when opening a companion pane. Headless JSON reports that commit ID in `base`.
+
+A missing target, an empty or invalid `CHVRN_BASE_BRANCH`, or no common ancestor exits with an error rather than falling back to the index or another branch. Chvrn does not fetch branches automatically.
+
 The base pane is read-only; the worktree pane is editable. Review proceeds file by file. `s` saves any edits to the current file, records its acceptance and advances to the next undecided file. Final submission writes a report when `--report` was supplied. A report contains reviewed files, accepted/rejected ranges and a comment; it is not a GitHub pull-request review. Put report and export destinations outside the reviewed worktree to avoid introducing new review targets.
 
 `--base index` compares with the current index, including already staged content on a changed path. Staged-only changes are not shown when the worktree equals the index. `--base HEAD` compares the selected revision with the worktree, not a separate staged-versus-unstaged dashboard. Named revisions are resolved at inspection and checked before submission; an immutable commit ID avoids following a moving reference.
+
+### Resolve a Git conflict
+
+Press `m` on an unresolved text conflict to open Git's base/ours/theirs versions. Add/add conflicts use an empty base. Both sides must be regular UTF-8 text files; binary, symlink and modify/delete conflicts require separate resolution in Git.
+
+The result is reconstructed from Git's conflict stages, not any manual edits already saved in the worktree. Escape returns to repository review before result edits; dirty results must be resolved and saved or discarded by quitting. Pending review updates, unsaved review edits and patch previews prevent entry.
+
+Choose a resolution, optionally request a suggestion with `J`, then confirm the write with `y`. Saving replaces the worktree file and returns to review, preserving its permissions and leaving the index unchanged. Run `git add` separately when ready. External changes to the conflict stages or worktree invalidate suggestions and block saving, including in linked worktrees.
 
 ### Git actions are separate from submission
 
 | Key | Action and required mode |
 | --- | --- |
 | Ctrl-N / Ctrl-P | Next/previous file. Submit or discard dirty edits before switching. |
+| `m` | Open the selected unresolved Git text conflict in three-way merge, outside patch previews. Confirmed writes do not stage. |
 | `S` | Stage the selected textual hunk, **index review only**. Writes the index immediately, preserving unrelated staged content and leaving worktree bytes unchanged. |
 | `x` | Restore the selected worktree hunk from the review's revision, **revision review only**. Writes the worktree immediately, without changing the index. |
 | `c`, Enter | Enter a review comment; finish comment entry. |

@@ -4,13 +4,15 @@
 
 ## Jev merge suggestions
 
-Jev is optional on interactive `merge` and `mergetool` through `--jev`. Supply `TYPESAFE_API_KEY` in the process environment; there is no API-key argument. Missing, empty or invalid credentials fail without writing the output. A configured key without `--jev` is ignored. Headless use of `--jev` fails with exit `2`, including conflict-free inputs.
+Jev is an optional, session-wide capability enabled with `--jev` on interactive repository review, `merge` and `mergetool`. `chvrn --jev` starts review; `m` opens the selected unresolved Git text conflict while retaining the same worker and opt-in. Supply `TYPESAFE_API_KEY` in the process environment; there is no API-key argument. Missing, empty or invalid credentials fail without writing the output. A configured key without `--jev` is ignored. Headless use of `--jev` fails with exit `2`, including conflict-free inputs.
+
+Companion launches forward `--jev`, but a new Herdr pane does not inherit environment variables set only for the launching command. Its shell must already have `TYPESAFE_API_KEY`, or launch Chvrn with the key inside that pane instead. Credentials are never interpolated into pane commands or process arguments.
 
 Press `J` on an unresolved conflict to send a request to `https://api.typesafe.ai/v1/systemone` using `jev-1.13.0`. Source disclosure is limited to the complete base/ours/theirs conflict and up to 20 surrounding lines before and after each region. LF, CRLF, bare CR and missing final newlines retain their original bytes. Source is not redacted: inspect it before requesting advice.
 
 The request body is capped at 24 KiB, the response at 64 KiB, and the global request deadline is 30 seconds. Oversized requests fail before transmission. Redirects, automatic requests and retries are disabled. Errors do not include the credential or remote response body.
 
-Only one network request can be active. Editing, undo, conflict selection changes, resolution, cancellation and entry into a nested definition view invalidate advice authority. Returning to equal text or the original selection does not revive it. Invalidating advice does not abort the network request or free its slot before completion; quitting does not wait for that request.
+Only one network request can be active per session, including across review/merge transitions. Editing, undo, conflict selection changes, resolution, cancellation, external changes to Git conflict inputs and entry into a nested definition view invalidate advice authority. Returning to equal text or the original selection does not revive it. Invalidating advice does not abort the network request or free its slot before completion; quitting does not wait for that request.
 
 Replies offer ours, theirs or leave unresolved. They cannot generate combined text, apply themselves or write the output. A compact footer shows the choice, confidence and Apply/Ignore controls without covering the merge. Enter applies a proposed side as an undoable choice; Escape/`q` ignores it. Abstentions have no apply action. The suggestion retains exclusive input until applied or ignored, blocking underlying editing and language-server actions; final write confirmation remains separate. Manual merging remains available after a request failure.
 

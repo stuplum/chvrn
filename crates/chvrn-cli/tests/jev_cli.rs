@@ -52,6 +52,7 @@ fn assert_interactive_refusal(output: &Output) {
     assert!(stderr.contains("--jev"), "{stderr}");
     assert!(stderr.contains("interactive"), "{stderr}");
     assert!(!stderr.contains("fixture-secret"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-secret"));
 }
 
 fn assert_original_inputs(root: &TempDir) {
@@ -142,7 +143,7 @@ fn headless_mergetool_assistance_preserves_the_git_selected_output() {
 }
 
 #[test]
-fn assistance_is_not_accepted_as_a_global_diff_option() {
+fn headless_diff_assistance_refuses_without_touching_either_input() {
     let root = fixture();
     let output = command(&root)
         .env("TYPESAFE_API_KEY", "fixture-secret")
@@ -150,7 +151,75 @@ fn assistance_is_not_accepted_as_a_global_diff_option() {
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(2));
+    assert_interactive_refusal(&output);
     assert_original_inputs(&root);
     assert!(!root.path().join("result.txt").exists());
+}
+
+#[test]
+fn global_assistance_before_merge_refuses_before_output_creation() {
+    let root = fixture();
+    let output = command(&root)
+        .env("TYPESAFE_API_KEY", "fixture-secret")
+        .args([
+            "--jev",
+            "merge",
+            "--base",
+            "base.txt",
+            "--ours",
+            "ours.txt",
+            "--theirs",
+            "theirs.txt",
+            "--output",
+            "result.txt",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_interactive_refusal(&output);
+    assert!(!root.path().join("result.txt").exists());
+    assert_original_inputs(&root);
+}
+
+#[test]
+fn headless_repository_assistance_refuses_before_discovery_or_side_effects() {
+    for args in [
+        vec!["--jev"],
+        vec!["--jev", "--non-interactive"],
+        vec!["--jev", "review", "--non-interactive"],
+        vec!["review", "--jev", "--format", "text"],
+        vec!["review", "--format", "json", "--jev"],
+        vec![
+            "review",
+            "--report",
+            "report.json",
+            "--export-patch",
+            "review.patch",
+            "--open-companion",
+            "--jev",
+        ],
+    ] {
+        let root = fixture();
+        fs::write(root.path().join("report.json"), b"existing report\n").unwrap();
+        fs::write(root.path().join("review.patch"), b"existing patch\n").unwrap();
+        let output = command(&root)
+            .env("TYPESAFE_API_KEY", "fixture-secret")
+            .args(args)
+            .output()
+            .unwrap();
+
+        assert_interactive_refusal(&output);
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            fs::read(root.path().join("report.json")).unwrap(),
+            b"existing report\n"
+        );
+        assert_eq!(
+            fs::read(root.path().join("review.patch")).unwrap(),
+            b"existing patch\n"
+        );
+        assert_original_inputs(&root);
+    }
 }

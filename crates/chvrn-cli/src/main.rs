@@ -36,6 +36,12 @@ struct Options {
     format: OutputFormat,
     #[arg(long, global = true)]
     non_interactive: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Enable on-demand Jev suggestions via TypeSafe (interactive only)"
+    )]
+    jev: bool,
     #[arg(long, global = true, value_enum)]
     herdr: Option<HerdrMode>,
     #[arg(long, global = true)]
@@ -111,11 +117,6 @@ enum Command {
         theirs: Option<PathBuf>,
         #[arg(long)]
         output: Option<PathBuf>,
-        #[arg(
-            long,
-            help = "Enable on-demand Jev suggestions via TypeSafe (interactive only)"
-        )]
-        jev: bool,
     },
 }
 
@@ -129,17 +130,15 @@ struct MergeArgs {
     theirs: PathBuf,
     #[arg(long)]
     output: PathBuf,
-    #[arg(
-        long,
-        help = "Enable on-demand Jev suggestions via TypeSafe (interactive only)"
-    )]
-    jev: bool,
 }
 
 #[derive(Args, Default)]
 struct ReviewArgs {
-    #[arg(long, default_value = "index")]
-    base: String,
+    #[arg(
+        long,
+        help = "Compare directly with a revision or index; default: merge base of HEAD and CHVRN_BASE_BRANCH (main when unset)"
+    )]
+    base: Option<String>,
     #[arg(long)]
     patch: Option<PathBuf>,
     #[arg(long)]
@@ -163,6 +162,9 @@ fn environment_path(path: Option<PathBuf>, name: &str) -> Result<PathBuf> {
 
 fn execute(cli: Cli) -> Result<u8> {
     let options = &cli.options;
+    if options.jev && !options.interactive() {
+        return Err("--jev requires an interactive session; output unchanged".into());
+    }
     if options.herdr.is_some() && std::env::var("HERDR_ENV").as_deref() != Ok("1") {
         return Err("herdr integration requires HERDR_ENV=1 in the current session".into());
     }
@@ -179,25 +181,17 @@ fn execute(cli: Cli) -> Result<u8> {
             ours,
             theirs,
             output,
-            jev,
         }) => standalone::merge(
             MergeArgs {
                 base: environment_path(base, "BASE")?,
                 ours: environment_path(ours, "LOCAL")?,
                 theirs: environment_path(theirs, "REMOTE")?,
                 output: environment_path(output, "MERGED")?,
-                jev,
             },
             options,
         ),
         Some(Command::Review(args)) => repository::review(args, options),
-        None => repository::review(
-            ReviewArgs {
-                base: "index".into(),
-                ..ReviewArgs::default()
-            },
-            options,
-        ),
+        None => repository::review(ReviewArgs::default(), options),
     }
 }
 

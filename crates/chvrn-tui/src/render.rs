@@ -456,6 +456,16 @@ impl ReviewSession {
                 review && repository_mode == Some(RepositoryReviewMode::PatchPreview),
                 false,
             ),
+            (
+                "[m]",
+                "Merge",
+                review
+                    && matches!(
+                        repository_mode,
+                        Some(RepositoryReviewMode::Index | RepositoryReviewMode::Revision)
+                    ),
+                false,
+            ),
             ("[c]", "Comment", review && repository_mode.is_some(), false),
             ("[J]", "Suggest", self.can_begin_merge_advice(), true),
             ("[o]", "Ours", review && conflict.is_some(), false),
@@ -965,6 +975,13 @@ impl ReviewSession {
                 }
             };
             wrap_help_line(&mut self.help_lines, action, width);
+            if review.mode != RepositoryReviewMode::PatchPreview {
+                wrap_help_line(
+                    &mut self.help_lines,
+                    "m: open the selected unresolved Git text conflict in three-way merge; confirmed saves do not stage",
+                    width,
+                );
+            }
         }
         let (left_label, right_label) = match self.mode {
             Mode::TwoWay { .. } => ("Left:", "Right:"),

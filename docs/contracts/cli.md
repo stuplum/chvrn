@@ -4,7 +4,7 @@ The `chvrn-cli` package builds the `chvrn` executable. [Black-box consumer tests
 
 ## Routing and terminal selection
 
-The commands are `diff`, `merge`, `review`, `difftool` and `mergetool`. No subcommand selects repository review against the index. The TUI opens only with terminal stdin and stdout, `--format auto` and no `--non-interactive`. Explicit `--format text` or `--format json` never launches it. Headless `auto` uses JSON.
+The commands are `diff`, `merge`, `review`, `difftool` and `mergetool`. No subcommand selects repository review with the same merge-base default as `review`. The TUI opens only with terminal stdin and stdout, `--format auto` and no `--non-interactive`. Explicit `--format text` or `--format json` never launches it. Headless `auto` uses JSON.
 
 Operational/usage failures exit `2`. Quitting an interactive session exits `1`, never approval. Successful explicit interactive submission exits `0`. Repository submission can advance through multiple files before the process completes.
 
@@ -20,17 +20,23 @@ Interactive file comparison permits editing both buffers. `s` explicitly saves c
 
 Interactive merging shows ours/result/theirs with read-only source panes. Conflicts require source selection or manual acceptance. Resolving the final conflict opens confirmation; `s` can request confirmation manually. Only explicit `y` confirmation submits a resolved result for a guarded write. `n` or Escape returns to review.
 
-`merge --jev` and `mergetool --jev` enable on-demand suggestions only in a TTY with `--format auto` and without `--non-interactive`. Other output modes fail with exit `2` before writing. Only opted-in runs read `TYPESAFE_API_KEY`; a missing or invalid key is an error, while ordinary merging requires none.
+Global `--jev` enables on-demand suggestions in repository review, standalone merge and mergetool sessions, only in a TTY with `--format auto` and without `--non-interactive`. It works before or after the subcommand and with bare `chvrn`. Other output modes fail with exit `2` before writing. Only opted-in runs read `TYPESAFE_API_KEY`; a missing or invalid key is an error, while ordinary merging requires none. Companion launches retain the flag but require the key in the new pane's shell environment; command-scoped credentials are not forwarded into pane commands or process arguments.
 
 The host routes `J` to a single-flight background client. Responses enter the TUI's snapshot-bound advice lifecycle and cannot mutate or submit a result themselves. A cancelled request retains its network slot until completion; dropping the host does not join the network thread. Entering an LSP definition view cancels advice before parking the original session. Help, suggestion review in the footer and write/discard dialogs own input ahead of host shortcuts; an external-refresh conflict is not such a modal, so host-owned `R` recovery remains reachable.
 
 ## Repository review
+
+Without `--base`, review resolves the merge base of `HEAD` and `CHVRN_BASE_BRANCH`, using `main` only when the variable is unset. The resulting commit ID is used as an immutable revision for the session, refreshes and companion launch, and appears in headless JSON as `base`. Missing refs, empty/invalid environment values and unrelated histories fail with exit `2`; there is no fetch or fallback. An explicit `--base` bypasses the environment and merge-base calculation entirely.
 
 `--base index` compares worktree content with the inspected index. A revision base such as `HEAD` compares the worktree with its resolved tree. Positional review paths are repository-relative. The review retains index/worktree/reference state for the operations that validate it.
 
 Headless review emits `{base, patch_preview, files}` or a text summary, without staging, rejecting, importing a patch or submitting a report. Each file's `equal` combines content comparison under the selected whitespace policy with matching file existence and Git file mode. Empty-file additions/deletions and mode-only changes are unequal even without textual hunks. The exit code is `1` if any file is unequal, otherwise `0`. Patch previews compare the inspected worktree with the proposed bytes, existence and mode; ordinary review compares the selected base with the worktree.
 
 Interactive `S` stages an exact textual hunk from an index review. Interactive `x` restores a textual hunk from a revision review, or declines an active patch preview. Both Git mutations are distinct from `s` review submission; quitting does not undo completed mutations. No action implicitly commits.
+
+Interactive `m` opens the selected unresolved Git text conflict as a three-way session, preserving the Jev worker and opt-in. It refuses dirty buffers, local alignment or external refreshes in flight, patch previews and pending Herdr gates. Git supplies immutable stage 1/2/3 inputs; an absent stage 1 represents an empty add/add base. Missing ours/theirs stages, binary data and non-regular files are refused. The result is reconstructed from stages rather than pre-existing manual worktree resolutions.
+
+Escape returns to repository review before merge edits. Confirmed submission validates the selected conflict entries, worktree bytes, permissions and guarded output before writing; it returns to review without staging, accepting the file or submitting a review report. The repository and actual index parent are watched, including linked-worktree index locations. Changed conflict inputs disable advice and block writes. Repository Git actions, file navigation and report submission are unavailable while merging.
 
 `--patch FILE` previews candidate changes; interactive acceptance of every candidate file is required before application. `--export-patch PATH` needs revision-based interactive review and `P`. `--report PATH` writes after completed interactive submission. Either output option in headless review fails with exit code `2` and an actionable diagnostic before inspecting changed files or accessing output destinations. `--open-companion` retains its separate launcher behaviour and forwards these options to the interactive companion.
 

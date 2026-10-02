@@ -18,6 +18,7 @@ fn command(root: &TempDir) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_chvrn"));
     command
         .current_dir(root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config-home"))
         .env_remove("TYPESAFE_API_KEY")
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")

@@ -19,6 +19,7 @@ crossterm.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 notify.workspace = true
 tempfile.workspace = true
 unicode-segmentation.workspace = true

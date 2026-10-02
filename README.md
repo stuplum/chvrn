@@ -20,6 +20,8 @@ cargo install --locked --git https://github.com/stuplum/chvrn.git chvrn-cli
 
 Run `chvrn` or `chvrn review` inside a Git repository to review changes since your branch diverged from `main`. Set `CHVRN_BASE_BRANCH` to use another target branch. Use `chvrn review --base index` for unstaged changes only. Press `?` for help.
 
+Use `--theme darcula` or another [bundled or external theme](docs/usage.md#themes). Save your usual choice in Chvrn's configuration file; the original appearance remains the default.
+
 ## Documentation
 
 [User guide](docs/usage.md) · [Integrations](docs/integrations.md) · [Development](docs/development.md)
@@ -31,3 +33,5 @@ Early development. Tested interactively on macOS arm64. [Current limitations.](d
 ## Licence
 
 [GPLv3 only](LICENSE). Copyright (c) 2026 Stuart Plumbley.
+
+Bundled Helix theme adaptations retain MPL-2.0 and their original-project notices. [Theme sources, licences and attribution](crates/chvrn-tui/themes/ATTRIBUTION.txt).

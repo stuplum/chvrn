@@ -17,7 +17,7 @@ use chvrn_core::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::{Cursor, Pane, ReviewOutcome, ReviewSubmission, text};
+use crate::{Cursor, Pane, ReviewOutcome, ReviewSubmission, Theme, render::RenderPalette, text};
 
 pub struct DiffRequest {
     generation: u64,
@@ -501,6 +501,8 @@ pub struct ReviewSession {
     pub(crate) local_pending: bool,
     local_worker: Option<LocalWorker>,
     pub(crate) merge_advice: crate::merge_advice::MergeAdviceState,
+    theme: Arc<Theme>,
+    pub(crate) palette: RenderPalette,
 }
 
 impl ReviewSession {
@@ -508,6 +510,7 @@ impl ReviewSession {
         let left = snapshot(left);
         let right = snapshot(right);
         let diff = Diff::between(&left, &right, WhitespacePolicy::Exact);
+        let theme = Arc::new(Theme::default());
         let mut session = Self {
             mode: Mode::TwoWay {
                 left: TextPane::new(left, false),
@@ -547,6 +550,8 @@ impl ReviewSession {
             local_pending: false,
             local_worker: None,
             merge_advice: crate::merge_advice::MergeAdviceState::default(),
+            palette: RenderPalette::compile(&theme),
+            theme,
         };
         session.rebuild_rows();
         session
@@ -576,6 +581,7 @@ impl ReviewSession {
                 }
             })
             .collect();
+        let theme = Arc::new(Theme::default());
         let mut session = Self {
             mode: Mode::ThreeWay {
                 base,
@@ -622,9 +628,20 @@ impl ReviewSession {
             local_pending: false,
             local_worker: None,
             merge_advice: crate::merge_advice::MergeAdviceState::default(),
+            palette: RenderPalette::compile(&theme),
+            theme,
         };
         session.rebuild_rows();
         session
+    }
+
+    pub fn set_theme(&mut self, theme: Arc<Theme>) {
+        self.palette = RenderPalette::compile(&theme);
+        self.theme = theme;
+    }
+
+    pub fn theme(&self) -> &Arc<Theme> {
+        &self.theme
     }
 
     pub fn focus(&self) -> Pane {

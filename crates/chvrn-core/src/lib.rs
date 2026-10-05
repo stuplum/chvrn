@@ -3,6 +3,7 @@ pub mod edit;
 pub mod merge;
 pub mod merge_advice;
 pub mod structural;
+pub mod unified;
 
 use std::sync::Arc;
 

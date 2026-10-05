@@ -35,6 +35,21 @@ struct TerminalGuard {
     paste: bool,
 }
 
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        let mut guard = Self::default();
+        enable_raw_mode()?;
+        guard.raw = true;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        guard.alternate = true;
+        execute!(io::stdout(), EnableMouseCapture)?;
+        guard.mouse = true;
+        execute!(io::stdout(), EnableBracketedPaste)?;
+        guard.paste = true;
+        Ok(guard)
+    }
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.paste {
@@ -54,15 +69,7 @@ impl Drop for TerminalGuard {
 }
 
 pub fn run(session: &mut ReviewSession, host: &mut impl ReviewHost) -> Result<u8> {
-    let mut guard = TerminalGuard::default();
-    enable_raw_mode()?;
-    guard.raw = true;
-    execute!(io::stdout(), EnterAlternateScreen)?;
-    guard.alternate = true;
-    execute!(io::stdout(), EnableMouseCapture)?;
-    guard.mouse = true;
-    execute!(io::stdout(), EnableBracketedPaste)?;
-    guard.paste = true;
+    let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
     let mut discard = false;
@@ -144,6 +151,18 @@ pub fn run(session: &mut ReviewSession, host: &mut impl ReviewHost) -> Result<u8
                 "Resolve {count} remaining conflicts before submitting"
             )),
             ReviewOutcome::Continue => {}
+        }
+    }
+}
+
+pub fn run_pager(session: &mut chvrn_tui::PagerSession) -> Result<u8> {
+    let _guard = TerminalGuard::enter()?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    terminal.clear()?;
+    loop {
+        terminal.draw(|frame| session.render(frame))?;
+        if session.handle(event::read()?) {
+            return Ok(0);
         }
     }
 }

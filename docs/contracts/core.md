@@ -68,6 +68,12 @@ pub mod diff {
 
 A hunk copies exact source bytes to the opposite destination, even if its surrounding alignment used a whitespace policy. `LeftToRight` takes `current` with this diff's **right** snapshot identity and replaces the selected right-side range with left-side bytes. `RightToLeft` takes `current` with this diff's **left** snapshot identity and replaces the selected left-side range with right-side bytes. A hunk from another diff is `ForeignHunk`. A different destination snapshot identity is `StaleSnapshot`, including one independently constructed with equal content. Applying a hunk returns a new snapshot; the diff must be recomputed before another application. Empty half-open hunk ranges represent boundary insertion/deletion. No partial mutation is possible on error.
 
+## Sparse unified patches
+
+`unified::UnifiedPatch::parse(String)` owns a complete UTF-8 patch and returns ordered `PatchFile` entries or a line-numbered `PatchError`. Each file retains optional old/new paths, metadata, binary status and supplied `PatchHunk` entries. Hunk starts/counts use the original patch coordinates. `PatchLine` carries its context/removed/added kind, optional one-based old/new numbers, a byte span and its no-final-newline marker; `UnifiedPatch::text(&Range<usize>)` borrows that span.
+
+Parsing validates hunk counts, ordering, arithmetic, known EOF anchors and binary-section framing. It does not allocate omitted file lines, apply a patch or decompress binary data. Git quoting and paired synthetic path prefixes are decoded; plain unified paths are retained literally. SGR colour escapes are removed only when present. Other raw terminal controls, malformed/truncated patches, combined diffs and non-UTF-8 quoted paths are rejected. Decoded filename controls remain data for the renderer to escape visibly.
+
 ## Rope-backed editing
 
 ```rust

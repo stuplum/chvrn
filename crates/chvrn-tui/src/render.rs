@@ -131,27 +131,27 @@ const MODIFIED: Color = Color::Rgb(222, 180, 106);
 const CONNECTOR_WIDTH: u16 = 5;
 
 #[derive(Clone, Copy)]
-struct RegionPaint {
-    normal: Style,
-    inline: Style,
+pub(crate) struct RegionPaint {
+    pub(crate) normal: Style,
+    pub(crate) inline: Style,
 }
 
 pub(crate) struct RenderPalette {
-    surface: Style,
-    heading: Style,
-    quiet: Style,
-    accent: Style,
+    pub(crate) surface: Style,
+    pub(crate) heading: Style,
+    pub(crate) quiet: Style,
+    pub(crate) accent: Style,
     notice: Style,
     rail: Style,
-    line_number: Style,
-    help: Style,
+    pub(crate) line_number: Style,
+    pub(crate) help: Style,
     cursor: Style,
     overview: [Style; 2],
     bands: [Color; 5],
     actions: [Style; 5],
     overview_bands: [[Style; 2]; 5],
     regions: [[RegionPaint; 2]; 7],
-    neutral: RegionPaint,
+    pub(crate) neutral: RegionPaint,
     syntax: [Style; 8],
 }
 
@@ -424,7 +424,7 @@ impl RenderPalette {
         }
     }
 
-    fn region(&self, kind: ChangeKind, pane: Pane, selected: bool) -> RegionPaint {
+    pub(crate) fn region(&self, kind: ChangeKind, pane: Pane, selected: bool) -> RegionPaint {
         let index = match (kind, pane) {
             (ChangeKind::Modified, Pane::Left | Pane::Ours) => 0,
             (ChangeKind::Modified, _) => 1,
@@ -448,6 +448,49 @@ impl RenderPalette {
             HighlightKind::Function => 6,
             HighlightKind::Punctuation => 7,
         }]
+    }
+    pub(crate) fn without_color(mut self) -> Self {
+        fn clear(style: &mut Style) {
+            style.fg = Some(Color::Reset);
+            style.bg = Some(Color::Reset);
+            style.underline_color = Some(Color::Reset);
+        }
+        for style in [
+            &mut self.surface,
+            &mut self.heading,
+            &mut self.quiet,
+            &mut self.accent,
+            &mut self.notice,
+            &mut self.rail,
+            &mut self.line_number,
+            &mut self.help,
+            &mut self.cursor,
+            &mut self.neutral.normal,
+            &mut self.neutral.inline,
+        ] {
+            clear(style);
+        }
+        for style in self
+            .syntax
+            .iter_mut()
+            .chain(self.overview.iter_mut())
+            .chain(self.actions.iter_mut())
+        {
+            clear(style);
+        }
+        for styles in &mut self.overview_bands {
+            for style in styles {
+                clear(style);
+            }
+        }
+        for paints in &mut self.regions {
+            for paint in paints {
+                clear(&mut paint.normal);
+                clear(&mut paint.inline);
+            }
+        }
+        self.bands.fill(Color::Reset);
+        self
     }
 }
 
@@ -1480,7 +1523,7 @@ impl ReviewSession {
     }
 }
 
-fn render_line_number(
+pub(crate) fn render_line_number(
     buffer: &mut Buffer,
     x: u16,
     y: u16,
@@ -1645,7 +1688,7 @@ fn intraline_color(region: Option<ChangeKind>, background: Color) -> Color {
     )
 }
 
-fn render_line(
+pub(crate) fn render_line(
     buffer: &mut Buffer,
     area: Rect,
     y: u16,

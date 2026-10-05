@@ -4,6 +4,12 @@ Status: approved implementation contract. Production code exists; executable ver
 
 The crate owns input dispatch, editable review buffers and Ratatui rendering. `chvrn-core` owns diff alignment, snapshot identity, edit history, merge resolution and Tree-sitter syntax spans; the TUI maps core Unicode-scalar positions to grapheme cursors and terminal display cells. The CLI owns terminal setup, lifecycle and integration with Git/herdr. Neither a submitted review nor a hunk application writes files, stages an index or sends herdr feedback.
 
+## Read-only pager
+
+`PagerSession::new(UnifiedPatch, Arc<Theme>)`, `render(&mut Frame)` and `handle(Event) -> bool` form a separate immutable patch-viewing API. A true input result requests a successful exit; help consumes the first quit key. There is no submission or mutation API.
+
+The pager caches derived rows and highlighting per visited file, aligns only within supplied hunks, retains original line numbers and displays omission, metadata, binary and final-newline notices. It shares the review renderer's palette and Unicode/tab primitives, escapes decoded filename controls and honours `NO_COLOR`. File/hunk navigation, scrolling, help and narrow-screen side focus do not change patch contents. The CLI owns pipe/terminal separation and terminal restoration.
+
 ## Public Rust API
 
 ```rust

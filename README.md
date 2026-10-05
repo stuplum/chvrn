@@ -9,6 +9,7 @@
 - **Compare and edit.** Two editable panes, connected changes and syntax highlighting.
 - **Resolve merges.** Choose either side, keep both or edit the result, with undo/redo.
 - **Review Git changes.** Inspect your worktree, stage hunks and use Git's diff and merge tools.
+- **Read piped patches.** Use `git diff | chvrn pager`, including as GH Dash's diff viewer, without a checkout or file writes.
 
 ## Install
 

@@ -14,10 +14,11 @@
 | `chvrn review --base REVISION [PATHS]...` | Compare the worktree with a revision such as `HEAD`. |
 | `chvrn difftool [LEFT] [RIGHT]` | File comparison using explicit paths or Git's `LOCAL`/`REMOTE`. |
 | `chvrn mergetool` | Merge using Git's `BASE`/`LOCAL`/`REMOTE`/`MERGED`, or explicit merge flags. |
+| `chvrn pager` | Read a unified diff from stdin in a read-only viewer, without a repository. |
 
 Use `chvrn --help` or `chvrn COMMAND --help` for the complete option list. File arguments may be absolute paths. Positional **repository review** paths are repository-relative, even when invoked from a subdirectory; absolute, escaping and symlink paths are refused.
 
-A TUI opens only when both stdin and stdout are terminals, `--format` is `auto` and `--non-interactive` is absent. `--format text`, `--format json`, redirected streams or `--non-interactive` select headless operation. Headless `auto` produces JSON, not the interactive display.
+Except for `pager`, a TUI opens only when both stdin and stdout are terminals, `--format` is `auto` and `--non-interactive` is absent. `--format text`, `--format json`, redirected streams or `--non-interactive` select headless operation. Headless `auto` produces JSON, not the interactive display.
 
 ```sh
 chvrn diff /path/to/before.rs /path/to/after.rs --format json
@@ -28,11 +29,49 @@ Headless diff and repository review inspect without changing files. **Headless m
 
 | Exit | Meaning |
 | --- | --- |
-| `0` | Equal headless diff/review, a successfully written conflict-free headless merge, or successful explicit interactive submission. |
-| `1` | Detected headless differences, unresolved merge conflicts, a declined patch or interactive quit. |
+| `0` | Equal headless diff/review, a successfully written conflict-free headless merge, successful explicit interactive submission, or pager completion/quit. |
+| `1` | Detected headless differences, unresolved merge conflicts, a declined patch or quit from an editable review session. |
 | `2` | Operational or usage error. |
 
 Headless review compares content using the selected whitespace policy, plus file existence and Git file mode. Empty-file additions/deletions and permission-only changes count as differences even when there are no textual hunks.
+
+## Read-only diff pager and GH Dash
+
+```sh
+git diff | chvrn pager
+gh pr diff 123 --repo OWNER/REPO | chvrn pager --theme darcula
+```
+
+The pager reads the supplied unified diff, not the local worktree. It works outside a repository and never checks out, stages, applies or writes files. Old and new panes retain the patch's original line numbers and supplied hunk boundaries. Notices mark omitted context; missing file contents are not reconstructed. Rename/copy, file-mode, empty-file and binary changes remain visible as metadata. Binary payloads are summarised, not decoded.
+
+Set the following in `$HOME/.config/gh-dash/config.yml`:
+
+```yaml
+pager:
+  diff: chvrn pager
+```
+
+Restart GH Dash, select a pull request and press `d`. Press `q` in Chvrn to return to the dashboard. No local checkout or `repoPaths` mapping is required.
+
+The dashboard must inherit a `PATH` that resolves `chvrn`. Cargo's shell setup does not update already-running shells: open a new shell, or source `$HOME/.cargo/env` in the existing shell before launching GH Dash. Check `command -v chvrn` there. GitHub CLI prints the raw diff and exits when the configured pager executable is missing.
+
+| Key | Action |
+| --- | --- |
+| Ctrl-N / Ctrl-P | Next / previous file. |
+| `]` / `[` | Next / previous supplied hunk. |
+| Up / Down, mouse wheel | Scroll rows. |
+| PageDown / Ctrl-F, PageUp / Ctrl-B | Scroll a page. |
+| Ctrl-D / Ctrl-U | Scroll half a page. |
+| Left / Right | Scroll horizontally. |
+| Home / End | First / last rows in the current file. |
+| Tab | Switch the visible side in a narrow terminal. |
+| `?` | Toggle help. |
+| `q` / Escape | Close help, or quit successfully. |
+
+The patch comes from stdin; keyboard input comes from the controlling terminal. With redirected stdout, `--format text` or `--non-interactive`, input bytes pass through unchanged, without parsing or loading themes. Empty input exits successfully. Interactive input must be UTF-8; standard SGR-coloured diffs are accepted, while malformed/truncated patches, combined merge diffs and other terminal control sequences are rejected.
+
+The pager uses the usual themes and `NO_COLOR`, but does not enable Herdr automatically. Explicit Jev, Herdr/agent, LSP, whitespace-filtering and JSON-output options are refused. It displays the supplied changes exactly and has no editing, saving or submission controls.
+
 
 ## Two-way comparison
 

@@ -2,6 +2,7 @@ mod files;
 mod herdr_ui;
 mod jev_ui;
 mod language;
+mod pager;
 mod repository;
 mod socket_ui;
 mod standalone;
@@ -114,6 +115,8 @@ enum Command {
     },
     Merge(MergeArgs),
     Review(ReviewArgs),
+    #[command(about = "View a unified diff from stdin without opening a repository")]
+    Pager,
     Difftool {
         left: Option<PathBuf>,
         right: Option<PathBuf>,
@@ -172,16 +175,18 @@ fn environment_path(path: Option<PathBuf>, name: &str) -> Result<PathBuf> {
 
 fn execute(cli: Cli) -> Result<u8> {
     let mut options = cli.options;
-    let theme = theme_config::load_theme(options.theme.as_deref())?;
-    options.loaded_theme = theme.theme;
-    options.theme = Some(theme.argument);
+    if !matches!(cli.command, Some(Command::Pager)) {
+        let theme = theme_config::load_theme(options.theme.as_deref())?;
+        options.loaded_theme = theme.theme;
+        options.theme = Some(theme.argument);
+        if options.jev && !options.interactive() {
+            return Err("--jev requires an interactive session; output unchanged".into());
+        }
+        if options.herdr.is_some() && std::env::var("HERDR_ENV").as_deref() != Ok("1") {
+            return Err("herdr integration requires HERDR_ENV=1 in the current session".into());
+        }
+    }
     let options = &options;
-    if options.jev && !options.interactive() {
-        return Err("--jev requires an interactive session; output unchanged".into());
-    }
-    if options.herdr.is_some() && std::env::var("HERDR_ENV").as_deref() != Ok("1") {
-        return Err("herdr integration requires HERDR_ENV=1 in the current session".into());
-    }
     match cli.command {
         Some(Command::Diff { left, right }) => standalone::diff(left, right, options),
         Some(Command::Merge(args)) => standalone::merge(args, options),
@@ -205,6 +210,7 @@ fn execute(cli: Cli) -> Result<u8> {
             options,
         ),
         Some(Command::Review(args)) => repository::review(args, options),
+        Some(Command::Pager) => pager::run(options),
         None => repository::review(ReviewArgs::default(), options),
     }
 }

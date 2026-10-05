@@ -1,6 +1,7 @@
 mod bundled_themes;
 mod input;
 mod merge_advice;
+mod pager;
 mod render;
 mod session;
 mod text;
@@ -12,6 +13,7 @@ pub use chvrn_core::diff::WhitespacePolicy;
 pub use chvrn_core::structural::Language;
 pub use input::ReviewEditError;
 pub use merge_advice::{MergeAdviceError, MergeAdviceRequest};
+pub use pager::PagerSession;
 pub use session::{DiffCompletion, DiffRequest, RepositoryReviewMode, ReviewSession};
 pub use theme::{BUNDLED_THEMES, Theme, ThemeError};
 

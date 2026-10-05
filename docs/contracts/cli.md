@@ -4,11 +4,22 @@ The `chvrn-cli` package builds the `chvrn` executable. [Black-box consumer tests
 
 ## Routing and terminal selection
 
-The commands are `diff`, `merge`, `review`, `difftool` and `mergetool`. No subcommand selects repository review with the same merge-base default as `review`. The TUI opens only with terminal stdin and stdout, `--format auto` and no `--non-interactive`. Explicit `--format text` or `--format json` never launches it. Headless `auto` uses JSON.
+The commands are `diff`, `merge`, `review`, `pager`, `difftool` and `mergetool`. No subcommand selects repository review with the same merge-base default as `review`. Except for `pager`, the TUI opens only with terminal stdin and stdout, `--format auto` and no `--non-interactive`. Explicit `--format text` or `--format json` never launches it. Headless `auto` uses JSON.
 
-Operational/usage failures exit `2`. Quitting an interactive session exits `1`, never approval. Successful explicit interactive submission exits `0`. Repository submission can advance through multiple files before the process completes.
+Operational/usage failures exit `2`. Quitting an editable interactive session exits `1`, never approval. Successful explicit interactive submission exits `0`. Repository submission can advance through multiple files before the process completes. Read-only pager completion and quit exit `0`.
 
 Global `--theme NAME_OR_FILE` takes precedence over the optional `theme` value in `config.toml`. Configuration lives under an absolute `XDG_CONFIG_HOME/chvrn`, otherwise `$HOME/.config/chvrn`. An explicit flag bypasses saved-config parsing. Missing configuration uses the original `chvrn` palette; malformed configuration and invalid selections fail before command side effects, including in headless mode. The CLI loads once, shares the theme across initial and replacement sessions, and supplies it to LSP definition views. Companion arguments retain the resolved selection, using the absolute source path for external themes so a changed working directory cannot select a different file. Relative saved file paths are relative to the configuration directory; explicit CLI paths are relative to the launch directory.
+
+Pager passthrough is the exception to theme loading: it copies bytes without parsing configuration or selecting a theme.
+
+## Unified-diff pager
+
+`chvrn pager` requires non-terminal stdin and does not discover or open a repository. With terminal stdout, `--format auto` and no `--non-interactive`, it parses the complete UTF-8 input before entering the read-only TUI. Empty input exits `0` without terminal setup. Invalid input exits `2` before terminal entry. Redirected stdout, `--format text` and `--non-interactive` copy the original bytes without parsing, including non-UTF-8 input.
+
+Explicit `--jev`, `--herdr`, `--agent`, `--lsp`, `--lsp-arg`, non-exact whitespace policies and `--format json` fail before input processing. Inherited Herdr environment variables do not activate integration. Interactive theme selection retains normal precedence.
+
+Crossterm's `use-dev-tty` polling backend reads keyboard events from the controlling terminal independently of the stdin pipe. The shared terminal guard restores raw mode, alternate screen, cursor, mouse and paste state on exit or error. The pager returns success on quit, without approval semantics or filesystem writes.
+
 
 ## File comparison
 

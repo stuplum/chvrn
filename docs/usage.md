@@ -66,11 +66,22 @@ The dashboard must inherit a `PATH` that resolves `chvrn`. Cargo's shell setup d
 | Home / End | First / last rows in the current file. |
 | Tab | Switch the visible side in a narrow terminal. |
 | `?` | Toggle help. |
-| `q` / Escape | Close help, or quit successfully. |
+| Mouse drag, Ctrl-C | Select and copy source from one pane, without line numbers or diff markers. |
+| `q` / Escape | Close help; Escape clears an active selection before quitting. |
 
 The patch comes from stdin; keyboard input comes from the controlling terminal. With redirected stdout, `--format text` or `--non-interactive`, input bytes pass through unchanged, without parsing or loading themes. Empty input exits successfully. Interactive input must be UTF-8; standard SGR-coloured diffs are accepted, while malformed/truncated patches, combined merge diffs and other terminal control sequences are rejected.
 
 The pager uses the usual themes and `NO_COLOR`, but does not enable Herdr automatically. Explicit Jev, Herdr/agent, LSP, whitespace-filtering and JSON-output options are refused. It displays the supplied changes exactly and has no editing, saving or submission controls.
+
+Selection stays in the starting pane and supplied hunk, including when dragging across the divider. Tabs and Unicode retain their source bytes. Omitted context is never invented or copied. Changing files or focused side clears the selection. Copying does not edit the patch. Local macOS sessions use `pbcopy`; other or remote terminals receive OSC52, with tmux/screen passthrough. OSC52 requires terminal clipboard permission; its status reports delivery, not confirmed clipboard contents.
+
+## Syntax highlighting
+
+Pager, diff and merge share Syntect with two-face's bundled syntax catalogue, including Elixir, Go, Ruby, Java, C/C++, shell, SQL, YAML, Terraform and markup. Definitions work offline. Filename/extension detection takes precedence over a recognised shebang; unknown files stay plain text.
+
+Add custom `.sublime-syntax` definitions under the first configured location: `$CHVRN_CONFIG_DIR/syntaxes`, `$XDG_CONFIG_HOME/chvrn/syntaxes`, or `$HOME/.config/chvrn/syntaxes`. Custom definitions can override bundled extensions. Restart Chvrn after changing definitions. Loading and parsing failures are displayed, not silently treated as successful highlighting.
+
+Sparse pager hunks are highlighted separately, using the actual supplied file header for shebang detection when available. Omitted text and its multiline parser state are not reconstructed. Highlighting does not enable structural analysis, language-server support or semantic merge for a language.
 
 
 ## Two-way comparison
@@ -92,6 +103,8 @@ Both files are editable in `diff`. Click `»` or `«` beside a hunk to copy that
 
 The visible panes are **Ours | Merged result | Theirs**. The base is retained internally; it is not a fourth pane. Source panes are read-only. Independent changes combine automatically. Unresolved regions provisionally show ours, but this is not acceptance and does not permit saving.
 
+Conflict shading covers the complete competing blocks in all three panes, including lines shared by the two choices. Connectors and choice arrows refer to those same blocks. An empty choice marks a deletion boundary without shading the following unchanged line. Panes remain compact: they do not insert blank alignment rows, so corresponding lines can appear at different heights.
+
 For the selected conflict:
 
 | Key | Result |
@@ -104,6 +117,12 @@ For the selected conflict:
 Accepted sources lose their gutter controls. A remaining non-empty source offers one insert-below action: `↘` for ours or `↙` for theirs. It inserts the original source block below the chosen result, preserving manual edits and duplicate lines. It consumes that source's control without resolving unrelated conflicts. There is no insert-above action.
 
 Undo/redo restores text, conflict decisions and available controls together. A choice is undoable even when it changes no text, including accepting a deletion.
+
+Matching additions made at different base positions are linked with `=` beside their line numbers. Focusing either source or result occurrence emphasises its counterparts. If the result contains multiple copies, the header and `v` control warn about duplicate additions.
+
+Press `v` to inspect the linked source and result positions, Tab to visit another result copy, and `k` to keep the current position and remove the others. `b` keeps all copies; Escape cancels. Removing copies is undoable, does not resolve unrelated conflicts and never writes without normal save confirmation.
+
+These are exact nonblank line matches, absent from the base and unambiguous in each source. They are not language-aware equivalence checks. Existing repetition is not flagged; differently formatted or semantically equivalent imports may not match. Warnings do not prohibit keeping intentional repetition or saving it.
 
 Resolving the final conflict opens confirmation automatically. `s` opens it manually, including for a conflict-free merge:
 
@@ -316,7 +335,7 @@ Bundled definitions and licences are preserved in [the theme attribution](../cra
 
 - **Per-file replacement:** Replacement is atomic per file, not across a collection of files. Partial filesystem failures are reported. Do not assume a failed multi-file operation wrote nothing.
 - **Large files:** Large local diff/syntax refreshes use a coalescing background worker. Hunk actions and submission wait for current alignment. Startup and initial merge construction still run before the first frame. No general speed advantage has been measured.
-- **Language scope:** Tree-sitter highlighting covers `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py` and `.json`. Other UTF-8 files use textual comparison. The core library also classifies top-level structural changes; these classifications are not displayed by the TUI and are not semantic refactoring or syntax-aware merge.
+- **Language scope:** Syntax colouring uses the extensible bundled catalogue described above. Tree-sitter structural analysis remains limited to `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py` and `.json`; its classifications are not displayed by the TUI and do not provide semantic refactoring or syntax-aware merge.
 - **Git scope:** Review compares the worktree with the index or a revision, not all three at once. Interactive staging/restoring requires textual hunks. Report and patch-file export require interactive review.
 - **Platforms:** Interactive checks have exercised macOS arm64. Linux/macOS CI configuration does not establish Linux terminal behaviour. Windows is not a supported claim; the current integration crate uses Unix APIs. Native non-UTF-8 path tests exclude Apple filesystems, which rejected the fixture itself.
 - **Integrations:** Previous real-server checks exercised clangd and Herdr 0.9.0. Other language-server combinations are not runtime-verified. See the [integration guide](integrations.md) for language IDs, explicit setup and delivery limits.

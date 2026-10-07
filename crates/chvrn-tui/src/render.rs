@@ -1,7 +1,7 @@
 use chvrn_core::{
     merge::ConflictId,
     merge_advice::{MergeAdviceChoice, MergeAdviceSuggestion},
-    structural::HighlightKind,
+    syntax::HighlightKind,
 };
 use ratatui::{
     Frame,
@@ -545,9 +545,16 @@ pub(crate) fn visible_pane_count(session: &ReviewSession, width: u16) -> usize {
 }
 
 fn pane_areas(session: &ReviewSession, area: Rect) -> ([PaneArea; 3], [Connector; 2], usize) {
-    let footer_height = session.merge_advice.dialog.as_ref().map_or(1, |dialog| {
-        AdviceFooter::new(&dialog.suggestion, area.width).height
-    });
+    let footer_height = if session.duplicate_additions.review.is_some() {
+        session
+            .duplicate_footer_lines(area.width)
+            .len()
+            .min(u16::MAX as usize) as u16
+    } else {
+        session.merge_advice.dialog.as_ref().map_or(1, |dialog| {
+            AdviceFooter::new(&dialog.suggestion, area.width).height
+        })
+    };
     let body = Rect::new(
         area.x,
         area.y.saturating_add(2),
@@ -633,7 +640,7 @@ impl ReviewSession {
                 Mode::ThreeWay { .. } => "MERGE",
             },
         };
-        let language = if self.pane(self.focus).language.is_some() {
+        let language = if !self.pane(self.focus).syntax.spans.is_empty() {
             "syntax"
         } else {
             "plain text"
@@ -695,6 +702,19 @@ impl ReviewSession {
                 style,
             );
         }
+        if !self.local_pending && self.duplicate_additions.count() > 0 {
+            let warning = format!(
+                "  {} duplicate addition(s) [v]",
+                self.duplicate_additions.count()
+            );
+            frame.buffer_mut().set_stringn(
+                x,
+                area.y,
+                warning,
+                usize::from(area.right().saturating_sub(x)),
+                self.palette.notice,
+            );
+        }
         let (panes, connectors, count) = pane_areas(self, area);
         if area.height > 1 {
             for pane_area in panes.iter().take(count) {
@@ -737,6 +757,27 @@ impl ReviewSession {
         }
     }
 
+    fn duplicate_footer_lines(&self, width: u16) -> Vec<String> {
+        let Some((index, occurrence)) = self.duplicate_additions.review else {
+            return Vec::new();
+        };
+        let link = &self.duplicate_additions.links[index];
+        let mut lines = Vec::new();
+        let origins = format!(
+            "Same addition, different position: ours L{}, theirs L{}; result {:?}",
+            link.ours + 1,
+            link.theirs + 1,
+            link.result.iter().map(|line| line + 1).collect::<Vec<_>>()
+        );
+        let actions = format!(
+            "[k] Keep L{}  [Tab] Other  [b] Keep all  [Esc] Cancel",
+            link.result[occurrence] + 1
+        );
+        wrap_help_line(&mut lines, &origins, usize::from(width).max(1));
+        wrap_help_line(&mut lines, &actions, usize::from(width).max(1));
+        lines
+    }
+
     fn render_footer(&self, frame: &mut Frame<'_>) {
         let screen = frame.area();
         if let Some(dialog) = &self.merge_advice.dialog {
@@ -747,6 +788,22 @@ impl ReviewSession {
             return;
         }
         let area = Rect::new(screen.x, screen.bottom() - 1, screen.width, 1);
+        if self.duplicate_additions.review.is_some() {
+            let lines = self.duplicate_footer_lines(screen.width);
+            let height = (lines.len() as u16).min(screen.height.saturating_sub(1));
+            let area = Rect::new(screen.x, screen.bottom() - height, screen.width, height);
+            frame.buffer_mut().set_style(area, self.palette.heading);
+            for (offset, line) in lines.iter().rev().take(height as usize).rev().enumerate() {
+                frame.buffer_mut().set_stringn(
+                    area.x,
+                    area.y + offset as u16,
+                    line,
+                    usize::from(area.width),
+                    self.palette.notice,
+                );
+            }
+            return;
+        }
         let normal = self.palette.heading;
         let key_style = self.palette.accent;
         let buffer = frame.buffer_mut();
@@ -759,6 +816,8 @@ impl ReviewSession {
             "Updating edited diff; hunk apply and submit wait for the latest alignment"
         } else if self.confirming_merge {
             "[y] Write merge  [n/Esc] Review"
+        } else if let Some(error) = &self.pane(self.focus).syntax.error {
+            error
         } else {
             &self.message
         };
@@ -808,6 +867,12 @@ impl ReviewSession {
         };
         let shortcuts = [
             ("[Esc]", "Review", self.editing, true),
+            (
+                "[v]",
+                "Duplicates",
+                review && self.duplicate_additions.count() > 0,
+                true,
+            ),
             (
                 "[Ctrl-Z]",
                 "Undo",
@@ -999,11 +1064,37 @@ impl ReviewSession {
                 pane_area.content,
                 y,
                 line,
-                &view.syntax,
+                &view.syntax.spans,
                 horizontal,
                 &self.palette,
                 paint,
             );
+            if let Some(link) = self.linked_addition(pane, line.number) {
+                let active = self.active_addition() == Some(link);
+                let style = if active {
+                    self.palette
+                        .accent
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    self.palette.notice
+                };
+                frame.buffer_mut().set_stringn(
+                    pane_area.content.x.saturating_sub(1),
+                    y,
+                    "=",
+                    1,
+                    style,
+                );
+                if active {
+                    for x in pane_area.content.x..pane_area.content.right() {
+                        let cell = &mut frame.buffer_mut()[(x, y)];
+                        cell.set_style(
+                            cell.style()
+                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                        );
+                    }
+                }
+            }
             if row_index == self.aligned_row && pane == self.focus {
                 if let Some(x) = cursor_cell(pane_area.content, Some(line), self.column, horizontal)
                 {
@@ -1094,7 +1185,18 @@ impl ReviewSession {
             .iter()
             .filter(|(left, right)| pane == *left || pane == *right)
             .filter_map(|(left, right)| {
-                band_at(self.change_bands(*left, *right), index, pane == *left)
+                self.action_bands(*left, *right)
+                    .iter()
+                    .find(|band| {
+                        band.kind == ChangeKind::Conflict
+                            && (if pane == *left {
+                                &band.left
+                            } else {
+                                &band.right
+                            })
+                            .contains(&index)
+                    })
+                    .or_else(|| band_at(self.change_bands(*left, *right), index, pane == *left))
             })
             .max_by_key(|band| kind_priority(band.kind))
             .map(|band| {
@@ -1114,7 +1216,21 @@ impl ReviewSession {
             .iter()
             .filter(|(left, right)| pane == *left || pane == *right)
             .filter_map(|(left, right)| {
-                band_in_range(self.change_bands(*left, *right), first, end, pane == *left)
+                self.action_bands(*left, *right)
+                    .iter()
+                    .find(|band| {
+                        let range = if pane == *left {
+                            &band.left
+                        } else {
+                            &band.right
+                        };
+                        band.kind == ChangeKind::Conflict
+                            && range.start < end
+                            && (range.end > first || range.is_empty() && range.start >= first)
+                    })
+                    .or_else(|| {
+                        band_in_range(self.change_bands(*left, *right), first, end, pane == *left)
+                    })
             })
             .max_by_key(|band| kind_priority(band.kind))
             .map(|band| band.kind)
@@ -1182,7 +1298,14 @@ impl ReviewSession {
                 || band.right.start <= right_top.saturating_add(height)
         });
         let bands = &bands[..end];
-        for band in bands {
+        let action_bands = self.action_bands(connector.left, connector.right);
+        let conflicts = action_bands.iter().filter(|band| {
+            band.kind == ChangeKind::Conflict
+                && (band.left.end >= left_top || band.right.end >= right_top)
+                && (band.left.start <= left_top.saturating_add(height)
+                    || band.right.start <= right_top.saturating_add(height))
+        });
+        for band in bands.iter().chain(conflicts) {
             draw_connector_band(
                 frame.buffer_mut(),
                 connector.area,
@@ -1192,7 +1315,6 @@ impl ReviewSession {
                 self.palette.bands[kind_index(band.kind)],
             );
         }
-        let action_bands = self.action_bands(connector.left, connector.right);
         for band in action_bands.iter().rev() {
             for source in [connector.right, connector.left] {
                 if let Some(action) = self.band_action(connector, band, source) {
@@ -1369,6 +1491,18 @@ impl ReviewSession {
                     width,
                 );
             }
+        }
+        if matches!(self.mode, Mode::ThreeWay { .. }) {
+            wrap_help_line(
+                &mut self.help_lines,
+                "=: same added line at different positions in ours/theirs; focus either to highlight its counterpart",
+                width,
+            );
+            wrap_help_line(
+                &mut self.help_lines,
+                "v: review duplicate additions; Tab: inspect other result copy; k: keep this position; b: keep all; Esc: cancel",
+                width,
+            );
         }
         let (left_label, right_label) = match self.mode {
             Mode::TwoWay { .. } => ("Left:", "Right:"),
@@ -1693,7 +1827,7 @@ pub(crate) fn render_line(
     area: Rect,
     y: u16,
     line: &ViewLine,
-    syntax: &[chvrn_core::structural::HighlightSpan],
+    syntax: &[chvrn_core::syntax::HighlightSpan],
     offset: usize,
     palette: &RenderPalette,
     paint: RegionPaint,

@@ -181,6 +181,105 @@ fn conflict_overrides_cover_selected_result_connectors_actions_and_overview() {
     );
 }
 
+fn overlapping_insertion_session(ours: &str, theirs: &str) -> ReviewSession {
+    let mut session = ReviewSession::three_way("head\ntail\n", ours, theirs);
+    session.set_theme(external_theme(
+        r##"
+"ui.background" = { bg = "#101010" }
+"chvrn.rail" = { bg = "#202020" }
+"chvrn.diff.conflict.selected" = { bg = "#aabbcc" }
+"chvrn.diff.conflict.result.selected" = { bg = "#aabbcc" }
+"chvrn.connector.conflict" = { bg = "#778899" }
+"chvrn.action.conflict" = { bg = "#778899" }
+        "##,
+    ));
+    session
+}
+
+#[test]
+fn shared_lines_in_competing_insertions_are_shaded_as_part_of_the_whole_conflict() {
+    use ratatui::style::Color;
+    let short = "head\nαshared\nβshared\ntail\n";
+    let long = "head\nαshared\nβshared\nγextra\ntail\n";
+    for (ours, theirs) in [(long, short), (short, long)] {
+        let session = overlapping_insertion_session(ours, theirs);
+        assert_eq!(session.unresolved_conflicts(), 1);
+        let buffer = draw(&session, 180, 12);
+        let mut shared_lines = 0;
+        for y in 2..8 {
+            for x in 0..buffer.area.width {
+                if matches!(buffer[(x, y)].symbol(), "α" | "β" | "γ") {
+                    shared_lines += usize::from(matches!(buffer[(x, y)].symbol(), "α" | "β"));
+                    assert_eq!(
+                        buffer[(x + 12, y)].bg,
+                        Color::Rgb(170, 187, 204),
+                        "conflict source is unshaded at ({x}, {y}) for {ours:?} / {theirs:?}",
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            shared_lines, 6,
+            "both shared lines must appear in all three panes"
+        );
+    }
+}
+
+#[test]
+fn conflict_connector_edges_cover_the_complete_choices_without_spilling_into_context() {
+    use ratatui::style::Color;
+    let short = "head\nαshared\nβshared\ntail\n";
+    let long = "head\nαshared\nβshared\nγextra\ntail\n";
+    for (ours, theirs, ours_height, theirs_height) in [(long, short, 3, 2), (short, long, 2, 3)] {
+        let session = overlapping_insertion_session(ours, theirs);
+        let buffer = draw(&session, 180, 12);
+        for (symbol, height) in [("»", ours_height), ("«", theirs_height)] {
+            let (x, start) = cell_at(&buffer, symbol);
+            for y in start..start + height {
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    Color::Rgb(119, 136, 153),
+                    "connector does not cover its source choice at ({x}, {y})",
+                );
+            }
+            for y in [start - 1, start + height] {
+                assert_eq!(buffer[(x, y)].bg, Color::Rgb(32, 32, 32));
+                assert!(!matches!(buffer[(x, y)].symbol(), "▀" | "▄"));
+            }
+        }
+    }
+}
+
+#[test]
+fn an_empty_conflict_choice_does_not_shade_the_following_unchanged_line() {
+    let session = ReviewSession::three_way(
+        "head\nbase\ntail\n",
+        "head\ntail\n",
+        "head\nφreplacement\ntail\n",
+    );
+    assert_eq!(session.unresolved_conflicts(), 1);
+    let buffer = draw(&session, 180, 12);
+    let mut unchanged_tails = 0;
+    for y in 2..6 {
+        for x in 0..buffer.area.width {
+            if buffer[(x, y)].symbol() == "t" && buffer[(x + 1, y)].symbol() == "a" {
+                unchanged_tails += 1;
+                assert_eq!(
+                    buffer[(x + 12, y)].bg,
+                    buffer[(x + 12, 2)].bg,
+                    "unchanged tail is painted as a conflict at ({x}, {y})",
+                );
+            }
+        }
+    }
+    assert_eq!(
+        unchanged_tails, 3,
+        "unchanged context must remain in all three panes"
+    );
+    let (x, y) = cell_at(&buffer, "φ");
+    assert_ne!(buffer[(x + 12, y)].bg, buffer[(x + 12, y + 1)].bg);
+}
+
 #[test]
 fn indexed_theme_preserves_terminal_colours_and_default_can_be_restored() {
     use ratatui::style::{Color, Modifier};

@@ -3,11 +3,16 @@ use std::{path::Path, sync::Arc};
 use chvrn_core::{
     TextSnapshot,
     diff::intraline_spans,
-    structural::{HighlightSpan, Language, highlight},
+    syntax::{HighlightSpan, SyntaxCatalog},
     unified::{PatchFile, PatchHunk, PatchLineKind, UnifiedPatch},
 };
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
-use ratatui::{Frame, buffer::Buffer, layout::Rect, style::Style};
+use ratatui::{
+    Frame,
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
@@ -28,9 +33,11 @@ const HELP: &[&str] = &[
     "Left / Right     Scroll horizontally",
     "Home / End       First / last rows of this file",
     "Tab              Switch focused side on narrow screens",
+    "Mouse drag       Select source within one side and supplied hunk",
+    "Ctrl-C           Copy selected source (without gutters or markers)",
     "Mouse wheel      Scroll; click a side to focus it",
     "?                Open / close this help",
-    "q / Esc          Close help, then quit",
+    "q / Esc          Close help; Esc clears selection before quitting",
     "- / +            Removed / added source lines",
     "Omitted context is not reconstructed from the patch.",
 ];
@@ -38,6 +45,7 @@ const HELP: &[&str] = &[
 pub struct PagerSession {
     patch: UnifiedPatch,
     palette: RenderPalette,
+    syntax: SyntaxCatalog,
     files: Vec<Option<CachedFile>>,
     file: usize,
     hunk: usize,
@@ -48,6 +56,11 @@ pub struct PagerSession {
     help: bool,
     help_top: usize,
     help_lines: Vec<ViewLine>,
+    selection: Option<Selection>,
+    selection_style: Style,
+    dragging: bool,
+    copy_request: Option<String>,
+    message: Option<ViewLine>,
 }
 
 struct CachedFile {
@@ -56,6 +69,7 @@ struct CachedFile {
     hunks: Vec<CachedHunk>,
     gutter: u16,
     width: usize,
+    syntax_error: Option<String>,
 }
 
 struct CachedHunk {
@@ -72,6 +86,27 @@ enum Row {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SourcePoint {
+    row: usize,
+    byte: usize,
+    cells: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Selection {
+    side: usize,
+    hunk: usize,
+    anchor: SourcePoint,
+    head: SourcePoint,
+}
+
+impl Selection {
+    fn bounds(self) -> (SourcePoint, SourcePoint) {
+        (self.anchor.min(self.head), self.anchor.max(self.head))
+    }
+}
+
 impl PagerSession {
     pub fn new(patch: UnifiedPatch, theme: Arc<Theme>) -> Self {
         let palette = RenderPalette::compile(&theme);
@@ -81,9 +116,17 @@ impl PagerSession {
             palette
         };
         let files = (0..patch.files.len()).map(|_| None).collect();
+        let (syntax, message) = match SyntaxCatalog::configured() {
+            Ok(syntax) => (syntax, None),
+            Err(error) => (
+                SyntaxCatalog::bundled(),
+                Some(label(format!("Custom syntax unavailable: {error}"))),
+            ),
+        };
         let mut session = Self {
             patch,
             palette,
+            syntax,
             files,
             file: 0,
             hunk: 0,
@@ -94,6 +137,17 @@ impl PagerSession {
             help: false,
             help_top: 0,
             help_lines: HELP.iter().map(|line| label(line.to_string())).collect(),
+            selection: None,
+            selection_style: if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+                || theme.style("ui.selection") == Style::default()
+            {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                theme.style("ui.selection")
+            },
+            dragging: false,
+            copy_request: None,
+            message,
         };
         session.prepare_file();
         session
@@ -102,13 +156,245 @@ impl PagerSession {
     fn prepare_file(&mut self) {
         if let Some(cache) = self.files.get_mut(self.file) {
             if cache.is_none() {
-                *cache = Some(CachedFile::new(&self.patch, &self.patch.files[self.file]));
+                *cache = Some(CachedFile::new(
+                    &self.patch,
+                    &self.patch.files[self.file],
+                    &self.syntax,
+                ));
             }
+        }
+        if let Some(error) = self
+            .current()
+            .and_then(|file| file.syntax_error.as_ref())
+            .cloned()
+        {
+            self.set_message(error);
         }
     }
 
     fn current(&self) -> Option<&CachedFile> {
         self.files.get(self.file)?.as_ref()
+    }
+
+    pub fn take_copy_request(&mut self) -> Option<String> {
+        self.copy_request.take()
+    }
+
+    pub fn set_message(&mut self, message: impl Into<String>) {
+        self.message = Some(label(message.into()));
+    }
+
+    fn pane_area(&self, side: usize) -> Rect {
+        if self.viewport.width < 80 {
+            return self.viewport;
+        }
+        let split = self.viewport.width / 2;
+        if side == 0 {
+            Rect::new(
+                self.viewport.x,
+                self.viewport.y,
+                split - 1,
+                self.viewport.height,
+            )
+        } else {
+            Rect::new(
+                self.viewport.x + split,
+                self.viewport.y,
+                self.viewport.width - split,
+                self.viewport.height,
+            )
+        }
+    }
+
+    fn point_at_column(
+        &self,
+        line: &ViewLine,
+        side: usize,
+        row: usize,
+        column: u16,
+    ) -> SourcePoint {
+        let pane = self.pane_area(side);
+        let gutter = self
+            .current()
+            .map_or(0, |file| file.gutter)
+            .min(pane.width.saturating_sub(1));
+        let x = pane.x + gutter;
+        let target = self.horizontal + usize::from(column.clamp(x, pane.right()).saturating_sub(x));
+        let stop = line.stop_at_cell(target);
+        let mut cells = stop.cells;
+        for (byte, grapheme) in line.text[stop.byte..].grapheme_indices(true) {
+            let width = text::display_cell_width(grapheme, cells);
+            if cells + width > target {
+                return SourcePoint {
+                    row,
+                    byte: stop.byte + byte,
+                    cells,
+                };
+            }
+            cells += width;
+        }
+        SourcePoint {
+            row,
+            byte: line.text.len(),
+            cells,
+        }
+    }
+
+    fn start_selection(&mut self, column: u16, y: u16) {
+        self.selection = None;
+        self.dragging = false;
+        self.message = None;
+        if column < self.viewport.x
+            || column >= self.viewport.right()
+            || y < self.viewport.y
+            || y >= self.viewport.bottom()
+        {
+            return;
+        }
+        if self.viewport.width >= 80 {
+            self.focused = usize::from(column >= self.viewport.x + self.viewport.width / 2);
+        }
+        let row = self.top + usize::from(y - self.viewport.y);
+        let Some(Row::Source { sides, hunk, .. }) =
+            self.current().and_then(|file| file.rows.get(row))
+        else {
+            return;
+        };
+        let Some(line) = &sides[self.focused] else {
+            return;
+        };
+        let point = self.point_at_column(line, self.focused, row, column);
+        self.selection = Some(Selection {
+            side: self.focused,
+            hunk: *hunk,
+            anchor: point,
+            head: point,
+        });
+        self.dragging = true;
+    }
+
+    fn extend_selection(&mut self, column: u16, y: u16) {
+        if !self.dragging || self.viewport.is_empty() {
+            return;
+        }
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let Some(file) = self.current() else {
+            return;
+        };
+        let target = self.top
+            + usize::from(y.clamp(self.viewport.y, self.viewport.bottom() - 1) - self.viewport.y);
+        let start = file.hunks[selection.hunk].row;
+        let end = file
+            .hunks
+            .get(selection.hunk + 1)
+            .map_or(file.rows.len(), |hunk| hunk.row);
+        let nearest = file.rows[start..end]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, row)| match row {
+                Row::Source { sides, hunk, .. } if *hunk == selection.hunk => sides[selection.side]
+                    .as_ref()
+                    .map(|line| (start + offset, line)),
+                _ => None,
+            })
+            .min_by_key(|(row, _)| row.abs_diff(target));
+        let Some((row, line)) = nearest else {
+            return;
+        };
+        let point = if target < row {
+            SourcePoint {
+                row,
+                byte: 0,
+                cells: 0,
+            }
+        } else if target > row {
+            SourcePoint {
+                row,
+                byte: line.text.len(),
+                cells: display_width(&line.text),
+            }
+        } else {
+            self.point_at_column(line, selection.side, row, column)
+        };
+        self.selection = Some(Selection {
+            head: point,
+            ..selection
+        });
+        if target < start || target >= end {
+            self.set_message("Selection is limited to the starting supplied hunk");
+        }
+    }
+
+    fn selected_source(&self) -> Option<String> {
+        let selection = self.selection?;
+        let (start, end) = selection.bounds();
+        if start == end {
+            return None;
+        }
+        let file = self.current()?;
+        let mut source = String::new();
+        let mut first = true;
+        for (offset, row) in file.rows[start.row..=end.row].iter().enumerate() {
+            let Row::Source { sides, hunk, .. } = row else {
+                continue;
+            };
+            if *hunk != selection.hunk {
+                return None;
+            }
+            let Some(line) = &sides[selection.side] else {
+                continue;
+            };
+            if !first {
+                source.push('\n');
+            }
+            first = false;
+            let row = start.row + offset;
+            let from = if row == start.row { start.byte } else { 0 };
+            let to = if row == end.row {
+                end.byte
+            } else {
+                line.text.len()
+            };
+            source.push_str(&line.text[from..to]);
+        }
+        (!source.is_empty()).then_some(source)
+    }
+
+    fn paint_selection(
+        &self,
+        buffer: &mut Buffer,
+        area: Rect,
+        line: &ViewLine,
+        side: usize,
+        row: usize,
+    ) {
+        let Some(selection) = self.selection.filter(|selection| selection.side == side) else {
+            return;
+        };
+        let (start, end) = selection.bounds();
+        if row < start.row || row > end.row {
+            return;
+        }
+        let from = if row == start.row { start.cells } else { 0 };
+        let to = if row == end.row {
+            end.cells
+        } else {
+            display_width(&line.text) + 1
+        };
+        let left = from
+            .saturating_sub(self.horizontal)
+            .min(usize::from(area.width));
+        let right = to
+            .saturating_sub(self.horizontal)
+            .min(usize::from(area.width));
+        if right > left {
+            buffer.set_style(
+                Rect::new(area.x + left as u16, area.y, (right - left) as u16, 1),
+                self.selection_style,
+            );
+        }
     }
 
     pub fn handle(&mut self, event: Event) -> bool {
@@ -124,6 +410,11 @@ impl PagerSession {
                 if !control && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                     if self.help {
                         self.help = false;
+                        return false;
+                    }
+                    if key.code == KeyCode::Esc && self.selection.take().is_some() {
+                        self.dragging = false;
+                        self.message = None;
                         return false;
                     }
                     return true;
@@ -150,6 +441,12 @@ impl PagerSession {
                     return false;
                 }
                 match (key.code, control) {
+                    (KeyCode::Char('c'), true) => {
+                        self.copy_request = self.selected_source();
+                        if self.copy_request.is_none() {
+                            self.set_message("Drag over source text to select it first");
+                        }
+                    }
                     (KeyCode::Char('n'), true) => self.move_file(true),
                     (KeyCode::Char('p'), true) => self.move_file(false),
                     (KeyCode::Char(']'), false) => self.move_hunk(true),
@@ -181,7 +478,11 @@ impl PagerSession {
                             .map_or(0, |file| file.width.saturating_sub(1));
                         self.horizontal = self.horizontal.saturating_add(1).min(max);
                     }
-                    (KeyCode::Tab | KeyCode::BackTab, false) => self.focused = 1 - self.focused,
+                    (KeyCode::Tab | KeyCode::BackTab, false) => {
+                        self.focused = 1 - self.focused;
+                        self.selection = None;
+                        self.dragging = false;
+                    }
                     _ => {}
                 }
             }
@@ -205,10 +506,15 @@ impl PagerSession {
                                 .map_or(0, |file| file.width.saturating_sub(1));
                             self.horizontal = self.horizontal.saturating_add(3).min(max);
                         }
-                        MouseEventKind::Down(MouseButton::Left) if self.viewport.width >= 80 => {
-                            self.focused = usize::from(
-                                mouse.column >= self.viewport.x + self.viewport.width / 2,
-                            );
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            self.start_selection(mouse.column, mouse.row);
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            self.extend_selection(mouse.column, mouse.row);
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            self.extend_selection(mouse.column, mouse.row);
+                            self.dragging = false;
                         }
                         _ => {}
                     }
@@ -243,6 +549,10 @@ impl PagerSession {
         };
         if target != self.file {
             self.file = target;
+            self.selection = None;
+            self.dragging = false;
+            self.copy_request = None;
+            self.message = None;
             self.hunk = 0;
             self.top = 0;
             self.horizontal = 0;
@@ -480,6 +790,7 @@ impl PagerSession {
                             &self.palette,
                             paint,
                         );
+                        self.paint_selection(buffer, content, line, side, self.top + offset);
                     }
                 }
             }
@@ -490,19 +801,31 @@ impl PagerSession {
         if area.height >= 3 {
             let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
             buffer.set_style(footer, self.palette.heading);
-            buffer.set_stringn(
-                footer.x,
-                footer.y,
-                "Ctrl-N/P files  [/] hunks  arrows scroll  Tab side  ? help  q quit",
-                usize::from(footer.width),
-                self.palette.quiet,
-            );
+            if let Some(message) = &self.message {
+                paint_label(
+                    buffer,
+                    footer,
+                    footer.y,
+                    message,
+                    0,
+                    &self.palette,
+                    self.palette.quiet,
+                );
+            } else {
+                buffer.set_stringn(
+                    footer.x,
+                    footer.y,
+                    "Drag select  Ctrl-C copy  Ctrl-N/P files  [/] hunks  ? help  q quit",
+                    usize::from(footer.width),
+                    self.palette.quiet,
+                );
+            }
         }
     }
 }
 
 impl CachedFile {
-    fn new(patch: &UnifiedPatch, file: &PatchFile) -> Self {
+    fn new(patch: &UnifiedPatch, file: &PatchFile, catalog: &SyntaxCatalog) -> Self {
         let titles = [
             label(format!(
                 "OLD  {}",
@@ -528,8 +851,16 @@ impl CachedFile {
                 "Binary file change (contents not shown)".into(),
             )));
         }
-        let languages = [file.old_path.as_deref(), file.new_path.as_deref()]
-            .map(|path| path.and_then(|path| Language::for_path(Path::new(path))));
+        let paths =
+            [file.old_path.as_deref(), file.new_path.as_deref()].map(|path| path.map(Path::new));
+        let first_lines = std::array::from_fn(|side| {
+            file.hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .find(|line| [line.old_number, line.new_number][side] == Some(1))
+                .map(|line| patch.text(&line.text))
+        });
+        let mut syntax_error = None;
         let mut hunks = Vec::with_capacity(file.hunks.len());
         let mut previous = [0usize; 2];
         let mut largest = 1usize;
@@ -561,7 +892,11 @@ impl CachedFile {
             );
             let row = rows.len();
             rows.push(Row::Notice(label(header)));
-            let syntax = append_hunk(patch, hunk, index, languages, &mut rows);
+            let (syntax, error) =
+                append_hunk(patch, hunk, index, paths, first_lines, catalog, &mut rows);
+            if syntax_error.is_none() {
+                syntax_error = error;
+            }
             hunks.push(CachedHunk { row, syntax });
             previous = [
                 starts[0].saturating_add(hunk.old_count),
@@ -596,6 +931,7 @@ impl CachedFile {
             hunks,
             gutter: (largest.ilog10() + 3) as u16,
             width,
+            syntax_error,
         }
     }
 }
@@ -604,9 +940,11 @@ fn append_hunk(
     patch: &UnifiedPatch,
     hunk: &PatchHunk,
     index: usize,
-    languages: [Option<Language>; 2],
+    paths: [Option<&Path>; 2],
+    first_lines: [Option<&str>; 2],
+    catalog: &SyntaxCatalog,
     rows: &mut Vec<Row>,
-) -> [Vec<HighlightSpan>; 2] {
+) -> ([Vec<HighlightSpan>; 2], Option<String>) {
     let mut sources = [String::new(), String::new()];
     let mut removed = Vec::new();
     let mut added = Vec::new();
@@ -644,15 +982,33 @@ fn append_hunk(
         }
     }
     flush_changes(&mut removed, &mut added, index, rows);
-    std::array::from_fn(|side| {
-        if languages[side].is_none() {
+    let mut error = None;
+    let syntax = std::array::from_fn(|side| {
+        let Some(path) = paths[side] else {
             return Vec::new();
+        };
+        let source = match TextSnapshot::from_bytes(sources[side].as_bytes()) {
+            Ok(source) => source,
+            Err(cause) => {
+                error = Some(format!(
+                    "Syntax unavailable for {}: {cause:?}",
+                    path.display()
+                ));
+                return Vec::new();
+            }
+        };
+        match catalog.highlight_fragment(path, first_lines[side], &source) {
+            Ok(spans) => spans,
+            Err(cause) => {
+                error = Some(format!(
+                    "Syntax unavailable for {}: {cause}",
+                    path.display()
+                ));
+                Vec::new()
+            }
         }
-        TextSnapshot::from_bytes(sources[side].as_bytes())
-            .ok()
-            .and_then(|source| highlight(languages[side], &source).ok())
-            .unwrap_or_default()
-    })
+    });
+    (syntax, error)
 }
 
 fn source_line(number: Option<usize>, value: &str, source: &mut String) -> Option<ViewLine> {

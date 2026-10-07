@@ -1,4 +1,5 @@
 mod bundled_themes;
+mod duplicate_additions;
 mod input;
 mod merge_advice;
 mod pager;

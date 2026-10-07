@@ -155,10 +155,10 @@ impl ReviewSession {
             right_syntax,
             ..
         } = completion;
-        let (left_language, right_language, left_read_only, right_read_only) = match &self.mode {
+        let (left_source, right_source, left_read_only, right_read_only) = match &self.mode {
             Mode::TwoWay { left, right, .. } => (
-                left.language,
-                right.language,
+                left.syntax_source.clone(),
+                right.syntax_source.clone(),
                 left.read_only,
                 right.read_only,
             ),
@@ -166,8 +166,8 @@ impl ReviewSession {
         };
         let mut left = TextPane::new(left, left_read_only);
         let mut right = TextPane::new(right, right_read_only);
-        left.language = left_language;
-        right.language = right_language;
+        left.syntax_source = left_source;
+        right.syntax_source = right_source;
         left.syntax = left_syntax;
         right.syntax = right_syntax;
         let has_hunk = !diff.hunks().is_empty();
@@ -193,6 +193,10 @@ impl ReviewSession {
     }
 
     fn handle_key(&mut self, event: KeyEvent) -> ReviewOutcome {
+        if self.duplicate_additions.review.is_some() {
+            self.handle_duplicate_key(event);
+            return ReviewOutcome::Continue;
+        }
         if self.merge_advice.dialog.is_some() {
             return self.handle_merge_advice_key(event);
         }
@@ -289,6 +293,7 @@ impl ReviewSession {
             }
             KeyCode::Char('i') => self.enter_edit(),
             KeyCode::Char('a') => self.apply_hunk(),
+            KeyCode::Char('v') => self.review_duplicate_addition(),
             KeyCode::Char('u') => self.undo(),
             KeyCode::Char(']') => self.select_hunk(true),
             KeyCode::Char('[') => self.select_hunk(false),
@@ -321,6 +326,61 @@ impl ReviewSession {
             _ => {}
         }
         ReviewOutcome::Continue
+    }
+
+    fn handle_duplicate_key(&mut self, event: KeyEvent) {
+        if event.kind != KeyEventKind::Press || !event.modifiers.is_empty() {
+            return;
+        }
+        let Some((index, occurrence)) = self.duplicate_additions.review else {
+            return;
+        };
+        match event.code {
+            KeyCode::Esc | KeyCode::Char('b') => self.duplicate_additions.review = None,
+            KeyCode::Tab => {
+                let link = &self.duplicate_additions.links[index];
+                let next = (occurrence + 1) % link.result.len();
+                let line = link.result[next];
+                self.go_to(Pane::Result, line, 0);
+                self.duplicate_additions.review = Some((index, next));
+            }
+            KeyCode::Char('k') => {
+                let positions = self.duplicate_additions.links[index].result.clone();
+                let source = self.pane(Pane::Result).snapshot.text();
+                let removed: Vec<_> = positions
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| *position != occurrence)
+                    .map(|(_, &line)| text::line_range_chars(source, line..line + 1))
+                    .collect();
+                let Some(first) = removed.first() else { return };
+                let range = first.start..removed.last().expect("removed range exists").end;
+                let mut replacement = String::new();
+                let mut previous_end = range.start;
+                for removed in &removed {
+                    replacement.push_str(text::slice_chars(source, previous_end..removed.start));
+                    previous_end = removed.end;
+                }
+                let previous = self.merge_metadata();
+                self.duplicate_additions.review = None;
+                if self
+                    .pane_mut(Pane::Result)
+                    .buffer
+                    .replace(range, &replacement)
+                    .is_err()
+                {
+                    self.message = "Cannot remove the duplicate addition".to_owned();
+                    return;
+                }
+                self.record_merge_edit(previous);
+                self.record_action(Pane::Result, true);
+                for range in removed.into_iter().rev() {
+                    self.adjust_merge_regions(Pane::Result, range, 0, true, None);
+                }
+                self.refresh_after_edit(Pane::Result);
+            }
+            _ => {}
+        }
     }
 
     fn handle_edit_key(&mut self, event: KeyEvent) -> ReviewOutcome {

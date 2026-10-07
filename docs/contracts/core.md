@@ -179,11 +179,6 @@ pub mod structural {
     impl StructuralDiff { pub fn changes(&self) -> &[StructuralChange]; }
     #[derive(Debug, PartialEq, Eq)]
     pub enum StructuralError { UnsupportedLanguage, ParseFailure }
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum HighlightKind { Keyword, Identifier, String, Number, Comment, Type, Function, Punctuation }
-    pub struct HighlightSpan { pub bytes: Range<usize>, pub kind: HighlightKind }
-    pub fn highlight(language: Option<Language>, text: &TextSnapshot)
-        -> Result<Vec<HighlightSpan>, StructuralError>;
     pub struct StructuralAnalysis;
     impl StructuralAnalysis {
         pub fn compare(language: Option<Language>, before: &TextSnapshot, after: &TextSnapshot)
@@ -192,7 +187,15 @@ pub mod structural {
 }
 ```
 
-Explicit grammar registration maps `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py` and `.json` to real Tree-sitter grammars. Other paths return `None` and ordinary textual diff/edit remains available; structural comparison or highlighting with `None` returns `UnsupportedLanguage`. `highlight` runs compiled Tree-sitter grammar queries and returns byte ranges into the original snapshot; callers convert them to grapheme and terminal-cell positions. Structural comparison parses actual syntax trees rather than a fake parser or line-only heuristic. Changed byte locations in `before` and `after` refer to their respective snapshots. A moved unchanged named syntax unit is `Move`; a syntax unit with unchanged token stream but changed layout is `Reflow`; changing only a declaration's name with unchanged body is `Renamed`; changing a call target or other token content is `ChangedTokens`. A changed literal must not be called a rename, move or reflow. Changes are reported at the affected top-level syntax-unit level, without nested duplicate records for the same edit. Structure is informational and never authorises a byte-inexact hunk application.
+Explicit grammar registration maps `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py` and `.json` to real Tree-sitter grammars. Other paths return `None`; structural comparison with `None` returns `UnsupportedLanguage`. Ordinary textual diff/edit remains available. Structural comparison parses actual syntax trees. Changed byte locations refer to their respective snapshots. A moved unchanged named syntax unit is `Move`; a unit with unchanged tokens but changed layout is `Reflow`; changing only a declaration's name with unchanged body is `Renamed`; changing a call target or other token content is `ChangedTokens`. Changes are reported at the affected top-level syntax-unit level, without nested duplicate records. Structure is informational and never authorises a byte-inexact hunk application.
+
+## Syntax catalogue
+
+`syntax::SyntaxCatalog` is a cloneable, shared immutable Syntect catalogue. `bundled()` loads two-face's offline definitions; `configured()` discovers the user syntax directory; `with_custom_syntaxes(&Path)` extends the bundle with `.sublime-syntax` files. Errors retain the relevant path.
+
+`highlight(&Path, &TextSnapshot)` returns `Result<Vec<HighlightSpan>, SyntaxError>`. `HighlightSpan { bytes: Range<usize>, kind: HighlightKind }` uses original UTF-8 byte offsets. Kinds are `Keyword`, `Identifier`, `String`, `Number`, `Comment`, `Type`, `Function` and `Punctuation`. Filename/extension precedes recognised shebang detection. Unknown syntax yields no spans.
+
+`highlight_fragment(&Path, Option<&str>, &TextSnapshot)` accepts the actual source first line separately, so a sparse hunk cannot masquerade as a file header. Each call starts fresh parser/scope state; state is preserved between lines within one snapshot but cannot leak between documents. Highlighting is independent of structural analysis.
 
 ## Merge advice data
 
@@ -207,4 +210,4 @@ These values do not grant mutation authority. The TUI binds a request to a parti
 
 ## Dependencies proposed for implementation
 
-Runtime: `ropey` 1.6, `similar` 2.7 for Myers fallback and intraline matching, `tree-sitter` 0.25, compatible `tree-sitter-rust`, `tree-sitter-typescript` (TypeScript and TSX), `tree-sitter-javascript` (JS and JSX), `tree-sitter-python`, `tree-sitter-json`, and `unicode-segmentation` 1 for grapheme-safe intraline coalescing. `std` suffices for all core integration tests: no test-only dependencies. The coordinator owns manifest versions and verification.
+Runtime includes `ropey` 1.6, `similar` 2.7, `tree-sitter` 0.25 and the registered language grammars, `unicode-segmentation`, Syntect 5.3.0 and two-face 0.5.2+bat-0.26.1. Syntect uses the pure-Rust regex backend. Tests use `tempfile` for isolated custom syntax definitions.

@@ -1,9 +1,7 @@
 use std::path::Path;
 
 use chvrn_core::TextSnapshot;
-use chvrn_core::structural::{
-    HighlightKind, Language, StructuralAnalysis, StructuralChangeKind, StructuralError, highlight,
-};
+use chvrn_core::structural::{Language, StructuralAnalysis, StructuralChangeKind, StructuralError};
 
 fn snapshot(text: &str) -> TextSnapshot {
     TextSnapshot::from_bytes(text.as_bytes()).unwrap()
@@ -184,50 +182,4 @@ fn unregistered_text_retains_textual_diff_but_has_no_structural_parser() {
     ));
     assert_eq!(before.as_bytes(), b"before\n");
     assert_eq!(after.as_bytes(), b"after\n");
-}
-
-#[test]
-fn grammar_highlights_identifiers_and_literals_at_original_byte_ranges() {
-    let rust = snapshot("fn value() -> i32 { 42 }\n");
-    let rust_spans = highlight(Some(Language::Rust), &rust).unwrap();
-    assert!(
-        rust_spans
-            .iter()
-            .any(|span| span.bytes == (3..8) && span.kind == HighlightKind::Function)
-    );
-    assert!(
-        rust_spans
-            .iter()
-            .any(|span| span.bytes == (20..22) && span.kind == HighlightKind::Number)
-    );
-
-    let json = snapshot("{\"value\": 2}");
-    let json_spans = highlight(Some(Language::Json), &json).unwrap();
-    assert!(
-        json_spans
-            .iter()
-            .any(|span| span.bytes == (1..8) && span.kind == HighlightKind::String)
-    );
-    assert!(
-        json_spans
-            .iter()
-            .any(|span| span.bytes == (10..11) && span.kind == HighlightKind::Number)
-    );
-}
-
-#[test]
-fn grammar_queries_highlight_language_keywords_not_just_identifiers() {
-    for (language, source, bytes) in [
-        (Language::Rust, "fn value() {}\n", 0..2),
-        (Language::TypeScript, "const value = 1;\n", 0..5),
-        (Language::Python, "def value():\n    return 1\n", 0..3),
-    ] {
-        let snapshot = snapshot(source);
-        let spans = highlight(Some(language), &snapshot).unwrap();
-        assert!(
-            spans
-                .iter()
-                .any(|span| span.bytes == bytes && span.kind == HighlightKind::Keyword)
-        );
-    }
 }

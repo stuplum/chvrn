@@ -36,3 +36,5 @@ Early development. Tested interactively on macOS arm64. [Current limitations.](d
 [GPLv3 only](LICENSE). Copyright (c) 2026 Stuart Plumbley.
 
 Bundled Helix theme adaptations retain MPL-2.0 and their original-project notices. [Theme sources, licences and attribution](crates/chvrn-tui/themes/ATTRIBUTION.txt).
+
+Syntax definitions are bundled through [two-face](https://docs.rs/two-face/0.5.2/two_face/), whose [acknowledgements](https://docs.rs/two-face/0.5.2/two_face/acknowledgement/index.html) retain the individual syntax licences and attribution.

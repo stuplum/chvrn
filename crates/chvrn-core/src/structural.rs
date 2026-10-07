@@ -1,8 +1,7 @@
 use std::ops::Range;
 use std::path::Path;
-use std::sync::LazyLock;
 
-use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::TextSnapshot;
 
@@ -41,63 +40,6 @@ impl Language {
             Self::Json => tree_sitter_json::LANGUAGE.into(),
         }
     }
-
-    fn highlight_query(self) -> &'static str {
-        match self {
-            Self::Rust => {
-                "(function_item name: (identifier) @function) (integer_literal) @number (string_literal) @string (line_comment) @comment (type_identifier) @type \"fn\" @keyword \"let\" @keyword \"pub\" @keyword \"impl\" @keyword \"struct\" @keyword \"return\" @keyword"
-            }
-            Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Jsx => {
-                "(identifier) @identifier (string) @string (number) @number (comment) @comment \"const\" @keyword \"function\" @keyword \"return\" @keyword"
-            }
-            Self::Python => {
-                "(identifier) @identifier (integer) @number (string) @string (comment) @comment \"def\" @keyword \"return\" @keyword \"class\" @keyword"
-            }
-            Self::Json => "(string) @string (number) @number",
-        }
-    }
-
-    fn compiled_query(self) -> Result<&'static Query, StructuralError> {
-        static RUST: LazyLock<Option<Query>> = LazyLock::new(|| {
-            Query::new(&Language::Rust.grammar(), Language::Rust.highlight_query()).ok()
-        });
-        static TYPESCRIPT: LazyLock<Option<Query>> = LazyLock::new(|| {
-            Query::new(
-                &Language::TypeScript.grammar(),
-                Language::TypeScript.highlight_query(),
-            )
-            .ok()
-        });
-        static TSX: LazyLock<Option<Query>> = LazyLock::new(|| {
-            Query::new(&Language::Tsx.grammar(), Language::Tsx.highlight_query()).ok()
-        });
-        static JAVASCRIPT: LazyLock<Option<Query>> = LazyLock::new(|| {
-            Query::new(
-                &Language::JavaScript.grammar(),
-                Language::JavaScript.highlight_query(),
-            )
-            .ok()
-        });
-        static PYTHON: LazyLock<Option<Query>> = LazyLock::new(|| {
-            Query::new(
-                &Language::Python.grammar(),
-                Language::Python.highlight_query(),
-            )
-            .ok()
-        });
-        static JSON: LazyLock<Option<Query>> = LazyLock::new(|| {
-            Query::new(&Language::Json.grammar(), Language::Json.highlight_query()).ok()
-        });
-        let slot = match self {
-            Self::Rust => &RUST,
-            Self::TypeScript => &TYPESCRIPT,
-            Self::Tsx => &TSX,
-            Self::JavaScript | Self::Jsx => &JAVASCRIPT,
-            Self::Python => &PYTHON,
-            Self::Json => &JSON,
-        };
-        slot.as_ref().ok_or(StructuralError::ParseFailure)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,23 +70,6 @@ impl StructuralDiff {
 pub enum StructuralError {
     UnsupportedLanguage,
     ParseFailure,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HighlightKind {
-    Keyword,
-    Identifier,
-    String,
-    Number,
-    Comment,
-    Type,
-    Function,
-    Punctuation,
-}
-
-pub struct HighlightSpan {
-    pub bytes: Range<usize>,
-    pub kind: HighlightKind,
 }
 
 pub struct StructuralAnalysis;
@@ -390,45 +315,4 @@ impl StructuralAnalysis {
         }
         Ok(StructuralDiff { changes })
     }
-}
-
-pub fn highlight(
-    language: Option<Language>,
-    text: &TextSnapshot,
-) -> Result<Vec<HighlightSpan>, StructuralError> {
-    let language = language.ok_or(StructuralError::UnsupportedLanguage)?;
-    let tree = parse(language, text)?;
-    let query = language.compiled_query()?;
-    let mut cursor = QueryCursor::new();
-    let mut captures = cursor.captures(query, tree.root_node(), text.as_bytes());
-    let mut spans = Vec::new();
-    while let Some((matched, capture_index)) = captures.next() {
-        let capture = matched.captures[*capture_index];
-        let kind = match query.capture_names()[capture.index as usize] {
-            "keyword" => HighlightKind::Keyword,
-            "identifier" => HighlightKind::Identifier,
-            "string" => HighlightKind::String,
-            "number" => HighlightKind::Number,
-            "comment" => HighlightKind::Comment,
-            "type" => HighlightKind::Type,
-            "function" => HighlightKind::Function,
-            _ => HighlightKind::Punctuation,
-        };
-        spans.push(HighlightSpan {
-            bytes: capture.node.byte_range(),
-            kind,
-        });
-    }
-    spans.sort_by_key(|span| (span.bytes.start, span.bytes.end));
-    spans.dedup_by(|current, previous| {
-        if current.bytes == previous.bytes {
-            if current.kind == HighlightKind::Function {
-                previous.kind = HighlightKind::Function;
-            }
-            true
-        } else {
-            false
-        }
-    });
-    Ok(spans)
 }

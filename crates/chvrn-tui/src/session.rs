@@ -3,7 +3,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
 };
@@ -13,19 +13,51 @@ use chvrn_core::{
     diff::{AlignedRow, Diff, Hunk, RenderedLine, WhitespacePolicy, intraline_spans},
     edit::{CapturedText, TextBuffer},
     merge::{ConflictId, ConflictResolution, Merge},
-    structural::{HighlightSpan, Language, highlight},
+    syntax::{HighlightSpan, SyntaxCatalog},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{Cursor, Pane, ReviewOutcome, ReviewSubmission, Theme, render::RenderPalette, text};
+
+#[derive(Clone, Default)]
+pub(crate) struct SyntaxSource {
+    pub(crate) path: PathBuf,
+}
+
+#[derive(Default)]
+pub(crate) struct SyntaxPaint {
+    pub(crate) spans: Vec<HighlightSpan>,
+    pub(crate) error: Option<String>,
+}
+
+impl SyntaxSource {
+    fn highlight(&self, snapshot: &TextSnapshot) -> SyntaxPaint {
+        static CATALOGUE: LazyLock<Result<SyntaxCatalog, String>> =
+            LazyLock::new(|| SyntaxCatalog::configured().map_err(|error| error.to_string()));
+        match CATALOGUE
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|catalogue| {
+                catalogue
+                    .highlight(&self.path, snapshot)
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(spans) => SyntaxPaint { spans, error: None },
+            Err(error) => SyntaxPaint {
+                spans: Vec::new(),
+                error: Some(error),
+            },
+        }
+    }
+}
 
 pub struct DiffRequest {
     generation: u64,
     left: TextSnapshot,
     right: TextSnapshot,
     policy: WhitespacePolicy,
-    left_language: Option<Language>,
-    right_language: Option<Language>,
+    left_source: SyntaxSource,
+    right_source: SyntaxSource,
 }
 
 pub struct DiffCompletion {
@@ -34,10 +66,10 @@ pub struct DiffCompletion {
     pub(crate) right: TextSnapshot,
     pub(crate) diff: Diff,
     pub(crate) policy: WhitespacePolicy,
-    pub(crate) left_syntax: Vec<HighlightSpan>,
+    pub(crate) left_syntax: SyntaxPaint,
     pub(crate) rows: Vec<ViewRow>,
     pub(crate) projection: [PaneProjection; 5],
-    pub(crate) right_syntax: Vec<HighlightSpan>,
+    pub(crate) right_syntax: SyntaxPaint,
 }
 
 impl DiffRequest {
@@ -50,14 +82,8 @@ impl DiffRequest {
         let diff = Diff::between(&left, &right, self.policy);
         let rows = two_way_rows(&diff, &left, &right);
         let projection = two_way_projection(&rows, &diff);
-        let left_syntax = self
-            .left_language
-            .and_then(|language| highlight(Some(language), &left).ok())
-            .unwrap_or_default();
-        let right_syntax = self
-            .right_language
-            .and_then(|language| highlight(Some(language), &right).ok())
-            .unwrap_or_default();
+        let left_syntax = self.left_source.highlight(&left);
+        let right_syntax = self.right_source.highlight(&right);
         DiffCompletion {
             generation: self.generation,
             left,
@@ -86,8 +112,8 @@ enum LocalWork {
         left: CapturedText,
         right: CapturedText,
         policy: WhitespacePolicy,
-        left_language: Option<Language>,
-        right_language: Option<Language>,
+        left_source: SyntaxSource,
+        right_source: SyntaxSource,
     },
     ThreeWay {
         generation: u64,
@@ -97,7 +123,7 @@ enum LocalWork {
         conflicts: Vec<ConflictRegion>,
         resolved: Vec<ResolvedConflict>,
         policy: WhitespacePolicy,
-        languages: [Option<Language>; 3],
+        sources: [SyntaxSource; 3],
     },
 }
 
@@ -109,7 +135,7 @@ enum LocalComputed {
         theirs: TextSnapshot,
         rows: Vec<ViewRow>,
         projection: [PaneProjection; 5],
-        syntax: [Vec<HighlightSpan>; 3],
+        syntax: [SyntaxPaint; 3],
     },
 }
 
@@ -126,16 +152,16 @@ impl LocalWork {
                 left,
                 right,
                 policy,
-                left_language,
-                right_language,
+                left_source,
+                right_source,
             } => {
                 let request = DiffRequest {
                     generation,
                     left: left.snapshot(),
                     right: right.snapshot(),
                     policy,
-                    left_language,
-                    right_language,
+                    left_source,
+                    right_source,
                 };
                 LocalResult {
                     generation,
@@ -150,7 +176,7 @@ impl LocalWork {
                 conflicts,
                 resolved,
                 policy,
-                languages,
+                sources,
             } => {
                 let ours = ours.snapshot();
                 let result = result.snapshot();
@@ -170,16 +196,12 @@ impl LocalWork {
                     left_actions,
                     right_actions,
                 );
+                let [ours_source, result_source, theirs_source] = sources;
                 let syntax = [
-                    (&ours, languages[0]),
-                    (&result, languages[1]),
-                    (&theirs, languages[2]),
-                ]
-                .map(|(snapshot, language)| {
-                    language
-                        .and_then(|language| highlight(Some(language), snapshot).ok())
-                        .unwrap_or_default()
-                });
+                    ours_source.highlight(&ours),
+                    result_source.highlight(&result),
+                    theirs_source.highlight(&theirs),
+                ];
                 LocalResult {
                     generation,
                     computed: LocalComputed::ThreeWay {
@@ -245,8 +267,8 @@ impl LocalWorker {
 pub(crate) struct TextPane {
     pub(crate) buffer: TextBuffer,
     pub(crate) snapshot: TextSnapshot,
-    pub(crate) syntax: Vec<HighlightSpan>,
-    pub(crate) language: Option<Language>,
+    pub(crate) syntax: SyntaxPaint,
+    pub(crate) syntax_source: SyntaxSource,
     pub(crate) read_only: bool,
 }
 
@@ -255,8 +277,8 @@ impl TextPane {
         Self {
             buffer: TextBuffer::new(snapshot.clone()),
             snapshot,
-            syntax: Vec::new(),
-            language: None,
+            syntax: SyntaxPaint::default(),
+            syntax_source: SyntaxSource::default(),
             read_only,
         }
     }
@@ -267,10 +289,7 @@ impl TextPane {
     }
 
     pub(crate) fn update_syntax(&mut self) {
-        self.syntax = self
-            .language
-            .and_then(|language| highlight(Some(language), &self.snapshot).ok())
-            .unwrap_or_default();
+        self.syntax = self.syntax_source.highlight(&self.snapshot);
     }
 }
 
@@ -501,6 +520,7 @@ pub struct ReviewSession {
     pub(crate) local_pending: bool,
     local_worker: Option<LocalWorker>,
     pub(crate) merge_advice: crate::merge_advice::MergeAdviceState,
+    pub(crate) duplicate_additions: crate::duplicate_additions::DuplicateAdditions,
     theme: Arc<Theme>,
     pub(crate) palette: RenderPalette,
 }
@@ -550,6 +570,7 @@ impl ReviewSession {
             local_pending: false,
             local_worker: None,
             merge_advice: crate::merge_advice::MergeAdviceState::default(),
+            duplicate_additions: crate::duplicate_additions::DuplicateAdditions::default(),
             palette: RenderPalette::compile(&theme),
             theme,
         };
@@ -582,6 +603,8 @@ impl ReviewSession {
             })
             .collect();
         let theme = Arc::new(Theme::default());
+        let duplicate_additions =
+            crate::duplicate_additions::DuplicateAdditions::new(&base, &ours, &theirs);
         let mut session = Self {
             mode: Mode::ThreeWay {
                 base,
@@ -628,6 +651,7 @@ impl ReviewSession {
             local_pending: false,
             local_worker: None,
             merge_advice: crate::merge_advice::MergeAdviceState::default(),
+            duplicate_additions,
             palette: RenderPalette::compile(&theme),
             theme,
         };
@@ -740,8 +764,8 @@ impl ReviewSession {
                 right: rhs,
                 ..
             } => {
-                lhs.language = Language::for_path(left);
-                rhs.language = Language::for_path(right);
+                lhs.syntax_source.path = left.to_path_buf();
+                rhs.syntax_source.path = right.to_path_buf();
                 if !self.local_pending {
                     lhs.update_syntax();
                     rhs.update_syntax();
@@ -753,9 +777,9 @@ impl ReviewSession {
                 theirs,
                 ..
             } => {
-                ours.language = Language::for_path(left);
-                result.language = Language::for_path(right);
-                theirs.language = Language::for_path(right);
+                ours.syntax_source.path = left.to_path_buf();
+                result.syntax_source.path = right.to_path_buf();
+                theirs.syntax_source.path = right.to_path_buf();
                 if !self.local_pending {
                     ours.update_syntax();
                     result.update_syntax();
@@ -819,16 +843,8 @@ impl ReviewSession {
             left,
             right,
             policy: self.whitespace,
-            left_language: if let Mode::TwoWay { left, .. } = &self.mode {
-                left.language
-            } else {
-                None
-            },
-            right_language: if let Mode::TwoWay { right, .. } = &self.mode {
-                right.language
-            } else {
-                None
-            },
+            left_source: self.pane(Pane::Left).syntax_source.clone(),
+            right_source: self.pane(Pane::Right).syntax_source.clone(),
         }
     }
 
@@ -955,6 +971,7 @@ impl ReviewSession {
         };
         self.rows = rows;
         self.projection = projection;
+        self.refresh_duplicate_additions();
         let count = self.hunk_count();
         self.selected = if count == 0 {
             None
@@ -1041,8 +1058,8 @@ impl ReviewSession {
                 left: left.buffer.capture(),
                 right: right.buffer.capture(),
                 policy: self.whitespace,
-                left_language: left.language,
-                right_language: right.language,
+                left_source: left.syntax_source.clone(),
+                right_source: right.syntax_source.clone(),
             },
             Mode::ThreeWay {
                 ours,
@@ -1059,7 +1076,11 @@ impl ReviewSession {
                 conflicts: conflicts.clone(),
                 resolved: resolved.clone(),
                 policy: self.whitespace,
-                languages: [ours.language, result.language, theirs.language],
+                sources: [
+                    ours.syntax_source.clone(),
+                    result.syntax_source.clone(),
+                    theirs.syntax_source.clone(),
+                ],
             },
         };
         self.local_pending = true;
@@ -1128,6 +1149,7 @@ impl ReviewSession {
                 self.projection = projection;
             }
         }
+        self.refresh_duplicate_additions();
         let line = self.aligned_row;
         self.local_pending = false;
         self.selected = if self.hunk_count() == 0 {
@@ -1510,20 +1532,6 @@ fn three_way_rows(
     let mut right_bands = bands_for_diff(&right_diff, false);
     mark_resolved(&mut left_bands, resolved, Pane::Ours);
     mark_resolved(&mut right_bands, resolved, Pane::Theirs);
-    attach_conflicts(
-        &rows,
-        Pane::Ours,
-        Pane::Result,
-        &mut left_bands,
-        conflicts.len(),
-    );
-    attach_conflicts(
-        &rows,
-        Pane::Result,
-        Pane::Theirs,
-        &mut right_bands,
-        conflicts.len(),
-    );
     let (left_actions, right_actions) =
         three_way_action_bands(result.snapshot.text(), conflicts, resolved);
     (rows, left_bands, right_bands, left_actions, right_actions)
@@ -1582,27 +1590,6 @@ fn three_way_projection(
     projections[Pane::Result as usize].actions = right_actions;
     projections[Pane::Theirs as usize].lines = projected_lines(rows, Pane::Theirs);
     projections
-}
-
-fn conflict_range(rows: &[ViewRow], index: usize, pane: Pane) -> Range<usize> {
-    let mut lines = rows
-        .iter()
-        .filter(|row| row.hunk == Some(index))
-        .filter_map(|row| row.line(pane).map(|line| line.number));
-    if let Some(first) = lines.next() {
-        let last = lines.last().unwrap_or(first);
-        return first..last + 1;
-    }
-    let first_row = rows
-        .iter()
-        .position(|row| row.hunk == Some(index))
-        .unwrap_or(rows.len());
-    let preceding = rows[..first_row]
-        .iter()
-        .filter_map(|row| row.line(pane).map(|line| line.number))
-        .next_back();
-    let position = preceding.map_or(0, |line| line + 1);
-    position..position
 }
 
 fn result_line_range(text: &str, chars: &Range<usize>) -> Range<usize> {
@@ -1675,45 +1662,6 @@ fn three_way_action_bands(
     left.sort_by_key(|band| key(band));
     right.sort_by_key(|band| key(band));
     (left, right)
-}
-
-fn attach_conflicts(
-    rows: &[ViewRow],
-    left: Pane,
-    right: Pane,
-    bands: &mut Vec<ChangeBand>,
-    conflict_count: usize,
-) {
-    for index in 0..conflict_count {
-        let left_range = conflict_range(rows, index, left);
-        let right_range = conflict_range(rows, index, right);
-        if let Some(band) = bands.iter_mut().find(|band| {
-            let source = if left == Pane::Result {
-                &band.left
-            } else {
-                &band.right
-            };
-            let conflict = if left == Pane::Result {
-                &left_range
-            } else {
-                &right_range
-            };
-            source.start < conflict.end && conflict.start < source.end
-                || source.is_empty() && source.start == conflict.start
-        }) {
-            band.kind = ChangeKind::Conflict;
-            band.hunk = Some(index);
-        } else {
-            bands.push(ChangeBand {
-                left: left_range,
-                right: right_range,
-                hunk: Some(index),
-                resolved: None,
-                kind: ChangeKind::Conflict,
-            });
-        }
-    }
-    bands.sort_by_key(|band| (band.left.start, band.right.start));
 }
 
 fn mark_resolved(bands: &mut [ChangeBand], resolved: &[ResolvedConflict], source: Pane) {

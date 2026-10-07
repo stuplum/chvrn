@@ -160,6 +160,7 @@ impl ReviewSession {
             || self.confirming_discard
             || self.confirming_merge
             || self.merge_advice.dialog.is_some()
+            || self.duplicate_additions.review.is_some()
     }
 
     pub(crate) fn merge_advice_eligible(&self) -> bool {

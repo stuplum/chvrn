@@ -905,7 +905,21 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::Write;
+
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, contents: impl AsRef<[u8]>) {
+        let mut writer = std::process::Command::new("/bin/sh")
+            .args(["-c", "umask 077; cat > \"$1\" && chmod 700 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let written = writer.stdin.take().unwrap().write_all(contents.as_ref());
+        let status = writer.wait().unwrap();
+        written.unwrap();
+        assert!(status.success());
+    }
 
     #[tokio::test]
     async fn cancellation_during_target_resolution_reaps_the_child() {
@@ -914,8 +928,13 @@ mod tests {
         let binary = dir.path().join("herdr");
         let path = dir.path().join("ready.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        fs::write(&binary, format!("#!/bin/sh\nexec /usr/bin/python3 -c 'import socket,os,time;s=socket.socket(socket.AF_UNIX);s.connect(\"{}\");s.sendall(str(os.getpid()).encode());s.shutdown(socket.SHUT_WR);time.sleep(60)'\n", path.display())).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\nexec /usr/bin/python3 -c 'import socket,os,time;s=socket.socket(socket.AF_UNIX);s.connect(\"{}\");s.sendall(str(os.getpid()).encode());s.shutdown(socket.SHUT_WR);time.sleep(60)'\n",
+                path.display()
+            ),
+        );
         let supervisor = crate::process::ProcessSupervisor::default();
         let process = HerdrProcess {
             binary,
@@ -955,8 +974,13 @@ mod tests {
             "agent_session":{"agent":"omp","source":"herdr:omp","kind":"path","value":"/sessions/one.jsonl"}
         }}});
         let explanation = json!({"agent":"omp","screen_detection_skipped":true,"screen_detection_skip_reason":"full_lifecycle_hook_authority","skip_state_update":false});
-        fs::write(&binary, format!("#!/bin/sh\ncase \"$1 $2\" in\n'agent get') printf '%s' '{envelope}';;\n'agent explain') printf '%s' '{explanation}';;\n'agent prompt') printf '%s' $$ > '{}'; exec sleep 60;;\nesac\n", pidfile.display())).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(
+            &binary,
+            format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n'agent get') printf '%s' '{envelope}';;\n'agent explain') printf '%s' '{explanation}';;\n'agent prompt') printf '%s' $$ > '{}'; exec sleep 60;;\nesac\n",
+                pidfile.display()
+            ),
+        );
         let supervisor = crate::process::ProcessSupervisor::default();
         let mut process = HerdrProcess {
             binary,
@@ -1007,15 +1031,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("herdr");
         let pidfile = dir.path().join("pid");
-        fs::write(
+        write_executable(
             &binary,
             format!(
                 "#!/bin/sh\nprintf '%s' $$ > '{}'\nexec sleep 60\n",
                 pidfile.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let supervisor = crate::process::ProcessSupervisor::default();
         let process = HerdrProcess {
             binary,
@@ -1045,8 +1067,7 @@ mod tests {
     async fn simultaneous_child_streams_are_drained_and_stderr_overflow_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("herdr");
-        fs::write(&binary, b"#!/bin/sh\nexec /usr/bin/python3 -c 'import os,threading; t=threading.Thread(target=lambda:os.write(1,b\"x\"*524288));t.start();os.write(2,b\"x\"*524288);t.join()'\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&binary, b"#!/bin/sh\nexec /usr/bin/python3 -c 'import os,threading; t=threading.Thread(target=lambda:os.write(1,b\"x\"*524288));t.start();os.write(2,b\"x\"*524288);t.join()'\n");
         let supervisor = crate::process::ProcessSupervisor::default();
         let process = HerdrProcess {
             binary: binary.clone(),
@@ -1061,11 +1082,10 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        fs::write(
+        write_executable(
             &binary,
             b"#!/bin/sh\nexec /usr/bin/python3 -c 'import os;os.write(2,b\"x\"*2097152)'\n",
-        )
-        .unwrap();
+        );
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             process.run_pane("pane", "ignored"),
@@ -1127,12 +1147,10 @@ mod tests {
     async fn pane_run_rejects_oversized_successful_child_output() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("herdr");
-        fs::write(
+        write_executable(
             &binary,
             b"#!/bin/sh\ndd if=/dev/zero bs=1048576 count=2 2>/dev/null\n",
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let supervisor = crate::process::ProcessSupervisor::default();
         let process = HerdrProcess {
             binary,
@@ -1192,8 +1210,7 @@ mod tests {
     async fn pane_run_accepts_success_with_empty_stdout_and_preserves_command_errors() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("herdr");
-        fs::write(&binary, b"#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = run ] && [ \"$3\" = w9:p5 ] && [ \"$4\" = 'echo hello' ]; then exit 0; fi\necho 'unexpected pane run' >&2\nexit 2\n").unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&binary, b"#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = run ] && [ \"$3\" = w9:p5 ] && [ \"$4\" = 'echo hello' ]; then exit 0; fi\necho 'unexpected pane run' >&2\nexit 2\n");
         let supervisor = crate::process::ProcessSupervisor::default();
         let process = HerdrProcess {
             binary,
@@ -1234,8 +1251,7 @@ mod tests {
             "#!/bin/sh\ncase \"$1 $2\" in\n 'agent get') printf '%s\\n' '{agent}';;\n 'agent explain') printf '%s\\n' '{explain}';;\n 'agent prompt') printf '%s\\n' \"$4\" > '{payload_path}'; printf '%s\\n' '{prompt}';;\n *) exit 2;;\nesac\n",
             payload_path = payload.display()
         );
-        fs::write(&binary, script).unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        write_executable(&binary, script);
         let supervisor = crate::process::ProcessSupervisor::default();
         let process = HerdrProcess {
             binary,

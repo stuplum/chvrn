@@ -6,6 +6,8 @@
 
 Library: `chvrn-core`, `serde`, `serde_json`, `url`, pinned `ureq =3.4.2` with rustls, Tokio `=1.53.2` and Unix `libc`. Tokio enables `rt`, `net`, `process`, `io-util`, `sync`, `time` and `macros`; core, Git and TUI crates remain synchronous. Tests use disposable processes, sockets and Git repositories. Herdr commands retain the installed 0.9 protocol.
 
+Herdr test executables are written and made executable by a separate shell process. Writing them in the parallel test process lets another thread's fork inherit a writable descriptor and makes Linux reject execution with `ETXTBSY`, even after the original writer closes. Keep executable fixture creation outside that process rather than retrying production commands.
+
 ## Runtime ownership
 
 The CLI lazily starts one continuously driven current-thread Tokio runtime on a dedicated thread. Bounded adapter queues bridge synchronous UI state and async transports. `process::ProcessSupervisor` registers each child before startup awaits; explicit shutdown cancels adapters, completes owned cleanup and reaps children before stopping the runtime. Adapter drops signal cancellation without blocking terminal restoration.

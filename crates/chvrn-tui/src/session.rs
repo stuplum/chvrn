@@ -51,7 +51,28 @@ impl SyntaxSource {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct SessionId(u64);
+
+impl SessionId {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(
+            NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("session identity overflow"),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiffRequestId {
+    session: u64,
+    generation: u64,
+}
+
 pub struct DiffRequest {
+    session_id: SessionId,
     generation: u64,
     left: TextSnapshot,
     right: TextSnapshot,
@@ -61,6 +82,7 @@ pub struct DiffRequest {
 }
 
 pub struct DiffCompletion {
+    pub(crate) session_id: SessionId,
     pub(crate) generation: u64,
     pub(crate) left: TextSnapshot,
     pub(crate) right: TextSnapshot,
@@ -73,6 +95,12 @@ pub struct DiffCompletion {
 }
 
 impl DiffRequest {
+    pub fn id(&self) -> DiffRequestId {
+        DiffRequestId {
+            session: self.session_id.0,
+            generation: self.generation,
+        }
+    }
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -85,6 +113,7 @@ impl DiffRequest {
         let left_syntax = self.left_source.highlight(&left);
         let right_syntax = self.right_source.highlight(&right);
         DiffCompletion {
+            session_id: self.session_id,
             generation: self.generation,
             left,
             right,
@@ -99,6 +128,12 @@ impl DiffRequest {
 }
 
 impl DiffCompletion {
+    pub fn id(&self) -> DiffRequestId {
+        DiffRequestId {
+            session: self.session_id.0,
+            generation: self.generation,
+        }
+    }
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -108,6 +143,7 @@ const SYNC_DIFF_LIMIT_BYTES: usize = 64 * 1024;
 
 enum LocalWork {
     TwoWay {
+        session_id: SessionId,
         generation: u64,
         left: CapturedText,
         right: CapturedText,
@@ -148,6 +184,7 @@ impl LocalWork {
     fn compute(self) -> LocalResult {
         match self {
             Self::TwoWay {
+                session_id,
                 generation,
                 left,
                 right,
@@ -156,6 +193,7 @@ impl LocalWork {
                 right_source,
             } => {
                 let request = DiffRequest {
+                    session_id,
                     generation,
                     left: left.snapshot(),
                     right: right.snapshot(),
@@ -486,6 +524,7 @@ pub(crate) struct RepositoryReview {
 }
 
 pub struct ReviewSession {
+    pub(crate) session_id: SessionId,
     pub(crate) mode: Mode,
     pub(crate) rows: Vec<ViewRow>,
     pub(crate) projection: [PaneProjection; 5],
@@ -532,6 +571,7 @@ impl ReviewSession {
         let diff = Diff::between(&left, &right, WhitespacePolicy::Exact);
         let theme = Arc::new(Theme::default());
         let mut session = Self {
+            session_id: SessionId::new(),
             mode: Mode::TwoWay {
                 left: TextPane::new(left, false),
                 right: TextPane::new(right, false),
@@ -606,6 +646,7 @@ impl ReviewSession {
         let duplicate_additions =
             crate::duplicate_additions::DuplicateAdditions::new(&base, &ours, &theirs);
         let mut session = Self {
+            session_id: SessionId::new(),
             mode: Mode::ThreeWay {
                 base,
                 ours: TextPane::new(ours, true),
@@ -839,6 +880,7 @@ impl ReviewSession {
             .expect("diff generation overflow");
         self.pending = None;
         DiffRequest {
+            session_id: self.session_id,
             generation: self.latest_generation,
             left,
             right,
@@ -1009,7 +1051,7 @@ impl ReviewSession {
         }
     }
 
-    fn refresh_alignment(&mut self) {
+    pub(crate) fn refresh_alignment(&mut self) {
         self.local_generation = self
             .local_generation
             .checked_add(1)
@@ -1054,6 +1096,7 @@ impl ReviewSession {
         let generation = self.local_generation;
         let work = match &self.mode {
             Mode::TwoWay { left, right, .. } => LocalWork::TwoWay {
+                session_id: self.session_id,
                 generation,
                 left: left.buffer.capture(),
                 right: right.buffer.capture(),

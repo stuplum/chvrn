@@ -37,7 +37,11 @@ fn exchange(server: SocketServer, socket: &Path, request: &[u8]) -> (SocketServe
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut server = server;
-        let result = server.serve_next();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(server.serve_next());
         let _ = sender.send((server, result));
     });
     let mut stream = UnixStream::connect(socket).unwrap();
@@ -340,36 +344,327 @@ fn duplicate_snapshot_ids_for_distinct_files_are_rejected_at_bind() {
     assert!(!socket.exists());
 }
 
-#[test]
-fn nonblocking_poll_processes_a_candidate_without_a_dedicated_accept_thread() {
+#[tokio::test]
+async fn incomplete_connection_does_not_starve_decisions_refresh_or_shutdown() {
+    use chvrn_integrations::socket::SocketCommand;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = private_socket_dir();
     let socket = dir.path().join("chvrn.sock");
     fs::write(dir.path().join("file.txt"), ORIGINAL).unwrap();
-    let mut server = bind(dir.path(), &socket);
-    server.set_nonblocking(true).unwrap();
-    assert!(!server.poll().unwrap());
-    let mut client = UnixStream::connect(&socket).unwrap();
-    client
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    client
-        .set_write_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
-    client
-        .write_all(&framed(&json!({
+    let server = bind(dir.path(), &socket);
+    let (commands, input) = tokio::sync::mpsc::channel(32);
+    let (candidates, _pending) = tokio::sync::mpsc::channel(32);
+    let (errors, _errors) = tokio::sync::mpsc::channel(32);
+    let task = tokio::spawn(server.run(input, candidates, errors));
+    let mut incomplete = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    incomplete.write_all(&[0, 0]).await.unwrap();
+    let queued = async_exchange(
+        &socket,
+        json!({
             "type": "patch_candidate", "snapshot": "snapshot-17", "path": "file.txt", "patch": PATCH
-        })))
+        }),
+    )
+    .await;
+    assert_eq!(queued["status"], "queued");
+    let (reply, receipt) = tokio::sync::oneshot::channel();
+    commands
+        .send(SocketCommand::Decision {
+            snapshot: "snapshot-17".into(),
+            outcome: ReviewOutcome::Accepted,
+            reply,
+        })
+        .await
         .unwrap();
-    client.shutdown(std::net::Shutdown::Write).unwrap();
-    assert!(server.poll().unwrap());
-    let mut length = [0; 4];
-    client.read_exact(&mut length).unwrap();
-    let mut response = vec![0; u32::from_be_bytes(length) as usize];
-    client.read_exact(&mut response).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), receipt)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    commands
+        .send(SocketCommand::Refresh(vec![InspectedFile {
+            relative_path: "file.txt".into(),
+            snapshot_id: "snapshot-18".into(),
+            bytes: ORIGINAL.as_bytes().to_vec(),
+        }]))
+        .await
+        .unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&response).unwrap()["status"],
-        "queued"
+        async_exchange(&socket, json!({"type": "inspect"})).await["files"][0]["snapshot"],
+        "snapshot-18"
     );
-    assert_eq!(server.take_pending_candidates()[0].patch, PATCH);
-    assert!(server.pending_candidates().is_empty());
+    assert_eq!(
+        async_exchange(
+            &socket,
+            json!({"type": "review_status", "snapshot": "snapshot-17"})
+        )
+        .await["status"],
+        "accepted"
+    );
+    drop(commands);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), incomplete.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert!(!socket.exists());
+}
+
+async fn async_exchange(socket: &Path, message: Value) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(4), async {
+        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        stream.write_all(&framed(&message)).await.unwrap();
+        let mut length = [0; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut body = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn candidate_capacity_includes_undrained_cli_results_and_receipts_still_progress() {
+    use chvrn_integrations::socket::SocketCommand;
+    let dir = private_socket_dir();
+    let socket = dir.path().join("chvrn.sock");
+    let inspected: Vec<_> = (0..33)
+        .map(|index| {
+            let path = format!("file-{index}");
+            fs::write(dir.path().join(&path), ORIGINAL).unwrap();
+            InspectedFile {
+                relative_path: path,
+                snapshot_id: format!("snapshot-{index}"),
+                bytes: ORIGINAL.as_bytes().to_vec(),
+            }
+        })
+        .collect();
+    let server = SocketServer::bind(&socket, dir.path(), inspected.clone()).unwrap();
+    let (commands, input) = tokio::sync::mpsc::channel(32);
+    let (output, mut candidates) = tokio::sync::mpsc::channel(32);
+    let (errors, _errors) = tokio::sync::mpsc::channel(32);
+    let task = tokio::spawn(server.run(input, output, errors));
+    for index in 0..32 {
+        assert_eq!(
+            async_exchange(
+                &socket,
+                json!({
+                    "type": "patch_candidate", "snapshot": format!("snapshot-{index}"),
+                    "path": format!("file-{index}"), "patch": PATCH,
+                })
+            )
+            .await["status"],
+            "queued"
+        );
+    }
+    let last = json!({ "type": "patch_candidate", "snapshot": "snapshot-32", "path": "file-32", "patch": PATCH });
+    assert_eq!(
+        async_exchange(&socket, last.clone()).await["reason"],
+        "busy"
+    );
+    let (reply, receipt) = tokio::sync::oneshot::channel();
+    commands
+        .send(SocketCommand::Decision {
+            snapshot: "snapshot-0".into(),
+            outcome: ReviewOutcome::Declined,
+            reply,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), receipt)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        async_exchange(&socket, last.clone()).await["reason"],
+        "busy"
+    );
+    let retained = tokio::time::timeout(Duration::from_secs(1), candidates.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.snapshot_id, "snapshot-0");
+    assert_eq!(
+        async_exchange(&socket, last.clone()).await["reason"],
+        "busy"
+    );
+    drop(retained);
+    assert_eq!(async_exchange(&socket, last).await["status"], "queued");
+    commands
+        .send(SocketCommand::Refresh(inspected))
+        .await
+        .unwrap();
+    assert_eq!(
+        async_exchange(
+            &socket,
+            json!({"type": "review_status", "snapshot": "snapshot-0"})
+        )
+        .await["status"],
+        "declined"
+    );
+    drop(commands);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_slow_drip_frame_expires_without_resetting_its_total_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = private_socket_dir();
+    let socket = dir.path().join("chvrn.sock");
+    fs::write(dir.path().join("file.txt"), ORIGINAL).unwrap();
+    let server = bind(dir.path(), &socket);
+    let (commands, input) = tokio::sync::mpsc::channel(32);
+    let (output, _candidates) = tokio::sync::mpsc::channel(32);
+    let (errors, _errors) = tokio::sync::mpsc::channel(32);
+    let task = tokio::spawn(server.run(input, output, errors));
+    let mut slow = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    slow.write_all(&100_u32.to_be_bytes()).await.unwrap();
+    assert_eq!(
+        async_exchange(&socket, json!({"type":"inspect"})).await["status"],
+        "inspected"
+    );
+    let (mut reader, mut writer) = slow.into_split();
+    let drip = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            if writer.write_all(b" ").await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(4), reader.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    tokio::time::timeout(Duration::from_secs(1), drip)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(commands);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn connection_slots_recover_under_a_continuous_accept_backlog() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = private_socket_dir();
+    let socket = dir.path().join("chvrn.sock");
+    fs::write(dir.path().join("file.txt"), ORIGINAL).unwrap();
+    let server = bind(dir.path(), &socket);
+    let (commands, input) = tokio::sync::mpsc::channel(32);
+    let (output, _candidates) = tokio::sync::mpsc::channel(32);
+    let (errors, _errors) = tokio::sync::mpsc::channel(32);
+    let task = tokio::spawn(server.run(input, output, errors));
+    let mut held = Vec::new();
+    for _ in 0..16 {
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        stream.write_all(&[0, 0]).await.unwrap();
+        held.push(stream);
+    }
+    let mut excess = tokio::net::UnixStream::connect(&socket).await.unwrap();
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    drop(held);
+    let stop = Arc::new(AtomicBool::new(false));
+    let finished = Arc::clone(&stop);
+    let path = socket.clone();
+    let (ready, running) = tokio::sync::oneshot::channel();
+    let (done, completed) = tokio::sync::oneshot::channel();
+    let producer = std::thread::spawn(move || {
+        let frame = framed(&json!({"type":"inspect"}));
+        let _ = ready.send(());
+        while !finished.load(Ordering::Acquire) {
+            if let Ok(mut stream) = UnixStream::connect(&path) {
+                let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                let _ = std::io::Write::write_all(&mut stream, &frame);
+            }
+        }
+        let _ = done.send(());
+    });
+    running.await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut stream = match tokio::net::UnixStream::connect(&socket).await {
+                Ok(stream) => stream,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                Err(error) => break Err(error),
+            };
+            if stream
+                .write_all(&framed(&json!({"type":"inspect"})))
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let mut length = [0; 4];
+            if stream.read_exact(&mut length).await.is_err() {
+                continue;
+            }
+            let mut body = vec![0; u32::from_be_bytes(length) as usize];
+            if stream.read_exact(&mut body).await.is_err() {
+                continue;
+            }
+            break serde_json::from_slice::<Value>(&body).map_err(std::io::Error::other);
+        }
+    })
+    .await;
+    stop.store(true, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(2), completed)
+        .await
+        .unwrap()
+        .unwrap();
+    producer.join().unwrap();
+    assert_eq!(response.unwrap().unwrap()["status"], "inspected");
+    drop(commands);
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn cleanup_does_not_unlink_a_replacement_socket() {
+    let dir = private_socket_dir();
+    let socket = dir.path().join("chvrn.sock");
+    fs::write(dir.path().join("file.txt"), ORIGINAL).unwrap();
+    let server = bind(dir.path(), &socket);
+    fs::rename(&socket, dir.path().join("old.sock")).unwrap();
+    let replacement = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    drop(server);
+    assert!(socket.exists());
+    assert!(UnixStream::connect(&socket).is_ok());
+    drop(replacement);
 }

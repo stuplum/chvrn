@@ -21,6 +21,8 @@ impl TextSnapshot {
 
 Line numbers in rendered rows are one-based; hunk line ranges are zero-based half-open ranges. Character offsets in intraline changes and editor operations count Unicode scalar values, never UTF-8 bytes. Structural source ranges are zero-based half-open byte ranges into `TextSnapshot::as_bytes()`, always ending on UTF-8 boundaries. CRLF is one line terminator, not two lines or an editable cursor position between CR and LF.
 
+`text::line_range(text: &str, line: usize) -> Option<std::ops::Range<usize>>` returns the zero-based line's content byte range without allocating. Only CR, LF and CRLF terminate lines; VT, FF, NEL, Unicode line separator and paragraph separator remain ordinary content. Terminators are excluded from the returned range. The empty document has coordinate line zero (`Some(0..0)`), and a final terminator exposes one terminal empty coordinate: `line_range("a\r\nb", 1) == Some(3..4)` and `line_range("a\r", 1) == Some(2..2)`. Missing lines return `None`. These coordinate-only empty lines do not add diff or merge rows. Ropey uses `cr_lines` and `simd` with default features disabled, so editor coordinates follow the same policy. Callers explicitly convert scalar, grapheme or UTF-16 columns within the returned content.
+
 ## Line and intraline diff
 
 ```rust
@@ -158,6 +160,8 @@ pub mod merge {
 
 Non-overlapping changes from both sides compose in base order with their exact bytes, including distinct character edits within one multi-line hunk. Same edits on both sides coalesce. Incompatible overlapping edits remain unresolved until explicitly chosen; `result()` is `None` while any conflict remains. `preview()` returns a cached immutable snapshot with independent edits, resolved choices and provisional exact ours bytes for unresolved conflicts. `preview_conflicts()` contains only unresolved conflicts and their exact provisional ours spans in the current preview. `result_chars` counts Unicode scalar values and `result_lines` is the zero-based half-open set of preview lines intersecting those bytes, or an empty range for a zero-width conflict. Spans shift when an earlier conflict is resolved. `conflicts()` keeps every original conflict and its source line ranges, including resolved ones, so IDs stay stable. `Ours`/`Theirs` select the original side's exact content, `Both` inserts ours then theirs, and `Manual` inserts the supplied exact text at that conflict; NUL-containing manual text is rejected. Unrelated edits survive all choices. No conflict-marker text is emitted unless a user explicitly enters it as manual text. Conflict IDs are stable within one `Merge` and not transferable between merges.
 
+Conflict source ranges project the complete base conflict scope into each original source, including unchanged context inside asymmetric or transitively overlapping groups. Slicing a source by its reported range yields exactly that side's complete resolution choice, including unequal insertion/deletion lengths and zero-width choices; the range is not merely the union of that side's changed lines. Prior independent edits are reflected in source offsets, while adjacent non-overlapping groups remain separate.
+
 ## Tree-sitter structural analysis
 
 ```rust
@@ -188,6 +192,8 @@ pub mod structural {
 ```
 
 Explicit grammar registration maps `.rs`, `.ts`, `.tsx`, `.js`, `.jsx`, `.py` and `.json` to real Tree-sitter grammars. Other paths return `None`; structural comparison with `None` returns `UnsupportedLanguage`. Ordinary textual diff/edit remains available. Structural comparison parses actual syntax trees. Changed byte locations refer to their respective snapshots. A moved unchanged named syntax unit is `Move`; a unit with unchanged tokens but changed layout is `Reflow`; changing only a declaration's name with unchanged body is `Renamed`; changing a call target or other token content is `ChangedTokens`. Changes are reported at the affected top-level syntax-unit level, without nested duplicate records. Structure is informational and never authorises a byte-inexact hunk application.
+
+Reflow requires equal token text and equal ordered syntax-tree hierarchy, including node kinds and child structure. Python indentation that moves a statement out of a control-flow block is therefore `ChangedTokens`, not `Reflow`; formatting that preserves tree shape remains `Reflow`. Rename matching also requires unchanged hierarchy. The comparison borrows nodes from the parsed trees rather than retaining another tree representation, and preserves the existing move, rename, reflow and changed-token classification precedence.
 
 ## Syntax catalogue
 

@@ -96,6 +96,30 @@ fn context_pager(path: &str, source: &str) -> PagerSession {
 }
 
 #[test]
+fn plain_multibyte_gaps_do_not_inherit_neighbouring_syntax_styles() {
+    let source = "let λ = \"text\"; let β = 42;";
+    let mut session = ReviewSession::two_way(source, source);
+    session.set_paths(Path::new("left.rs"), Path::new("right.rs"));
+    session.set_theme(syntax_theme());
+    let buffer = draw_review(&session);
+    assert_token(&buffer, source, "text", 2, STRING, Modifier::UNDERLINED);
+    assert_token(&buffer, source, "42", 2, NUMBER, Modifier::BOLD);
+    let mut plain = 0;
+    for cell in &buffer.content {
+        if matches!(cell.symbol(), "λ" | "β") {
+            plain += 1;
+            assert_eq!(cell.fg, Color::Rgb(204, 204, 204));
+            assert!(
+                !cell
+                    .modifier
+                    .intersects(Modifier::ITALIC | Modifier::BOLD | Modifier::UNDERLINED)
+            );
+        }
+    }
+    assert_eq!(plain, 4);
+}
+
+#[test]
 fn elixir_pager_styles_sparse_hunks_without_renumbering_source() {
     let patch = "--- a/lib/example.ex\n+++ b/lib/example.ex\n@@ -40,3 +70,3 @@\n   if true do\n-    label = \"before\"\n+    label = \"after\"\n   end\n@@ -900 +1200 @@\n-  count = 41\n+  count = 42\n";
     let mut pager = PagerSession::new(

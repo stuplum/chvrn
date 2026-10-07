@@ -183,3 +183,59 @@ fn unregistered_text_retains_textual_diff_but_has_no_structural_parser() {
     assert_eq!(before.as_bytes(), b"before\n");
     assert_eq!(after.as_bytes(), b"after\n");
 }
+
+#[test]
+fn python_control_flow_indentation_changes_are_not_formatting_reflow() {
+    let before = snapshot("def f():\n    if x:\n        a()\n        b()\n");
+    let after = snapshot("def f():\n    if x:\n        a()\n    b()\n");
+    let analysis = StructuralAnalysis::compare(Some(Language::Python), &before, &after).unwrap();
+    assert_eq!(analysis.changes().len(), 1);
+    assert_eq!(
+        analysis.changes()[0].kind,
+        StructuralChangeKind::ChangedTokens
+    );
+}
+
+#[test]
+fn formatting_only_changes_preserve_reflow_for_each_supported_grammar() {
+    let cases = [
+        (Language::Rust, "fn f(){a();}\n", "fn f() {\n    a();\n}\n"),
+        (
+            Language::Python,
+            "def f():\n    a(1,2)\n",
+            "def f():\n    a(1, 2)\n",
+        ),
+        (
+            Language::JavaScript,
+            "function f(){a();}\n",
+            "function f() {\n  a();\n}\n",
+        ),
+        (
+            Language::TypeScript,
+            "function f(){a();}\n",
+            "function f() {\n  a();\n}\n",
+        ),
+        (
+            Language::Tsx,
+            "const f=()=> <div>ok</div>;\n",
+            "const f = () => <div>ok</div>;\n",
+        ),
+        (
+            Language::Jsx,
+            "const f=()=> <div>ok</div>;\n",
+            "const f = () => <div>ok</div>;\n",
+        ),
+        (Language::Json, "{\"a\":1}\n", "{\n  \"a\": 1\n}\n"),
+    ];
+    for (language, before, after) in cases {
+        let analysis =
+            StructuralAnalysis::compare(Some(language), &snapshot(before), &snapshot(after))
+                .unwrap();
+        assert_eq!(analysis.changes().len(), 1, "{language:?}");
+        assert_eq!(
+            analysis.changes()[0].kind,
+            StructuralChangeKind::Reflow,
+            "{language:?}"
+        );
+    }
+}

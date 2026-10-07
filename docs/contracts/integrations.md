@@ -1,10 +1,18 @@
 # Integrations public API
 
-Production APIs follow the approved behavioural tests. The coordinator owns build, test, and runtime verification after integration. `chvrn-integrations` exposes four independent modules: `herdr`, `socket`, `lsp`, and `jev`. None sends an approval keystroke, stages a change, or silently writes a reviewed file.
+`chvrn-integrations` exposes four protocol modules, `herdr`, `socket`, `lsp` and `jev`, plus shared child ownership in `process`. None sends an approval keystroke, stages a change or silently writes a reviewed file.
 
 ## Dependencies for implementation and tests
 
-Library: `chvrn-core`, `serde` with `derive`, `serde_json`, `url`, and pinned `ureq =3.4.2` with rustls and default features disabled. Tests: `tempfile` and `serde_json`; otherwise standard library. Unix socket tests use `std::os::unix`, and are Unix-targeted. Runtime uses the installed herdr 0.9 `agent get`, `agent explain --json`, `agent prompt`, `pane get`, `pane split`, `pane run` and Unix socket `pane.focus` APIs; no guessed flags.
+Library: `chvrn-core`, `serde`, `serde_json`, `url`, pinned `ureq =3.4.2` with rustls, Tokio `=1.53.2` and Unix `libc`. Tokio enables `rt`, `net`, `process`, `io-util`, `sync`, `time` and `macros`; core, Git and TUI crates remain synchronous. Tests use disposable processes, sockets and Git repositories. Herdr commands retain the installed 0.9 protocol.
+
+## Runtime ownership
+
+The CLI lazily starts one continuously driven current-thread Tokio runtime on a dedicated thread. Bounded adapter queues bridge synchronous UI state and async transports. `process::ProcessSupervisor` registers each child before startup awaits; explicit shutdown cancels adapters, completes owned cleanup and reaps children before stopping the runtime. Adapter drops signal cancellation without blocking terminal restoration.
+
+Language requests allow one active and one queued operation, with two retained result slots in total. Herdr commands/results and socket commands are bounded at 32. Shutdown uses a separate signal, not ordinary queue capacity. Queue saturation reports busy or suspends admission rather than dropping mutation decisions.
+
+Git validation and document preparation use separate bounded worker lanes, each with one active and one queued job. Their synchronous Git calls are not cancelled by Tokio deadlines. Shutdown does not join those lanes; a running preparation call can outlive its adapter until process exit. Exact snapshot and request identity is checked again before publishing results.
 
 ## `chvrn_integrations::herdr`
 
@@ -61,18 +69,18 @@ pub enum SplitDirection { Right, Down }
 pub enum FeedbackDelivery { Delivered, RejectedBlocked, Uncertain(String) }
 pub struct HerdrProcess;
 impl HerdrProcess {
-    pub fn from_environment() -> Result<Self, HerdrProcessError>;
-    pub fn new(binary: impl Into<std::path::PathBuf>) -> Result<Self, HerdrProcessError>;
-    pub fn get_agent(&self, pane_id: &str) -> Result<serde_json::Value, HerdrProcessError>;
-    pub fn resolve_target(&self, name_or_pane: &str) -> Result<String, HerdrProcessError>;
-    pub fn pane_get(&self, pane_id: &str) -> Result<serde_json::Value, HerdrProcessError>;
-    pub fn focus_agent(&self, name_or_pane: &str) -> Result<serde_json::Value, HerdrProcessError>;
-    pub fn focus_pane(&self, pane_id: &str) -> Result<(), HerdrProcessError>;
-    pub fn split(&self, pane_id: &str, direction: SplitDirection, cwd: &std::path::Path) -> Result<String, HerdrProcessError>;
-    pub fn run_pane(&self, pane_id: &str, command: &str) -> Result<(), HerdrProcessError>;
-    pub fn sample(&self, bridge: &mut HerdrBridge) -> Result<Vec<BridgeEffect>, HerdrProcessError>;
-    pub fn deliver_feedback(&self, bridge: &mut HerdrBridge, report: &ReviewReport) -> Result<FeedbackDelivery, HerdrProcessError>;
-    pub fn request_explanation(&self, bridge: &HerdrBridge, snapshot_id: &str, path: &str, range: HunkRange, question: &str) -> Result<FeedbackDelivery, HerdrProcessError>;
+    pub fn from_environment(supervisor: process::ProcessSupervisor) -> Result<Self, HerdrProcessError>;
+    pub fn new(binary: impl Into<std::path::PathBuf>, supervisor: process::ProcessSupervisor) -> Result<Self, HerdrProcessError>;
+    pub async fn get_agent(&self, pane_id: &str) -> Result<serde_json::Value, HerdrProcessError>;
+    pub async fn resolve_target(&self, name_or_pane: &str) -> Result<String, HerdrProcessError>;
+    pub async fn pane_get(&self, pane_id: &str) -> Result<serde_json::Value, HerdrProcessError>;
+    pub async fn focus_agent(&self, name_or_pane: &str) -> Result<serde_json::Value, HerdrProcessError>;
+    pub async fn focus_pane(&self, pane_id: &str) -> Result<(), HerdrProcessError>;
+    pub async fn split(&self, pane_id: &str, direction: SplitDirection, cwd: &std::path::Path) -> Result<String, HerdrProcessError>;
+    pub async fn run_pane(&self, pane_id: &str, command: &str) -> Result<(), HerdrProcessError>;
+    pub async fn sample(&self, bridge: &mut HerdrBridge) -> Result<Vec<BridgeEffect>, HerdrProcessError>;
+    pub async fn deliver_feedback(&self, bridge: &mut HerdrBridge, report: &ReviewReport) -> Result<FeedbackDelivery, HerdrProcessError>;
+    pub async fn request_explanation(&self, bridge: &HerdrBridge, snapshot_id: &str, path: &str, range: HunkRange, question: &str) -> Result<FeedbackDelivery, HerdrProcessError>;
 }
 ```
 
@@ -88,6 +96,10 @@ The CLI checks `HERDR_ENV=1` before running herdr commands. The reducer only ret
 
 An accepted `agent prompt` response may omit `agent_session`; `send_verified_prompt` requires authoritative `done` or `idle` plus verified session identity before sending either review feedback or a requested explanation. It requires the response to name the expected pane and terminal, then re-reads authoritative session identity before marking the report delivered. A failed re-read after a successful prompt is `Uncertain`, not a reason to retry automatically.
 
+Composite Herdr operations share one 30-second absolute deadline across identity probes and transmission. Stdout and stderr are drained concurrently, each capped at 1 MiB; overflow fails explicitly. The direct focus socket has a three-second whole-exchange deadline. Cancellation after prompt transmission preserves uncertain delivery and never retries automatically. Verification loss retains the original pending identity: restoring A can resume A's review, but restoring B invalidates it.
+
+Explicit quit remains available while submission or preparation is pending. The CLI reports unconfirmed feedback, exits without approval and cancels protocol work; it does not wait for a blocked Git preparation lane.
+
 `pane run` success can have empty stdout. `run_pane` therefore relies on the process exit status and reports errors from stderr without requiring or manufacturing JSON. An observed OMP `/restart` exec was followed by `agent_not_ready` despite a displayed idle hook state; do not treat `/restart` as a verified activation path until lifecycle authority and shell handoff are confirmed on the new session.
 
 ## `chvrn_integrations::socket`
@@ -100,13 +112,20 @@ pub struct SocketServer;
 impl SocketServer {
     pub const MAX_FRAME_BYTES: usize = 65_536;
     pub fn bind(socket_path: &std::path::Path, root: &std::path::Path, inspected: Vec<InspectedFile>) -> std::io::Result<Self>;
-    pub fn set_nonblocking(&self, enabled: bool) -> std::io::Result<()>;
-    pub fn poll(&mut self) -> std::io::Result<bool>;
-    pub fn serve_next(&mut self) -> std::io::Result<()>;
-    pub fn pending_candidates(&self) -> &[PatchCandidate];
+    pub async fn serve_next(&mut self) -> std::io::Result<()>;
+    pub async fn run(self, commands: tokio::sync::mpsc::Receiver<SocketCommand>, candidates: tokio::sync::mpsc::Sender<PatchCandidate>, errors: tokio::sync::mpsc::Sender<String>);
+    pub fn pending_candidates(&self) -> &std::collections::VecDeque<PatchCandidate>;
     pub fn take_pending_candidates(&mut self) -> Vec<PatchCandidate>;
     pub fn refresh_inspected(&mut self, inspected: Vec<InspectedFile>) -> std::io::Result<usize>;
     pub fn record_review(&mut self, snapshot_id: &str, outcome: ReviewOutcome) -> std::io::Result<()>;
+}
+pub enum SocketCommand {
+    Refresh(Vec<InspectedFile>),
+    Decision {
+        snapshot: String,
+        outcome: ReviewOutcome,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 ```
 
@@ -114,11 +133,11 @@ Unix-domain protocol, distinct from LSP: four-byte unsigned big-endian payload l
 
 Candidate request: `{"type":"patch_candidate","snapshot":"s1","path":"src/a.rs","patch":"..."}`. A candidate is queued only when its path resolves inside root, is not a symlink escape, matches an inspected relative path/snapshot, and current disk bytes match inspected bytes. Another candidate for an issued pending or completed snapshot is rejected with `already_issued`, because review status is keyed by snapshot ID. `take_pending_candidates` transfers suggestions to the host for explicit review. Neither receiving nor inspecting a candidate writes files, approves changes, or rewrites stale suggestions under refreshed IDs.
 
-Status request: `{"type":"review_status","snapshot":"s1"}`. A completed `accepted` or `declined` receipt survives `refresh_inspected` even after the old snapshot leaves the active file map; the first completed outcome is immutable. Refresh removes queued unreviewed suggestions that no longer match current inspected files, and those old pending IDs return `unknown_snapshot`. Invalid framing and JSON are rejected without queuing or writing. Other rejection reasons include `malformed`, `too_large`, `outside_root`, and `stale_snapshot`. Binding requires a private (`0700`) socket parent to avoid a publication race, sets socket file mode `0600`, and Drop removes only the socket inode it bound. `poll` returns immediately in nonblocking mode. Framing and I/O have bounded lengths and per-connection timeouts.
+Status request: `{"type":"review_status","snapshot":"s1"}`. A completed `accepted` or `declined` receipt survives refresh after the old snapshot leaves the active file map; the first completed outcome is immutable. Refresh invalidates unreviewed suggestions that no longer match inspected files. Invalid framing and JSON never queue or write. Rejection reasons include `malformed`, `too_large`, `outside_root`, `stale_snapshot` and `busy`. Binding requires a private (`0700`) parent, sets socket mode `0600`, and Drop removes only the socket inode it bound.
 
-`SocketUi::decision` waits at most three seconds for its worker to return the `record_review` result. It succeeds only after that receipt is recorded; a rejected snapshot, worker failure, or timeout propagates to its caller. Sending a command to the worker is not evidence of an accepted or declined receipt.
+Each exchange has one three-second deadline covering reads, validation and writes. The owner admits at most 16 connections and reaps completed tasks before accepting more. Candidate capacity is 32 across the owner and CLI; candidates retain their capacity lease after transfer. Incomplete clients and saturated candidate consumers do not block refresh, reserved decision replies or cancellation.
 
-`SocketServer` is `Send` so an owner can run `serve_next` on a dedicated worker. Framing errors must not leave that worker blocked on unread payload bytes.
+The CLI reserves a command slot and dedicated acknowledgement with `SocketUi::reserve_decision()` before applying a patch. `DecisionPermit::record(snapshot, accepted)` returns a `PendingDecision`; `try_complete()` checks its receipt without blocking. While awaiting it, the host retains the original candidate, blocks repeat application, navigation and submission, and does not publish a new snapshot. Only a successful receipt permits the checked refresh transition. Failure after application reports that bytes were already written, retains failed state and never retries silently. Explicit quit remains available without claiming acknowledgement.
 
 ## `chvrn_integrations::lsp`
 
@@ -140,22 +159,22 @@ impl<T> SnapshotBound<T> {
 impl SnapshotBound<Option<String>> {
     pub fn apply_to_buffer(&self, buffer: &mut chvrn_core::edit::TextBuffer) -> Result<Option<chvrn_core::TextSnapshot>, LspError>;
 }
-pub struct LspSession<R: std::io::Read, W: std::io::Write>;
-impl<R: std::io::Read, W: std::io::Write> LspSession<R, W> {
+pub struct LspSession<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>;
+impl<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> LspSession<R, W> {
     pub fn new(reader: R, writer: W, document: Document) -> Self;
-    pub fn initialise(&mut self, root_uri: Option<&str>, language_id: &str) -> Result<serde_json::Value, LspError>;
-    pub fn hover(&mut self, position: TextPosition) -> Result<Option<String>, LspError>;
-    pub fn definition(&mut self, position: TextPosition) -> Result<Option<LspLocation>, LspError>;
-    pub fn read_diagnostics(&mut self) -> Result<(), LspError>;
+    pub async fn initialise(&mut self, root_uri: Option<&str>, language_id: &str) -> Result<serde_json::Value, LspError>;
+    pub async fn hover(&mut self, position: TextPosition) -> Result<Option<String>, LspError>;
+    pub async fn definition(&mut self, position: TextPosition) -> Result<Option<LspLocation>, LspError>;
+    pub async fn read_diagnostics(&mut self) -> Result<(), LspError>;
     pub fn diagnostics(&self) -> &[Diagnostic];
     pub fn bind_snapshot(&mut self, snapshot: chvrn_core::TextSnapshot) -> Result<(), LspError>;
     pub fn diagnostics_for_snapshot(&self, current: &chvrn_core::TextSnapshot) -> Option<&[Diagnostic]>;
     pub fn set_formatting_options(&mut self, options: FormattingOptions) -> Result<(), LspError>;
-    pub fn replace_text(&mut self, text: String, new_snapshot_id: String) -> Result<(), LspError>;
-    pub fn format(&mut self, request: FormatRequest) -> Result<(), LspError>;
-    pub fn format_proposal(&mut self, source: &chvrn_core::TextSnapshot) -> Result<SnapshotBound<Option<String>>, LspError>;
-    pub fn undo(&mut self, new_snapshot_id: String) -> Result<(), LspError>;
-    pub fn shutdown(&mut self) -> Result<(), LspError>;
+    pub async fn replace_text(&mut self, text: String, new_snapshot_id: String) -> Result<(), LspError>;
+    pub async fn format(&mut self, request: FormatRequest) -> Result<(), LspError>;
+    pub async fn format_proposal(&mut self, source: &chvrn_core::TextSnapshot) -> Result<SnapshotBound<Option<String>>, LspError>;
+    pub async fn undo(&mut self, new_snapshot_id: String) -> Result<(), LspError>;
+    pub async fn shutdown(&mut self) -> Result<(), LspError>;
     pub fn document(&self) -> &Document;
 }
 pub struct LanguageServerConfig {
@@ -167,23 +186,30 @@ pub struct LanguageServerConfig {
 pub struct ServerCapabilities { pub hover: bool, pub definition: bool, pub formatting: bool }
 pub struct LspProcess;
 impl LspProcess {
-    pub fn start(config: Option<&LanguageServerConfig>, document: Document) -> Result<Self, LspError>;
+    pub async fn start(config: Option<&LanguageServerConfig>, document: Document, supervisor: &process::ProcessSupervisor) -> Result<Self, LspError>;
     pub fn capabilities(&self) -> ServerCapabilities;
-    pub fn session_mut(&mut self) -> &mut LspSession<TimedReader, std::process::ChildStdin>;
-    pub fn hover(&mut self, position: TextPosition) -> Result<Option<String>, LspError>;
-    pub fn definition(&mut self, position: TextPosition) -> Result<Option<LspLocation>, LspError>;
-    pub fn format(&mut self, request: FormatRequest) -> Result<(), LspError>;
-    pub fn shutdown(self) -> Result<(), LspError>;
+    pub fn session_mut(&mut self) -> &mut LspSession<tokio::process::ChildStdout, tokio::process::ChildStdin>;
+    pub fn is_desynchronised(&self) -> bool;
+    pub async fn hover(&mut self, position: TextPosition) -> Result<Option<String>, LspError>;
+    pub async fn definition(&mut self, position: TextPosition) -> Result<Option<LspLocation>, LspError>;
+    pub async fn format(&mut self, request: FormatRequest) -> Result<(), LspError>;
+    pub async fn shutdown(self) -> Result<(), LspError>;
 }
 ```
 
 LSP uses `Content-Length: N\r\n\r\n` headers followed by exactly N UTF-8 JSON bytes, not the socket's four-byte prefix. Outgoing requests use `jsonrpc: "2.0"`, distinct IDs, `textDocument/hover`, `textDocument/definition`, and `textDocument/formatting`. Caller positions are UTF-8 byte offsets on Unicode scalar boundaries; wire positions are UTF-16 code-unit offsets. Incoming cross-file definition results retain the target URI and UTF-16 location until the target text can be loaded. Diagnostics for the loaded document convert to byte offsets; invalid byte boundaries are errors. `textDocument/didChange` carries the new full text and increasing version. Stale diagnostics versions and stale responses never replace current state. Server requests do not approve reviews. `LspProcess` starts a configured executable, performs initialise/initialized/didOpen, gates unsupported capabilities, bounds server reads, shuts down explicitly or kills its child on Drop. Missing configuration reports `Unavailable`.
+
+Writes and response matching share a 30-second operation budget; unrelated notifications cannot extend it. Headers are capped at 8192 bytes and message bodies at 8 MiB. Cancellation or partial framing makes the transport unusable. The CLI retires and reaps it before a later explicit request may start a fresh server; it does not retry the failed action. Healthy process shutdown shares one 500 ms deadline across the shutdown response, exit notification and cooperative child exit, then kills and reaps on failure or timeout.
+
+Source lines use LF, CRLF and bare CR. Unicode separators remain content. Incoming positions reject surrogate interiors and out-of-range lines; the terminal empty line remains a valid coordinate for EOF edits.
 
 `FormatRequest.new_snapshot_id` names the resulting content after successful low-level `LspSession::format`. Low-level `undo` restores the prior text with a fresh caller-supplied ID, and both operations send a versioned full-text `didChange`. For the shared editor buffer, bind its cloned `TextSnapshot`, request `format_proposal`, and apply it with `apply_to_buffer` only if `same_identity` still matches the current `TextBuffer` snapshot. Core `TextBuffer` then owns undo. After apply or undo, pass the resulting text and a distinct caller-supplied ID to `replace_text`, then bind the fresh core snapshot; this keeps the LSP document synchronised without allowing old equal text to restore stale authority. `diagnostics_for_snapshot` only exposes a diagnostic batch bound to the exact current core snapshot. Hunk ranges in review reports are zero-based, end-exclusive line ranges in their inspected file snapshots.
 
 The preceding `format_proposal`/`apply_to_buffer` sequence is the library API pattern. The current CLI instead calls `LspProcess::format`, then applies the returned text with `ReviewSession::replace_pane_text` only after verifying the response path, pane and buffer identity. Stale responses are discarded. Later language requests synchronise changed or undone pane text with a fresh identity.
 
 `replace_text` accepts unchanged bytes with a fresh snapshot ID: edit/undo can return to equal text without restoring the old snapshot's authority. It still advances the document version and invalidates previous diagnostics. The CLI caches diagnostics only for the currently bound core snapshot and consumes incoming messages until that snapshot has a diagnostic batch, instead of waiting for a new notification on every repeated diagnostics request.
+
+Mirror `replace_text` updates clear incompatible private formatting history without retaining previous full-text copies. Explicit low-level formatting and undo retain their separate undo contract.
 
 Herdr lifecycle, socket framing, and LSP framing remain separate. The CLI and TUI compose them after coordinator verification; no automatic approval follows any protocol response.
 

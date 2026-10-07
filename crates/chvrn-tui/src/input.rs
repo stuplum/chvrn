@@ -67,14 +67,13 @@ impl ReviewSession {
                     ReviewOutcome::Continue
                 }
             }
-            ReviewInput::DiscardAndReload => {
-                if self.refresh_conflict {
-                    if let Some(completion) = self.pending.take() {
-                        self.accept_diff(completion);
-                    }
+            ReviewInput::DiscardAndReload => match self.pending.take() {
+                Some(completion) if self.refresh_conflict => {
+                    self.accept_diff(completion);
+                    ReviewOutcome::RefreshApplied
                 }
-                ReviewOutcome::Continue
-            }
+                _ => ReviewOutcome::RefreshSuperseded,
+            },
         };
         if self.selected != selected_before {
             self.cancel_merge_advice();
@@ -131,8 +130,11 @@ impl ReviewSession {
     }
 
     fn receive_diff(&mut self, completion: DiffCompletion) -> ReviewOutcome {
-        if completion.generation != self.latest_generation || completion.policy != self.whitespace {
-            return ReviewOutcome::Continue;
+        if completion.session_id != self.session_id
+            || completion.generation != self.latest_generation
+            || completion.generation == self.accepted_generation
+        {
+            return ReviewOutcome::RefreshSuperseded;
         }
         if self.changed {
             self.pending = Some(completion);
@@ -140,11 +142,12 @@ impl ReviewSession {
             return ReviewOutcome::RefreshConflict;
         }
         self.accept_diff(completion);
-        ReviewOutcome::Continue
+        ReviewOutcome::RefreshApplied
     }
 
     fn accept_diff(&mut self, completion: DiffCompletion) {
         let DiffCompletion {
+            policy,
             generation,
             left,
             right,
@@ -190,6 +193,9 @@ impl ReviewSession {
         self.editing = false;
         self.undo_actions.clear();
         self.redo_actions.clear();
+        if policy != self.whitespace {
+            self.refresh_alignment();
+        }
     }
 
     fn handle_key(&mut self, event: KeyEvent) -> ReviewOutcome {

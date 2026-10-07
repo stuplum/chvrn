@@ -190,10 +190,12 @@ fn proposal(
     output
 }
 
-fn affected_lines(edits: &[&Edit]) -> Range<usize> {
-    let first = edits.first().unwrap().side_lines.start;
-    let last = edits.last().unwrap().side_lines.end;
-    first..last
+fn projected_lines(scope: &Range<usize>, edits: &[&Edit]) -> Range<usize> {
+    let first = edits.first().unwrap();
+    let last = edits.last().unwrap();
+    let start = first.side_lines.start - (first.base.start - scope.start);
+    let end = last.side_lines.end + (scope.end - last.base.end);
+    start..end
 }
 
 fn append(output: &mut String, char_length: &mut usize, text: &str) {
@@ -275,8 +277,8 @@ impl Merge {
                 conflicts.push(Conflict {
                     id,
                     base_lines: scope.clone(),
-                    ours_lines: affected_lines(&ours),
-                    theirs_lines: affected_lines(&theirs),
+                    ours_lines: projected_lines(&scope, &ours),
+                    theirs_lines: projected_lines(&scope, &theirs),
                 });
                 PieceContent::Conflict {
                     id,

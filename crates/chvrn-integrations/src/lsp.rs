@@ -1,11 +1,13 @@
+use crate::process::{OwnedChild, ProcessSupervisor};
 use chvrn_core::{TextSnapshot, edit::TextBuffer};
 use serde_json::{Value, json};
 use std::collections::HashSet;
-use std::io::{Cursor, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::time::{Instant, timeout, timeout_at};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -130,7 +132,7 @@ impl Default for FormattingOptions {
     }
 }
 
-pub struct LspSession<R: Read, W: Write> {
+pub struct LspSession<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> {
     reader: R,
     writer: W,
     document: Document,
@@ -144,7 +146,7 @@ pub struct LspSession<R: Read, W: Write> {
     desynchronised: bool,
 }
 
-impl<R: Read, W: Write> LspSession<R, W> {
+impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> LspSession<R, W> {
     pub fn new(reader: R, writer: W, document: Document) -> Self {
         let used_snapshot_ids = HashSet::from([document.snapshot_id.clone()]);
         Self {
@@ -203,28 +205,51 @@ impl<R: Read, W: Write> LspSession<R, W> {
         Ok(())
     }
 
-    pub fn initialise(
+    pub async fn initialise(
         &mut self,
         root_uri: Option<&str>,
         language_id: &str,
     ) -> Result<Value, LspError> {
-        let response = self.request(
-            "initialize",
-            json!({
-                "processId": std::process::id(),
-                "clientInfo": { "name": "chvrn" },
-                "rootUri": root_uri,
-                "capabilities": {
-                    "general": { "positionEncodings": ["utf-16"] },
-                    "textDocument": {
-                        "synchronization": { "dynamicRegistration": false, "didSave": false },
-                        "hover": { "contentFormat": ["plaintext"] },
-                        "definition": {},
-                        "formatting": {}
+        match timeout(
+            Duration::from_secs(30),
+            self.initialise_exchange(root_uri, language_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.desynchronised = true;
+                Err(LspError::Io(
+                    "language server startup deadline exceeded".into(),
+                ))
+            }
+        }
+    }
+
+    async fn initialise_exchange(
+        &mut self,
+        root_uri: Option<&str>,
+        language_id: &str,
+    ) -> Result<Value, LspError> {
+        let response = self
+            .request(
+                "initialize",
+                json!({
+                    "processId": std::process::id(),
+                    "clientInfo": { "name": "chvrn" },
+                    "rootUri": root_uri,
+                    "capabilities": {
+                        "general": { "positionEncodings": ["utf-16"] },
+                        "textDocument": {
+                            "synchronization": { "dynamicRegistration": false, "didSave": false },
+                            "hover": { "contentFormat": ["plaintext"] },
+                            "definition": {},
+                            "formatting": {}
+                        }
                     }
-                }
-            }),
-        )?;
+                }),
+            )
+            .await?;
         let encoding = response
             .pointer("/capabilities/positionEncoding")
             .and_then(Value::as_str)
@@ -234,28 +259,31 @@ impl<R: Read, W: Write> LspSession<R, W> {
                 "language server selected an unsupported position encoding".into(),
             ));
         }
-        self.notify("initialized", json!({}))?;
+        self.notify("initialized", json!({})).await?;
         self.notify(
             "textDocument/didOpen",
             json!({ "textDocument": {
-            "uri": &self.document.uri,
-            "languageId": language_id,
-            "version": self.document.version,
-            "text": &self.document.text
+    "uri": &self.document.uri,
+    "languageId": language_id,
+    "version": self.document.version,
+    "text": &self.document.text
         } }),
-        )?;
+        )
+        .await?;
         Ok(response)
     }
 
-    pub fn hover(&mut self, position: TextPosition) -> Result<Option<String>, LspError> {
+    pub async fn hover(&mut self, position: TextPosition) -> Result<Option<String>, LspError> {
         let wire = to_utf16(&self.document.text, position)?;
-        let response = self.request(
-            "textDocument/hover",
-            json!({
-                "textDocument": { "uri": &self.document.uri },
-                "position": { "line": position.line, "character": wire }
-            }),
-        )?;
+        let response = self
+            .request(
+                "textDocument/hover",
+                json!({
+                    "textDocument": { "uri": &self.document.uri },
+                    "position": { "line": position.line, "character": wire }
+                }),
+            )
+            .await?;
         let Some(contents) = response.get("contents") else {
             return Ok(None);
         };
@@ -283,15 +311,20 @@ impl<R: Read, W: Write> LspSession<R, W> {
         Err(LspError::Protocol("invalid hover response".into()))
     }
 
-    pub fn definition(&mut self, position: TextPosition) -> Result<Option<LspLocation>, LspError> {
+    pub async fn definition(
+        &mut self,
+        position: TextPosition,
+    ) -> Result<Option<LspLocation>, LspError> {
         let wire = to_utf16(&self.document.text, position)?;
-        let response = self.request(
-            "textDocument/definition",
-            json!({
-                "textDocument": { "uri": &self.document.uri },
-                "position": { "line": position.line, "character": wire }
-            }),
-        )?;
+        let response = self
+            .request(
+                "textDocument/definition",
+                json!({
+                    "textDocument": { "uri": &self.document.uri },
+                    "position": { "line": position.line, "character": wire }
+                }),
+            )
+            .await?;
         if response.is_null() {
             return Ok(None);
         }
@@ -333,28 +366,54 @@ impl<R: Read, W: Write> LspSession<R, W> {
         }))
     }
 
-    pub fn read_diagnostics(&mut self) -> Result<(), LspError> {
-        let message = read_frame(&mut self.reader)?;
-        self.process_incoming(&message)
+    pub async fn read_diagnostics(&mut self) -> Result<(), LspError> {
+        self.begin_exchange()?;
+        let result = timeout(Duration::from_secs(30), async {
+            let message = read_frame(&mut self.reader).await?;
+            self.process_incoming(&message).await
+        })
+        .await
+        .map_err(|_| LspError::Io("language server diagnostic deadline exceeded".into()))?;
+        if result.is_ok() {
+            self.desynchronised = false;
+        }
+        result
     }
 
-    pub fn replace_text(&mut self, text: String, new_snapshot_id: String) -> Result<(), LspError> {
+    pub async fn replace_text(
+        &mut self,
+        text: String,
+        new_snapshot_id: String,
+    ) -> Result<(), LspError> {
         self.validate_snapshot_id(&new_snapshot_id)?;
-        self.commit_text(text, new_snapshot_id)
+        self.commit_text(text, new_snapshot_id, false).await
     }
 
-    pub fn format(&mut self, request: FormatRequest) -> Result<(), LspError> {
+    pub async fn format(&mut self, request: FormatRequest) -> Result<(), LspError> {
+        match timeout(Duration::from_secs(30), self.format_exchange(request)).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.desynchronised = true;
+                Err(LspError::Io(
+                    "language server formatting deadline exceeded".into(),
+                ))
+            }
+        }
+    }
+
+    async fn format_exchange(&mut self, request: FormatRequest) -> Result<(), LspError> {
         if self.document.snapshot_id != request.inspected_snapshot_id {
             return Err(LspError::StaleSnapshot);
         }
         self.validate_snapshot_id(&request.new_snapshot_id)?;
-        if let Some(text) = self.request_formatted_text()? {
-            self.commit_text(text, request.new_snapshot_id)?;
+        if let Some(text) = self.request_formatted_text().await? {
+            self.commit_text(text, request.new_snapshot_id, true)
+                .await?;
         }
         Ok(())
     }
 
-    pub fn format_proposal(
+    pub async fn format_proposal(
         &mut self,
         source: &TextSnapshot,
     ) -> Result<SnapshotBound<Option<String>>, LspError> {
@@ -367,19 +426,17 @@ impl<R: Read, W: Write> LspSession<R, W> {
         }
         Ok(SnapshotBound {
             source: source.clone(),
-            value: self.request_formatted_text()?,
+            value: self.request_formatted_text().await?,
         })
     }
 
-    fn request_formatted_text(&mut self) -> Result<Option<String>, LspError> {
+    async fn request_formatted_text(&mut self) -> Result<Option<String>, LspError> {
         let options = self.formatting_options;
-        let response = self.request(
-            "textDocument/formatting",
-            json!({
-                "textDocument": { "uri": &self.document.uri },
-                "options": { "tabSize": options.tab_size, "insertSpaces": options.insert_spaces }
-            }),
-        )?;
+        let response = self.request("textDocument/formatting",
+    json!({
+        "textDocument": { "uri": &self.document.uri },
+        "options": { "tabSize": options.tab_size, "insertSpaces": options.insert_spaces }
+    }),).await?;
         if response.is_null() {
             return Ok(None);
         }
@@ -427,7 +484,7 @@ impl<R: Read, W: Write> LspSession<R, W> {
         Ok(Some(text))
     }
 
-    pub fn undo(&mut self, new_snapshot_id: String) -> Result<(), LspError> {
+    pub async fn undo(&mut self, new_snapshot_id: String) -> Result<(), LspError> {
         self.validate_snapshot_id(&new_snapshot_id)?;
         let next_version = self
             .document
@@ -437,7 +494,7 @@ impl<R: Read, W: Write> LspSession<R, W> {
         let Some(previous) = self.history.pop() else {
             return Err(LspError::StaleSnapshot);
         };
-        if let Err(error) = self.send_change(&previous, next_version) {
+        if let Err(error) = self.send_change(&previous, next_version).await {
             self.history.push(previous);
             return Err(error);
         }
@@ -451,9 +508,21 @@ impl<R: Read, W: Write> LspSession<R, W> {
         Ok(())
     }
 
-    pub fn shutdown(&mut self) -> Result<(), LspError> {
-        self.request("shutdown", Value::Null)?;
-        self.notify("exit", Value::Null)
+    pub async fn shutdown(&mut self) -> Result<(), LspError> {
+        match timeout(Duration::from_secs(30), async {
+            self.request("shutdown", Value::Null).await?;
+            self.notify("exit", Value::Null).await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.desynchronised = true;
+                Err(LspError::Io(
+                    "language server shutdown deadline exceeded".into(),
+                ))
+            }
+        }
     }
 
     fn validate_snapshot_id(&self, id: &str) -> Result<(), LspError> {
@@ -463,15 +532,25 @@ impl<R: Read, W: Write> LspSession<R, W> {
         Ok(())
     }
 
-    fn commit_text(&mut self, text: String, new_snapshot_id: String) -> Result<(), LspError> {
+    async fn commit_text(
+        &mut self,
+        text: String,
+        new_snapshot_id: String,
+        retain_undo: bool,
+    ) -> Result<(), LspError> {
         let version = self
             .document
             .version
             .checked_add(1)
             .ok_or_else(|| LspError::Protocol("document version overflow".into()))?;
-        self.send_change(&text, version)?;
-        self.history
-            .push(std::mem::replace(&mut self.document.text, text));
+        self.send_change(&text, version).await?;
+        if retain_undo {
+            self.history
+                .push(std::mem::replace(&mut self.document.text, text));
+        } else {
+            self.history.clear();
+            self.document.text = text;
+        }
         self.document.version = version;
         self.document.snapshot_id = new_snapshot_id.clone();
         self.used_snapshot_ids.insert(new_snapshot_id);
@@ -481,76 +560,88 @@ impl<R: Read, W: Write> LspSession<R, W> {
         Ok(())
     }
 
-    fn send_change(&mut self, text: &str, version: i32) -> Result<(), LspError> {
+    fn begin_exchange(&mut self) -> Result<(), LspError> {
         if self.desynchronised {
             return Err(LspError::Protocol(
                 "language server state is unsynchronised".into(),
             ));
         }
-        let message = json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didChange",
-            "params": {
-                "textDocument": { "uri": &self.document.uri, "version": version },
-                "contentChanges": [{ "text": text }]
-            }
-        });
-        if let Err(error) = write_frame(&mut self.writer, &message) {
-            self.desynchronised = true;
-            return Err(error);
-        }
+        self.desynchronised = true;
         Ok(())
     }
 
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), LspError> {
-        if self.desynchronised {
-            return Err(LspError::Protocol(
-                "language server state is unsynchronised".into(),
-            ));
-        }
-        write_frame(
-            &mut self.writer,
-            &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+    async fn send_change(&mut self, text: &str, version: i32) -> Result<(), LspError> {
+        self.notify(
+            "textDocument/didChange",
+            json!({
+                "textDocument": { "uri": &self.document.uri, "version": version },
+                "contentChanges": [{ "text": text }]
+            }),
         )
+        .await
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, LspError> {
-        if self.desynchronised {
-            return Err(LspError::Protocol(
-                "language server state is unsynchronised".into(),
-            ));
+    async fn notify(&mut self, method: &str, params: Value) -> Result<(), LspError> {
+        self.begin_exchange()?;
+        let result = timeout(
+            Duration::from_secs(30),
+            write_frame(
+                &mut self.writer,
+                &json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+            ),
+        )
+        .await
+        .map_err(|_| LspError::Io("language server write deadline exceeded".into()))?;
+        if result.is_ok() {
+            self.desynchronised = false;
         }
+        result
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, LspError> {
+        self.begin_exchange()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
         let id = self.next_id;
         self.next_id = self
             .next_id
             .checked_add(1)
             .ok_or_else(|| LspError::Protocol("request ID overflow".into()))?;
         let version = self.document.version;
-        write_frame(
-            &mut self.writer,
-            &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
-        )?;
-        loop {
-            let message = read_frame(&mut self.reader)?;
-            if message.get("id").and_then(Value::as_i64) == Some(id)
-                && message.get("method").is_none()
-            {
-                if version != self.document.version {
-                    return Err(LspError::StaleSnapshot);
+        let result = timeout_at(deadline, async {
+            write_frame(
+                &mut self.writer,
+                &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+            )
+            .await?;
+            loop {
+                let message = read_frame(&mut self.reader).await?;
+                if message.get("id").and_then(Value::as_i64) == Some(id)
+                    && message.get("method").is_none()
+                {
+                    if version != self.document.version {
+                        return Err(LspError::StaleSnapshot);
+                    }
+                    if let Some(error) = message.get("error") {
+                        self.desynchronised = false;
+                        return Err(LspError::Protocol(error.to_string()));
+                    }
+                    return message
+                        .get("result")
+                        .cloned()
+                        .ok_or_else(|| LspError::Protocol("response has no result".into()));
                 }
-                if let Some(error) = message.get("error") {
-                    return Err(LspError::Protocol(error.to_string()));
-                }
-                return message
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| LspError::Protocol("response has no result".into()));
+                self.process_incoming(&message).await?;
             }
-            self.process_incoming(&message)?;
+        })
+        .await
+        .map_err(|_| LspError::Io("language server operation deadline exceeded".into()))?;
+        if result.is_ok() {
+            self.desynchronised = false;
         }
+        result
     }
 
-    fn process_incoming(&mut self, message: &Value) -> Result<(), LspError> {
+    async fn process_incoming(&mut self, message: &Value) -> Result<(), LspError> {
         if message.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
         {
             let params = message
@@ -604,20 +695,20 @@ impl<R: Read, W: Write> LspSession<R, W> {
             } else {
                 json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "method not supported" } })
             };
-            write_frame(&mut self.writer, &response)?;
+            write_frame(&mut self.writer, &response).await?;
         }
         Ok(())
     }
 }
 
-fn read_frame<R: Read>(reader: &mut R) -> Result<Value, LspError> {
+async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Value, LspError> {
     let mut headers = Vec::with_capacity(64);
     while !headers.ends_with(b"\r\n\r\n") {
         if headers.len() >= MAX_HEADER_BYTES {
             return Err(LspError::Protocol("LSP header exceeds limit".into()));
         }
         let mut byte = [0_u8; 1];
-        reader.read_exact(&mut byte)?;
+        reader.read_exact(&mut byte).await?;
         headers.push(byte[0]);
     }
     let headers = std::str::from_utf8(&headers)
@@ -643,7 +734,7 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Value, LspError> {
         return Err(LspError::Protocol("LSP body length outside bounds".into()));
     }
     let mut body = vec![0; length];
-    reader.read_exact(&mut body)?;
+    reader.read_exact(&mut body).await?;
     let message: Value =
         serde_json::from_slice(&body).map_err(|_| LspError::Protocol("invalid LSP JSON".into()))?;
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") || !message.is_object() {
@@ -652,22 +743,26 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Value, LspError> {
     Ok(message)
 }
 
-fn write_frame<W: Write>(writer: &mut W, message: &Value) -> Result<(), LspError> {
+async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    message: &Value,
+) -> Result<(), LspError> {
     let body =
         serde_json::to_vec(message).map_err(|error| LspError::Protocol(error.to_string()))?;
     if body.len() > MAX_MESSAGE_BYTES {
         return Err(LspError::Protocol("LSP message exceeds limit".into()));
     }
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
-    writer.flush()?;
+    writer
+        .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+        .await?;
+    writer.write_all(&body).await?;
+    writer.flush().await?;
     Ok(())
 }
 
 fn text_line(text: &str, line: u32) -> Result<&str, LspError> {
-    text.split('\n')
-        .nth(line as usize)
-        .map(|text| text.strip_suffix('\r').unwrap_or(text))
+    chvrn_core::text::line_range(text, line as usize)
+        .map(|range| &text[range])
         .ok_or(LspError::InvalidPosition)
 }
 
@@ -715,80 +810,9 @@ fn wire_position(text: &str, position: &Value) -> Result<TextPosition, LspError>
 
 fn wire_offset(text: &str, position: &Value) -> Result<usize, LspError> {
     let converted = wire_position(text, position)?;
-    let mut offset = 0;
-    for line in text.split_inclusive('\n').take(converted.line as usize) {
-        offset += line.len();
-    }
-    Ok(offset + converted.byte_column)
-}
-
-pub struct TimedReader {
-    receiver: Receiver<std::io::Result<Vec<u8>>>,
-    pending: Cursor<Vec<u8>>,
-    timeout: Duration,
-    eof: bool,
-}
-
-impl TimedReader {
-    fn spawn(mut stdout: ChildStdout, timeout: Duration) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(16);
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 8192];
-            loop {
-                match stdout.read(&mut buffer) {
-                    Ok(0) => {
-                        let _ = sender.send(Ok(Vec::new()));
-                        break;
-                    }
-                    Ok(count) => {
-                        if sender.send(Ok(buffer[..count].to_vec())).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = sender.send(Err(error));
-                        break;
-                    }
-                }
-            }
-        });
-        Self {
-            receiver,
-            pending: Cursor::new(Vec::new()),
-            timeout,
-            eof: false,
-        }
-    }
-}
-
-impl Read for TimedReader {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if buffer.is_empty() || self.eof {
-            return Ok(0);
-        }
-        if self.pending.position() < self.pending.get_ref().len() as u64 {
-            return self.pending.read(buffer);
-        }
-        match self.receiver.recv_timeout(self.timeout) {
-            Ok(Ok(bytes)) if bytes.is_empty() => {
-                self.eof = true;
-                Ok(0)
-            }
-            Ok(Ok(bytes)) => {
-                self.pending = Cursor::new(bytes);
-                self.pending.read(buffer)
-            }
-            Ok(Err(error)) => Err(error),
-            Err(RecvTimeoutError::Timeout) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "language server response timed out",
-            )),
-            Err(RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "language server output ended",
-            )),
-        }
-    }
+    let range = chvrn_core::text::line_range(text, converted.line as usize)
+        .ok_or(LspError::InvalidPosition)?;
+    Ok(range.start + converted.byte_column)
 }
 
 #[derive(Debug, Clone)]
@@ -807,23 +831,25 @@ pub struct ServerCapabilities {
 }
 
 pub struct LspProcess {
-    child: Child,
-    session: LspSession<TimedReader, ChildStdin>,
+    child: OwnedChild,
+    session: LspSession<ChildStdout, ChildStdin>,
     capabilities: ServerCapabilities,
 }
 
 impl LspProcess {
-    pub fn start(
+    pub async fn start(
         config: Option<&LanguageServerConfig>,
         document: Document,
+        supervisor: &ProcessSupervisor,
     ) -> Result<Self, LspError> {
         let config = config.ok_or(LspError::Unavailable)?;
-        let mut child = Command::new(&config.executable)
-            .args(&config.arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut child = supervisor.spawn(
+            Command::new(&config.executable)
+                .args(&config.arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null()),
+        )?;
         let stdout = child
             .stdout
             .take()
@@ -832,11 +858,7 @@ impl LspProcess {
             .stdin
             .take()
             .ok_or_else(|| LspError::Protocol("server stdin is unavailable".into()))?;
-        let session = LspSession::new(
-            TimedReader::spawn(stdout, Duration::from_secs(30)),
-            stdin,
-            document,
-        );
+        let session = LspSession::new(stdout, stdin, document);
         let mut process = Self {
             child,
             session,
@@ -846,12 +868,29 @@ impl LspProcess {
                 formatting: false,
             },
         };
-        let result = process
-            .session
-            .initialise(config.root_uri.as_deref(), &config.language_id)?;
-        let capabilities = result
-            .get("capabilities")
-            .ok_or_else(|| LspError::Protocol("initialise response missing capabilities".into()))?;
+        let result = match timeout(
+            Duration::from_secs(30),
+            process
+                .session
+                .initialise(config.root_uri.as_deref(), &config.language_id),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            result => {
+                let _ = process.child.terminate().await;
+                return Err(match result {
+                    Ok(Err(error)) => error,
+                    _ => LspError::Io("language server startup deadline exceeded".into()),
+                });
+            }
+        };
+        let Some(capabilities) = result.get("capabilities") else {
+            let _ = process.child.terminate().await;
+            return Err(LspError::Protocol(
+                "initialise response missing capabilities".into(),
+            ));
+        };
         process.capabilities = ServerCapabilities {
             hover: enabled(capabilities.get("hoverProvider")),
             definition: enabled(capabilities.get("definitionProvider")),
@@ -864,51 +903,64 @@ impl LspProcess {
         self.capabilities
     }
 
-    pub fn session_mut(&mut self) -> &mut LspSession<TimedReader, ChildStdin> {
+    pub fn session_mut(&mut self) -> &mut LspSession<ChildStdout, ChildStdin> {
         &mut self.session
     }
 
-    pub fn hover(&mut self, position: TextPosition) -> Result<Option<String>, LspError> {
+    pub fn is_desynchronised(&self) -> bool {
+        self.session.desynchronised
+    }
+
+    pub async fn hover(&mut self, position: TextPosition) -> Result<Option<String>, LspError> {
         if !self.capabilities.hover {
             return Err(LspError::Unavailable);
         }
-        self.session.hover(position)
+        self.session.hover(position).await
     }
 
-    pub fn definition(&mut self, position: TextPosition) -> Result<Option<LspLocation>, LspError> {
+    pub async fn definition(
+        &mut self,
+        position: TextPosition,
+    ) -> Result<Option<LspLocation>, LspError> {
         if !self.capabilities.definition {
             return Err(LspError::Unavailable);
         }
-        self.session.definition(position)
+        self.session.definition(position).await
     }
 
-    pub fn format(&mut self, request: FormatRequest) -> Result<(), LspError> {
+    pub async fn format(&mut self, request: FormatRequest) -> Result<(), LspError> {
         if !self.capabilities.formatting {
             return Err(LspError::Unavailable);
         }
-        self.session.format(request)
+        self.session.format(request).await
     }
 
-    pub fn shutdown(mut self) -> Result<(), LspError> {
-        self.session.shutdown()?;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while self.child.try_wait()?.is_none() {
-            if Instant::now() >= deadline {
-                return Err(LspError::Io(
-                    "language server did not exit after shutdown".into(),
-                ));
-            }
-            std::thread::sleep(Duration::from_millis(20));
+    pub async fn shutdown(mut self) -> Result<(), LspError> {
+        if self.session.desynchronised {
+            self.child.terminate().await?;
+            return Ok(());
         }
-        Ok(())
-    }
-}
-
-impl Drop for LspProcess {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let exchange = timeout_at(deadline, self.session.shutdown())
+            .await
+            .map_err(|_| LspError::Io("language server shutdown deadline exceeded".into()))
+            .and_then(|result| result);
+        if let Err(error) = exchange {
+            self.child.terminate().await?;
+            return Err(error);
+        }
+        match timeout_at(deadline, self.child.wait()).await {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(Ok(status)) => Err(LspError::Io(format!(
+                "language server exited with {status}"
+            ))),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => {
+                self.child.terminate().await?;
+                Err(LspError::Io(
+                    "language server shutdown deadline exceeded".into(),
+                ))
+            }
         }
     }
 }

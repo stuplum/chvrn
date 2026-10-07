@@ -27,7 +27,7 @@ impl GuardedFile {
         let metadata = regular_metadata(&path)?;
         let bytes = metadata
             .as_ref()
-            .map(|_| fs::read(&path).map(Arc::new))
+            .map(|_| read_regular(&path).map(|(bytes, _)| Arc::new(bytes)))
             .transpose()?;
         let captured = Self {
             path,
@@ -68,7 +68,7 @@ impl GuardedFile {
         };
         let same_bytes = match (&self.bytes, &metadata) {
             (None, None) => true,
-            (Some(expected), Some(_)) => fs::read(&self.path)? == **expected,
+            (Some(expected), Some(_)) => read_regular(&self.path)?.0 == **expected,
             _ => false,
         };
         if !same_metadata || !same_bytes {
@@ -119,6 +119,25 @@ impl GuardedFile {
         self.metadata = regular_metadata(&self.path)?;
         Ok(())
     }
+}
+
+fn read_regular(path: &Path) -> Result<(Vec<u8>, Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(format!("refusing non-regular file: {}", path.display()).into());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let current = fs::symlink_metadata(path)?;
+    if !current.is_file() || !same_file(&metadata, &current) {
+        return Err(format!("file changed while reading: {}", path.display()).into());
+    }
+    Ok((bytes, metadata))
 }
 
 fn regular_metadata(path: &Path) -> Result<Option<Metadata>> {

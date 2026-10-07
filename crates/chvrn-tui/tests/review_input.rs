@@ -123,6 +123,30 @@ fn gutter_insertion_places_the_opposite_block_below_the_chosen_block() {
 }
 
 #[test]
+fn asymmetric_choices_keep_complete_advice_and_remaining_source_insertion() {
+    let mut session = ReviewSession::three_way("a\nb\n", "A\nb\n", "X\nY\n");
+    session.set_merge_advice_enabled(true);
+    let request = session.begin_merge_advice().unwrap();
+    let ours = &request.input().ours;
+    let captured: Vec<_> = ours
+        .snapshot
+        .text()
+        .lines()
+        .skip(ours.lines.start)
+        .take(ours.lines.len())
+        .collect();
+    assert_eq!(captured, ["A", "b"]);
+    session.cancel_merge_advice();
+    key(&mut session, KeyCode::Char('t'));
+    key(&mut session, KeyCode::Esc);
+    click_gutter_control(&mut session, "↘");
+    assert_eq!(session.pane_text(Pane::Result), "X\nY\nA\nb\n");
+    assert_eq!(session.pane_text(Pane::Ours), "A\nb\n");
+    assert_eq!(session.pane_text(Pane::Theirs), "X\nY\n");
+    assert_eq!(session.unresolved_conflicts(), 0);
+}
+
+#[test]
 fn gutter_insertion_preserves_duplicate_lines_in_the_two_blocks() {
     let mut session = ReviewSession::three_way(
         "head\nbase-a\nbase-middle\nbase-b\ntail\n",
@@ -782,15 +806,9 @@ fn older_background_diff_completion_cannot_replace_a_newer_snapshot() {
     let older = session.request_diff("original\n", "old candidate\n");
     let newer = session.request_diff("original\n", "latest candidate\n");
 
-    assert_eq!(
-        session.handle(ReviewInput::DiffReady(newer.compute())),
-        ReviewOutcome::Continue
-    );
+    session.handle(ReviewInput::DiffReady(newer.compute()));
     assert_eq!(session.pane_text(Pane::Right), "latest candidate\n");
-    assert_eq!(
-        session.handle(ReviewInput::DiffReady(older.compute())),
-        ReviewOutcome::Continue
-    );
+    session.handle(ReviewInput::DiffReady(older.compute()));
     assert_eq!(session.pane_text(Pane::Right), "latest candidate\n");
     assert_eq!(session.hunk_count(), 1);
 }
@@ -813,10 +831,7 @@ fn external_refresh_arriving_after_a_local_edit_requires_explicit_discard() {
         key(&mut session, KeyCode::Char('s')),
         ReviewOutcome::RefreshConflict
     );
-    assert_eq!(
-        session.handle(ReviewInput::DiscardAndReload),
-        ReviewOutcome::Continue
-    );
+    session.handle(ReviewInput::DiscardAndReload);
     assert_eq!(session.pane_text(Pane::Left), "original\n");
     assert_eq!(session.pane_text(Pane::Right), "external\n");
     assert!(matches!(
@@ -1093,4 +1108,73 @@ fn large_review_capture_preserves_current_identity_before_background_diff() {
     let actual = captured.snapshot();
     assert!(session.pane_matches_snapshot(Pane::Left, &actual));
     assert_eq!(actual.text().lines().nth(10_000), Some("Xline10000"));
+}
+
+#[test]
+fn foreign_refresh_cannot_replace_an_already_accepted_snapshot() {
+    let mut first = ReviewSession::two_way("first\n", "first\n");
+    let foreign = first.request_diff("first\n", "foreign\n");
+    let mut second = ReviewSession::two_way("second\n", "second\n");
+    let own = second.request_diff("second\n", "current\n");
+    second.handle(ReviewInput::DiffReady(own.compute()));
+    let current = second.pane_snapshot(Pane::Right);
+
+    second.handle(ReviewInput::DiffReady(foreign.compute()));
+
+    assert_eq!(second.pane_text(Pane::Right), "current\n");
+    assert!(second.pane_matches_snapshot(Pane::Right, &current));
+}
+
+#[test]
+fn whitespace_change_during_refresh_installs_incoming_bytes_under_current_policy() {
+    let mut session = ReviewSession::two_way("old\n", "old\n");
+    let request = session.request_diff("incoming \n", "incoming\n");
+    session.set_whitespace_policy(WhitespacePolicy::IgnoreEdge);
+
+    session.handle(ReviewInput::DiffReady(request.compute()));
+
+    assert_eq!(session.pane_text(Pane::Left), "incoming \n");
+    assert_eq!(session.pane_text(Pane::Right), "incoming\n");
+    assert_eq!(session.hunk_count(), 0);
+    assert!(matches!(
+        key(&mut session, KeyCode::Char('s')),
+        ReviewOutcome::Submitted(submission)
+            if submission.left == "incoming \n" && submission.right == "incoming\n"
+    ));
+}
+
+#[test]
+fn whitespace_change_preserves_explicit_discard_for_dirty_refresh() {
+    let mut session = ReviewSession::two_way("old\n", "old\n");
+    let request = session.request_diff("incoming \n", "incoming\n");
+    key(&mut session, KeyCode::Char('i'));
+    session.handle(ReviewInput::Paste("local ".into()));
+    key(&mut session, KeyCode::Esc);
+    session.set_whitespace_policy(WhitespacePolicy::IgnoreEdge);
+
+    assert_eq!(
+        session.handle(ReviewInput::DiffReady(request.compute())),
+        ReviewOutcome::RefreshConflict
+    );
+    assert_eq!(session.pane_text(Pane::Left), "local old\n");
+    session.handle(ReviewInput::DiscardAndReload);
+    assert_eq!(session.pane_text(Pane::Left), "incoming \n");
+    assert_eq!(session.pane_text(Pane::Right), "incoming\n");
+    assert_eq!(session.hunk_count(), 0);
+}
+
+#[test]
+fn editing_displayed_line_treats_unicode_separators_as_content() {
+    for separator in ['\u{000b}', '\u{000c}', '\u{0085}', '\u{2028}', '\u{2029}'] {
+        let original = format!("a{separator}b\nc");
+        let mut session = ReviewSession::two_way(&original, &original);
+        session.go_to(Pane::Left, 1, 0);
+        key(&mut session, KeyCode::Char('i'));
+        session.handle(ReviewInput::Paste("X".into()));
+        assert_eq!(
+            session.pane_text(Pane::Left),
+            format!("a{separator}b\nXc"),
+            "separator {separator:?}"
+        );
+    }
 }

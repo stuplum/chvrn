@@ -364,10 +364,7 @@ impl<'a> Parser<'a> {
         self.advance();
         let mut old_used = 0;
         let mut new_used = 0;
-        loop {
-            let Some(line) = self.peek() else {
-                break;
-            };
+        while let Some(line) = self.peek() {
             if line.text == "\\ No newline at end of file" {
                 let previous = hunk.lines.last_mut().ok_or_else(|| {
                     PatchError::new(line.number, "newline marker has no preceding line")
@@ -443,10 +440,7 @@ impl<'a> Parser<'a> {
 
     fn binary_payload(&mut self) -> Result<(), PatchError> {
         let mut sections = 0;
-        loop {
-            let Some(header) = self.peek() else {
-                break;
-            };
+        while let Some(header) = self.peek() {
             if header.text.starts_with("diff --git ") {
                 break;
             }

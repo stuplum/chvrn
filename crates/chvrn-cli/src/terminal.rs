@@ -151,7 +151,9 @@ pub fn run(session: &mut ReviewSession, host: &mut impl ReviewHost) -> Result<u8
             ReviewOutcome::UnresolvedConflicts(count) => session.set_message(format!(
                 "Resolve {count} remaining conflicts before submitting"
             )),
-            ReviewOutcome::Continue => {}
+            ReviewOutcome::Continue
+            | ReviewOutcome::RefreshApplied
+            | ReviewOutcome::RefreshSuperseded => {}
         }
     }
 }

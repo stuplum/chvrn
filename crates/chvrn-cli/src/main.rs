@@ -1,5 +1,6 @@
 mod files;
 mod herdr_ui;
+mod integration_runtime;
 mod jev_ui;
 mod language;
 mod pager;
@@ -63,6 +64,8 @@ struct Options {
     lsp: Option<PathBuf>,
     #[arg(long = "lsp-arg", global = true, allow_hyphen_values = true)]
     lsp_args: Vec<OsString>,
+    #[arg(skip)]
+    runtime: integration_runtime::IntegrationRuntime,
 }
 
 impl Options {
@@ -187,7 +190,7 @@ fn execute(cli: Cli) -> Result<u8> {
         }
     }
     let options = &options;
-    match cli.command {
+    let result = match cli.command {
         Some(Command::Diff { left, right }) => standalone::diff(left, right, options),
         Some(Command::Merge(args)) => standalone::merge(args, options),
         Some(Command::Difftool { left, right }) => standalone::diff(
@@ -212,7 +215,9 @@ fn execute(cli: Cli) -> Result<u8> {
         Some(Command::Review(args)) => repository::review(args, options),
         Some(Command::Pager) => pager::run(options),
         None => repository::review(ReviewArgs::default(), options),
-    }
+    };
+    options.runtime.shutdown();
+    result
 }
 
 fn main() -> ExitCode {

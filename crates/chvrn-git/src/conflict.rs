@@ -1,5 +1,6 @@
 use crate::{ContentKind, GitError, Repository, SplitByte, classify, nul_fields, path_bytes};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -46,6 +47,13 @@ struct ConflictWorktree {
 
 impl Repository {
     pub fn conflict(&self, path: &Path) -> Result<Option<ConflictSnapshot>, GitError> {
+        let pinned = self.pin_index()?;
+        let snapshot = pinned.repository.conflict_pinned(path)?;
+        pinned.validate(self)?;
+        Ok(snapshot)
+    }
+
+    fn conflict_pinned(&self, path: &Path) -> Result<Option<ConflictSnapshot>, GitError> {
         let entries = self.index_entries(path)?;
         if entries[1..].iter().all(Option::is_none) {
             return Ok(None);
@@ -152,18 +160,16 @@ impl Repository {
 
     fn conflict_worktree(&self, path: &Path) -> Result<ConflictWorktree, GitError> {
         self.validate_path(path)?;
-        let path = self.root.join(path);
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                GitError::StaleConflict
-            } else {
-                GitError::IoFailure
-            }
-        })?;
+        let mut file = self
+            .open_worktree_file(path)?
+            .ok_or(GitError::StaleConflict)?;
+        let metadata = file.metadata().map_err(|_| GitError::IoFailure)?;
         if !metadata.is_file() {
             return Err(GitError::NonRegularConflict { stage: 0 });
         }
-        let bytes = fs::read(path).map_err(|_| GitError::IoFailure)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| GitError::IoFailure)?;
         Ok(ConflictWorktree {
             bytes,
             permissions: metadata.permissions(),

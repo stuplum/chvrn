@@ -1,15 +1,19 @@
+use crate::process::ProcessSupervisor;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::env;
-#[cfg(unix)]
-use std::io::{BufRead, Read, Write};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(unix)]
+use std::process::{Output, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::process::Command;
+use tokio::time::{Instant, timeout_at};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleReliability {
@@ -123,8 +127,16 @@ impl HerdrBridge {
     }
 
     pub fn observe_agent_session(&mut self, identity: AgentSessionIdentity) -> Vec<BridgeEffect> {
-        let changed = matches!((&self.agent_session, &identity),
-            (AgentSessionIdentity::Verified(previous), AgentSessionIdentity::Verified(next)) if previous != next);
+        let changed = match &identity {
+            AgentSessionIdentity::Verified(next) => {
+                matches!(&self.agent_session, AgentSessionIdentity::Verified(previous) if previous != next)
+                    || self
+                        .pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.report.agent_session_id != *next)
+            }
+            AgentSessionIdentity::Unverified => false,
+        };
         let effects = if changed {
             self.invalidate_pending()
         } else {
@@ -188,6 +200,10 @@ impl HerdrBridge {
             .last
             .as_ref()
             .is_some_and(|last| last.terminal_id != terminal)
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.report.terminal_id != terminal)
         {
             effects.extend(self.invalidate_pending());
             self.agent_session = AgentSessionIdentity::Unverified;
@@ -380,29 +396,107 @@ pub enum FeedbackDelivery {
     Uncertain(String),
 }
 
+#[derive(Clone, Default)]
+pub struct DeliveryState(Arc<AtomicBool>);
+
+impl DeliveryState {
+    pub fn unconfirmed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 pub struct HerdrProcess {
     binary: PathBuf,
+    supervisor: ProcessSupervisor,
+    deadline: Option<Instant>,
+    delivery: DeliveryState,
 }
 
 impl HerdrProcess {
-    pub fn from_environment() -> Result<Self, HerdrProcessError> {
+    pub fn from_environment(supervisor: ProcessSupervisor) -> Result<Self, HerdrProcessError> {
         let binary = env::var_os("HERDR_BIN_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("herdr"));
-        Self::new(binary)
+        Self::new(binary, supervisor)
     }
 
-    pub fn new(binary: impl Into<PathBuf>) -> Result<Self, HerdrProcessError> {
+    pub fn new(
+        binary: impl Into<PathBuf>,
+        supervisor: ProcessSupervisor,
+    ) -> Result<Self, HerdrProcessError> {
         if env::var("HERDR_ENV").as_deref() != Ok("1") {
             return Err(HerdrProcessError::Unavailable);
         }
         Ok(Self {
             binary: binary.into(),
+            supervisor,
+            deadline: None,
+            delivery: DeliveryState::default(),
         })
     }
 
-    fn invoke(&self, arguments: &[&str]) -> Result<Value, HerdrProcessError> {
-        let output = Command::new(&self.binary).args(arguments).output()?;
+    pub fn delivery_state(&self) -> DeliveryState {
+        self.delivery.clone()
+    }
+
+    fn operation(&self) -> Self {
+        Self {
+            binary: self.binary.clone(),
+            supervisor: self.supervisor.clone(),
+            deadline: Some(
+                self.deadline
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(30)),
+            ),
+            delivery: self.delivery.clone(),
+        }
+    }
+
+    async fn output(&self, arguments: &[&str]) -> Result<Output, HerdrProcessError> {
+        let deadline = self
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
+        if Instant::now() >= deadline {
+            return Err(deadline_error());
+        }
+        let mut child = self.supervisor.spawn(
+            Command::new(&self.binary)
+                .args(arguments)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(HerdrProcessError::InvalidResponse)?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(HerdrProcessError::InvalidResponse)?;
+        let result = timeout_at(deadline, async {
+            let (stdout, stderr) = tokio::try_join!(capture(stdout), capture(stderr))?;
+            let status = child.wait().await?;
+            Ok::<_, HerdrProcessError>(Output {
+                status,
+                stdout,
+                stderr,
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(output)) => Ok(output),
+            result => {
+                let _ = child.terminate().await;
+                Err(match result {
+                    Ok(Err(error)) => error,
+                    _ => deadline_error(),
+                })
+            }
+        }
+    }
+
+    async fn invoke(&self, arguments: &[&str]) -> Result<Value, HerdrProcessError> {
+        let output = self.output(arguments).await?;
         if !output.status.success() {
             return Err(HerdrProcessError::Rejected(
                 String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -411,8 +505,8 @@ impl HerdrProcess {
         serde_json::from_slice(&output.stdout).map_err(|_| HerdrProcessError::InvalidResponse)
     }
 
-    pub fn get_agent(&self, pane_id: &str) -> Result<Value, HerdrProcessError> {
-        let envelope = self.invoke(&["agent", "get", pane_id])?;
+    pub async fn get_agent(&self, pane_id: &str) -> Result<Value, HerdrProcessError> {
+        let envelope = self.invoke(&["agent", "get", pane_id]).await?;
         if envelope
             .pointer("/result/agent/pane_id")
             .and_then(Value::as_str)
@@ -423,8 +517,8 @@ impl HerdrProcess {
         Ok(envelope)
     }
 
-    pub fn resolve_target(&self, name_or_pane: &str) -> Result<String, HerdrProcessError> {
-        let envelope = self.invoke(&["agent", "get", name_or_pane])?;
+    pub async fn resolve_target(&self, name_or_pane: &str) -> Result<String, HerdrProcessError> {
+        let envelope = self.invoke(&["agent", "get", name_or_pane]).await?;
         envelope
             .pointer("/result/agent/pane_id")
             .and_then(Value::as_str)
@@ -433,8 +527,8 @@ impl HerdrProcess {
             .ok_or(HerdrProcessError::InvalidResponse)
     }
 
-    pub fn pane_get(&self, pane_id: &str) -> Result<Value, HerdrProcessError> {
-        let envelope = self.invoke(&["pane", "get", pane_id])?;
+    pub async fn pane_get(&self, pane_id: &str) -> Result<Value, HerdrProcessError> {
+        let envelope = self.invoke(&["pane", "get", pane_id]).await?;
         if envelope
             .pointer("/result/pane/pane_id")
             .and_then(Value::as_str)
@@ -445,38 +539,24 @@ impl HerdrProcess {
         Ok(envelope)
     }
 
-    pub fn focus_agent(&self, name_or_pane: &str) -> Result<Value, HerdrProcessError> {
-        self.resolve_target(name_or_pane)?;
-        self.invoke(&["agent", "focus", name_or_pane])
+    pub async fn focus_agent(&self, name_or_pane: &str) -> Result<Value, HerdrProcessError> {
+        let operation = self.operation();
+        operation.resolve_target(name_or_pane).await?;
+        operation.invoke(&["agent", "focus", name_or_pane]).await
     }
 
-    #[cfg(unix)]
-    pub fn focus_pane(&self, pane_id: &str) -> Result<(), HerdrProcessError> {
-        self.pane_get(pane_id)?;
+    pub async fn focus_pane(&self, pane_id: &str) -> Result<(), HerdrProcessError> {
+        let operation = self.operation();
+        operation.pane_get(pane_id).await?;
         let socket = env::var_os("HERDR_SOCKET_PATH").ok_or(HerdrProcessError::Unavailable)?;
-        let mut stream = UnixStream::connect(socket)?;
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-        let request = json!({ "id": "chvrn_focus", "method": "pane.focus", "params": { "pane_id": pane_id } });
-        let body = serde_json::to_vec(&request).map_err(|_| HerdrProcessError::InvalidResponse)?;
-        stream.write_all(&body)?;
-        stream.write_all(b"\n")?;
-        let mut response = Vec::new();
-        std::io::BufReader::new(stream)
-            .take(65_536)
-            .read_until(b'\n', &mut response)?;
-        if response.len() > 65_535 || !response.ends_with(b"\n") {
-            return Err(HerdrProcessError::InvalidResponse);
-        }
-        let result: Value =
-            serde_json::from_slice(&response).map_err(|_| HerdrProcessError::InvalidResponse)?;
-        if result.get("id").and_then(Value::as_str) != Some("chvrn_focus")
-            || result.get("error").is_some()
-        {
-            return Err(HerdrProcessError::Rejected(result.to_string()));
-        }
-        if self
-            .pane_get(pane_id)?
+        let deadline = operation
+            .deadline
+            .unwrap()
+            .min(Instant::now() + Duration::from_secs(3));
+        focus_exchange(&PathBuf::from(socket), pane_id, deadline).await?;
+        if operation
+            .pane_get(pane_id)
+            .await?
             .pointer("/result/pane/focused")
             .and_then(Value::as_bool)
             != Some(true)
@@ -486,7 +566,7 @@ impl HerdrProcess {
         Ok(())
     }
 
-    pub fn split(
+    pub async fn split(
         &self,
         pane_id: &str,
         direction: SplitDirection,
@@ -497,17 +577,19 @@ impl HerdrProcess {
             SplitDirection::Down => "down",
         };
         let cwd = cwd.to_str().ok_or(HerdrProcessError::InvalidResponse)?;
-        let response = self.invoke(&[
-            "pane",
-            "split",
-            "--pane",
-            pane_id,
-            "--direction",
-            direction,
-            "--cwd",
-            cwd,
-            "--no-focus",
-        ])?;
+        let response = self
+            .invoke(&[
+                "pane",
+                "split",
+                "--pane",
+                pane_id,
+                "--direction",
+                direction,
+                "--cwd",
+                cwd,
+                "--no-focus",
+            ])
+            .await?;
         response
             .pointer("/result/pane/pane_id")
             .and_then(Value::as_str)
@@ -515,10 +597,8 @@ impl HerdrProcess {
             .ok_or(HerdrProcessError::InvalidResponse)
     }
 
-    pub fn run_pane(&self, pane_id: &str, command: &str) -> Result<(), HerdrProcessError> {
-        let output = Command::new(&self.binary)
-            .args(["pane", "run", pane_id, command])
-            .output()?;
+    pub async fn run_pane(&self, pane_id: &str, command: &str) -> Result<(), HerdrProcessError> {
+        let output = self.output(&["pane", "run", pane_id, command]).await?;
         if !output.status.success() {
             return Err(HerdrProcessError::Rejected(
                 String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -527,8 +607,12 @@ impl HerdrProcess {
         Ok(())
     }
 
-    pub fn sample(&self, bridge: &mut HerdrBridge) -> Result<Vec<BridgeEffect>, HerdrProcessError> {
-        let (envelope, identity) = self.authoritative_agent(&bridge.pane_id)?;
+    pub async fn sample(
+        &self,
+        bridge: &mut HerdrBridge,
+    ) -> Result<Vec<BridgeEffect>, HerdrProcessError> {
+        let operation = self.operation();
+        let (envelope, identity) = operation.authoritative_agent(&bridge.pane_id).await?;
         let reliability = if matches!(identity, AgentSessionIdentity::Verified(_)) {
             LifecycleReliability::Verified
         } else {
@@ -545,21 +629,22 @@ impl HerdrProcess {
         Ok(effects)
     }
 
-    fn authoritative_agent(
+    async fn authoritative_agent(
         &self,
         pane_id: &str,
     ) -> Result<(Value, AgentSessionIdentity), HerdrProcessError> {
-        let first = self.get_agent(pane_id)?;
-        let explain_output = Command::new(&self.binary)
-            .args(["agent", "explain", "--json", pane_id])
-            .output()?;
-        let explanation: Value = if explain_output.status.success() {
-            serde_json::from_slice(&explain_output.stdout)
+        let operation = self.operation();
+        let first = operation.get_agent(pane_id).await?;
+        let output = operation
+            .output(&["agent", "explain", "--json", pane_id])
+            .await?;
+        let explanation = if output.status.success() {
+            serde_json::from_slice(&output.stdout)
                 .map_err(|_| HerdrProcessError::InvalidResponse)?
         } else {
             Value::Null
         };
-        let latest = self.get_agent(pane_id)?;
+        let latest = operation.get_agent(pane_id).await?;
         let before = first
             .pointer("/result/agent")
             .ok_or(HerdrProcessError::InvalidResponse)?;
@@ -570,7 +655,7 @@ impl HerdrProcess {
         Ok((latest, identity))
     }
 
-    pub fn deliver_feedback(
+    pub async fn deliver_feedback(
         &self,
         bridge: &mut HerdrBridge,
         report: &ReviewReport,
@@ -582,22 +667,21 @@ impl HerdrProcess {
         {
             return Err(HerdrProcessError::InvalidResponse);
         }
+        let operation = self.operation();
         let text = serde_json::to_string(&json!({ "chvrn_review": report }))
             .map_err(|_| HerdrProcessError::InvalidResponse)?;
-        let result = {
-            let target = bridge
-                .verified_identity()
-                .ok_or(HerdrProcessError::Unavailable)?;
-            if target.pane_id != report.pane_id
-                || target.terminal_id != report.terminal_id
-                || target.agent_session_id != report.agent_session_id
-            {
-                return Ok(FeedbackDelivery::Uncertain(
-                    "review target changed before prompt".into(),
-                ));
-            }
-            self.send_verified_prompt(&target, &text)?
-        };
+        let target = bridge
+            .verified_identity()
+            .ok_or(HerdrProcessError::Unavailable)?;
+        if target.pane_id != report.pane_id
+            || target.terminal_id != report.terminal_id
+            || target.agent_session_id != report.agent_session_id
+        {
+            return Ok(FeedbackDelivery::Uncertain(
+                "review target changed before prompt".into(),
+            ));
+        }
+        let result = operation.send_verified_prompt(&target, &text).await?;
         match &result {
             FeedbackDelivery::Delivered => bridge
                 .feedback_delivered(&report.id)
@@ -610,7 +694,7 @@ impl HerdrProcess {
         Ok(result)
     }
 
-    pub fn request_explanation(
+    pub async fn request_explanation(
         &self,
         bridge: &HerdrBridge,
         snapshot_id: &str,
@@ -625,21 +709,22 @@ impl HerdrProcess {
         {
             return Err(HerdrProcessError::InvalidResponse);
         }
+        let operation = self.operation();
         let target = bridge
             .verified_identity()
             .ok_or(HerdrProcessError::Unavailable)?;
         let text = serde_json::to_string(&json!({
             "chvrn_explain": { "snapshot_id": snapshot_id, "path": path, "range": range, "question": question }
         })).map_err(|_| HerdrProcessError::InvalidResponse)?;
-        self.send_verified_prompt(&target, &text)
+        operation.send_verified_prompt(&target, &text).await
     }
 
-    fn send_verified_prompt(
+    async fn send_verified_prompt(
         &self,
         target: &VerifiedAgentTarget<'_>,
         text: &str,
     ) -> Result<FeedbackDelivery, HerdrProcessError> {
-        let (current, identity) = self.authoritative_agent(target.pane_id)?;
+        let (current, identity) = self.authoritative_agent(target.pane_id).await?;
         let agent = current
             .pointer("/result/agent")
             .ok_or(HerdrProcessError::InvalidResponse)?;
@@ -654,9 +739,10 @@ impl HerdrProcess {
                 "agent identity or readiness changed before prompt".into(),
             ));
         }
-        let output = match Command::new(&self.binary)
-            .args(["agent", "prompt", target.pane_id, text])
-            .output()
+        self.delivery.0.store(true, Ordering::Release);
+        let output = match self
+            .output(&["agent", "prompt", target.pane_id, text])
+            .await
         {
             Ok(output) => output,
             Err(error) => return Ok(FeedbackDelivery::Uncertain(error.to_string())),
@@ -681,10 +767,14 @@ impl HerdrProcess {
                     "prompt response did not confirm the target pane".into(),
                 ));
             }
-            let after = self.authoritative_agent(target.pane_id);
-            if after.is_ok_and(|(_, identity)| {
-                identity == AgentSessionIdentity::Verified(target.agent_session_id.into())
-            }) {
+            if self
+                .authoritative_agent(target.pane_id)
+                .await
+                .is_ok_and(|(_, identity)| {
+                    identity == AgentSessionIdentity::Verified(target.agent_session_id.into())
+                })
+            {
+                self.delivery.0.store(false, Ordering::Release);
                 return Ok(FeedbackDelivery::Delivered);
             }
             return Ok(FeedbackDelivery::Uncertain(
@@ -693,11 +783,36 @@ impl HerdrProcess {
         }
         let error: Value = serde_json::from_slice(&output.stderr).unwrap_or(Value::Null);
         if error.pointer("/error/code").and_then(Value::as_str) == Some("agent_blocked") {
+            self.delivery.0.store(false, Ordering::Release);
             return Ok(FeedbackDelivery::RejectedBlocked);
         }
         Ok(FeedbackDelivery::Uncertain(
             String::from_utf8_lossy(&output.stderr).into_owned(),
         ))
+    }
+}
+
+fn deadline_error() -> HerdrProcessError {
+    HerdrProcessError::Io(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "Herdr command deadline exceeded",
+    ))
+}
+
+async fn capture(mut stream: impl AsyncRead + Unpin) -> Result<Vec<u8>, HerdrProcessError> {
+    let mut output = Vec::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = stream.read(&mut buffer).await?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if output.len() + count > 1_048_576 {
+            return Err(HerdrProcessError::Io(std::io::Error::other(
+                "Herdr output exceeds 1 MiB limit",
+            )));
+        }
+        output.extend_from_slice(&buffer[..count]);
     }
 }
 
@@ -754,6 +869,30 @@ fn verified_agent_identity(
         .unwrap_or(AgentSessionIdentity::Unverified)
 }
 
+async fn focus_exchange(
+    socket: &Path,
+    pane_id: &str,
+    deadline: Instant,
+) -> Result<(), HerdrProcessError> {
+    timeout_at(deadline, async {
+        let mut stream = UnixStream::connect(socket).await?;
+        let request = json!({ "id": "chvrn_focus", "method": "pane.focus", "params": { "pane_id": pane_id } });
+        let body = serde_json::to_vec(&request).map_err(|_| HerdrProcessError::InvalidResponse)?;
+        stream.write_all(&body).await?;
+        stream.write_all(b"\n").await?;
+        let mut response = Vec::new();
+        BufReader::new(stream.take(65_536)).read_until(b'\n', &mut response).await?;
+        if response.len() > 65_535 || !response.ends_with(b"\n") {
+            return Err(HerdrProcessError::InvalidResponse);
+        }
+        let result: Value = serde_json::from_slice(&response).map_err(|_| HerdrProcessError::InvalidResponse)?;
+        if result.get("id").and_then(Value::as_str) != Some("chvrn_focus") || result.get("error").is_some() {
+            return Err(HerdrProcessError::Rejected(result.to_string()));
+        }
+        Ok(())
+    }).await.map_err(|_| deadline_error())?
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AgentSessionIdentity, verified_agent_identity};
@@ -768,6 +907,243 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    #[tokio::test]
+    async fn cancellation_during_target_resolution_reaps_the_child() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let binary = dir.path().join("herdr");
+        let path = dir.path().join("ready.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        fs::write(&binary, format!("#!/bin/sh\nexec /usr/bin/python3 -c 'import socket,os,time;s=socket.socket(socket.AF_UNIX);s.connect(\"{}\");s.sendall(str(os.getpid()).encode());s.shutdown(socket.SHUT_WR);time.sleep(60)'\n", path.display())).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = crate::process::ProcessSupervisor::default();
+        let process = HerdrProcess {
+            binary,
+            supervisor: supervisor.clone(),
+            deadline: None,
+            delivery: super::DeliveryState::default(),
+        };
+        let operation = tokio::spawn(async move { process.resolve_target("pane").await });
+        let pid: libc::pid_t = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut pid = String::new();
+            stream.read_to_string(&mut pid).await.unwrap();
+            pid.parse().unwrap()
+        })
+        .await
+        .unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), supervisor.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_prompt_confirmation_stays_uncertain_and_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("herdr");
+        let pidfile = dir.path().join("prompt-pid");
+        let envelope = json!({"id":"cli:agent:get","result":{"type":"agent_info","agent":{
+            "agent":"omp","agent_status":"done","pane_id":"pane","terminal_id":"terminal",
+            "revision":1,"state_change_seq":1,
+            "agent_session":{"agent":"omp","source":"herdr:omp","kind":"path","value":"/sessions/one.jsonl"}
+        }}});
+        let explanation = json!({"agent":"omp","screen_detection_skipped":true,"screen_detection_skip_reason":"full_lifecycle_hook_authority","skip_state_update":false});
+        fs::write(&binary, format!("#!/bin/sh\ncase \"$1 $2\" in\n'agent get') printf '%s' '{envelope}';;\n'agent explain') printf '%s' '{explanation}';;\n'agent prompt') printf '%s' $$ > '{}'; exec sleep 60;;\nesac\n", pidfile.display())).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = crate::process::ProcessSupervisor::default();
+        let mut process = HerdrProcess {
+            binary,
+            supervisor: supervisor.clone(),
+            deadline: None,
+            delivery: super::DeliveryState::default(),
+        };
+        let mut bridge = HerdrBridge::new("pane");
+        process.sample(&mut bridge).await.unwrap();
+        let report = ReviewReport {
+            id: "report".into(),
+            pane_id: "pane".into(),
+            terminal_id: "terminal".into(),
+            agent_session_id: "/sessions/one.jsonl".into(),
+            snapshot_id: "snapshot".into(),
+            files: vec![],
+            comment: "accept".into(),
+        };
+        bridge.submit(report.clone()).unwrap();
+        assert!(matches!(
+            process.sample(&mut bridge).await.unwrap().as_slice(),
+            [BridgeEffect::SendFeedback { .. }]
+        ));
+        process.deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            process.deliver_feedback(&mut bridge, &report),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(result, super::FeedbackDelivery::Uncertain(_)));
+        assert!(process.delivery_state().unconfirmed());
+        assert_eq!(bridge.pending_report(), Some(&report));
+        assert!(
+            bridge
+                .observe(&envelope.to_string(), LifecycleReliability::Verified)
+                .unwrap()
+                .is_empty()
+        );
+        supervisor.shutdown().await;
+        let pid: libc::pid_t = fs::read_to_string(pidfile).unwrap().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[tokio::test]
+    async fn hung_child_times_out_and_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("herdr");
+        let pidfile = dir.path().join("pid");
+        fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nprintf '%s' $$ > '{}'\nexec sleep 60\n",
+                pidfile.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = crate::process::ProcessSupervisor::default();
+        let process = HerdrProcess {
+            binary,
+            supervisor: supervisor.clone(),
+            deadline: None,
+            delivery: super::DeliveryState::default(),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(35),
+            process.run_pane("pane", "ignored"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(HerdrProcessError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        supervisor.shutdown().await;
+        let pid: libc::pid_t = fs::read_to_string(pidfile).unwrap().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn simultaneous_child_streams_are_drained_and_stderr_overflow_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("herdr");
+        fs::write(&binary, b"#!/bin/sh\nexec /usr/bin/python3 -c 'import os,threading; t=threading.Thread(target=lambda:os.write(1,b\"x\"*524288));t.start();os.write(2,b\"x\"*524288);t.join()'\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = crate::process::ProcessSupervisor::default();
+        let process = HerdrProcess {
+            binary: binary.clone(),
+            supervisor: supervisor.clone(),
+            deadline: None,
+            delivery: super::DeliveryState::default(),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process.run_pane("pane", "ignored"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        fs::write(
+            &binary,
+            b"#!/bin/sh\nexec /usr/bin/python3 -c 'import os;os.write(2,b\"x\"*2097152)'\n",
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            process.run_pane("pane", "ignored"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(HerdrProcessError::Io(error)) if error.to_string().contains("1 MiB"))
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn focus_socket_trickle_cannot_extend_the_exchange_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("focus.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut byte = [0];
+            loop {
+                stream.read_exact(&mut byte).await.unwrap();
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            let _ = ready.send(());
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+            loop {
+                interval.tick().await;
+                if stream.write_all(b" ").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let focus = super::focus_exchange(
+            &path,
+            "pane",
+            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+        );
+        let (result, handshake) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), focus),
+            tokio::time::timeout(std::time::Duration::from_secs(2), started),
+        );
+        handshake.unwrap().unwrap();
+        assert!(
+            matches!(result.unwrap(), Err(HerdrProcessError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_run_rejects_oversized_successful_child_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("herdr");
+        fs::write(
+            &binary,
+            b"#!/bin/sh\ndd if=/dev/zero bs=1048576 count=2 2>/dev/null\n",
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = crate::process::ProcessSupervisor::default();
+        let process = HerdrProcess {
+            binary,
+            supervisor: supervisor.clone(),
+            deadline: None,
+            delivery: super::DeliveryState::default(),
+        };
+        assert!(process.run_pane("w9:p5", "ignored").await.is_err());
+        drop(process);
+        supervisor.shutdown().await;
+    }
     #[test]
     fn official_omp_session_path_is_verified_and_replacement_is_not_the_same_session() {
         let explanation = json!({
@@ -812,22 +1188,29 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn pane_run_accepts_success_with_empty_stdout_and_preserves_command_errors() {
+    #[tokio::test]
+    async fn pane_run_accepts_success_with_empty_stdout_and_preserves_command_errors() {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("herdr");
         fs::write(&binary, b"#!/bin/sh\nif [ \"$1\" = pane ] && [ \"$2\" = run ] && [ \"$3\" = w9:p5 ] && [ \"$4\" = 'echo hello' ]; then exit 0; fi\necho 'unexpected pane run' >&2\nexit 2\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let process = HerdrProcess { binary };
-        assert!(process.run_pane("w9:p5", "echo hello").is_ok());
+        let supervisor = crate::process::ProcessSupervisor::default();
+        let process = HerdrProcess {
+            binary,
+            supervisor: supervisor.clone(),
+            deadline: None,
+            delivery: super::DeliveryState::default(),
+        };
+        assert!(process.run_pane("w9:p5", "echo hello").await.is_ok());
         assert!(
-            matches!(process.run_pane("w9:p5", "bad command"), Err(HerdrProcessError::Rejected(message)) if message.contains("unexpected pane run"))
+            matches!(process.run_pane("w9:p5", "bad command").await, Err(HerdrProcessError::Rejected(message)) if message.contains("unexpected pane run"))
         );
     }
 
     #[cfg(unix)]
-    #[test]
-    fn completed_official_turn_accepts_feedback_and_explanation_prompts_with_verified_session() {
+    #[tokio::test]
+    async fn completed_official_turn_accepts_feedback_and_explanation_prompts_with_verified_session()
+     {
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("herdr");
         let payload = dir.path().join("prompt.json");
@@ -853,9 +1236,15 @@ mod tests {
         );
         fs::write(&binary, script).unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let process = HerdrProcess { binary };
+        let supervisor = crate::process::ProcessSupervisor::default();
+        let process = HerdrProcess {
+            binary,
+            supervisor: supervisor.clone(),
+            deadline: None,
+            delivery: super::DeliveryState::default(),
+        };
         let mut bridge = HerdrBridge::new("w9:p5");
-        assert!(process.sample(&mut bridge).unwrap().is_empty());
+        assert!(process.sample(&mut bridge).await.unwrap().is_empty());
         let report = ReviewReport {
             id: "review-one".into(),
             pane_id: "w9:p5".into(),
@@ -879,10 +1268,15 @@ mod tests {
             comment: "accept".into(),
         };
         bridge.submit(report.clone()).unwrap();
-        assert!(matches!(process.sample(&mut bridge).unwrap().as_slice(),
-            [BridgeEffect::SendFeedback { report: queued }] if queued.id == "review-one"));
+        assert!(
+            matches!(process.sample(&mut bridge).await.unwrap().as_slice(),
+            [BridgeEffect::SendFeedback { report: queued }] if queued.id == "review-one")
+        );
         assert_eq!(
-            process.deliver_feedback(&mut bridge, &report).unwrap(),
+            process
+                .deliver_feedback(&mut bridge, &report)
+                .await
+                .unwrap(),
             super::FeedbackDelivery::Delivered
         );
         let sent: serde_json::Value = serde_json::from_slice(&fs::read(&payload).unwrap()).unwrap();
@@ -909,6 +1303,7 @@ mod tests {
                     super::HunkRange { start: 2, end: 4 },
                     "Explain this hunk",
                 )
+                .await
                 .unwrap(),
             super::FeedbackDelivery::Delivered
         );

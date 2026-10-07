@@ -1,3 +1,4 @@
+use crate::integration_runtime::Cancellation;
 use crate::repository::snapshot_id;
 use crate::{Options, Result};
 use chvrn_core::TextSnapshot;
@@ -8,7 +9,12 @@ use chvrn_integrations::lsp::{
 use chvrn_tui::{Pane, ReviewSession};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
+use tokio::sync::{
+    OwnedSemaphorePermit, Semaphore,
+    mpsc::{self, Receiver, Sender, error::TrySendError},
+    oneshot,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
@@ -27,6 +33,7 @@ struct Request {
     capture: CapturedText,
     line: usize,
     grapheme: usize,
+    permit: OwnedSemaphorePermit,
 }
 
 enum ResponseValue {
@@ -40,6 +47,7 @@ struct Response {
     pane: Pane,
     snapshot: TextSnapshot,
     value: std::result::Result<ResponseValue, String>,
+    _permit: OwnedSemaphorePermit,
 }
 
 struct ActiveServer {
@@ -49,21 +57,24 @@ struct ActiveServer {
 }
 
 pub struct LanguageUi {
-    requests: Option<SyncSender<Request>>,
+    requests: Option<Sender<Request>>,
     responses: Receiver<Response>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    cancellation: Option<Cancellation>,
+    admission: Arc<Semaphore>,
     previous: Option<ReviewSession>,
 }
 
 impl LanguageUi {
     pub fn new(options: &Options, root: &Path) -> Result<Self> {
-        let (requests, input) = mpsc::sync_channel::<Request>(1);
-        let (output, responses) = mpsc::channel();
+        let (requests, mut input) = mpsc::channel::<Request>(1);
+        let (output, responses) = mpsc::channel(1);
+        let admission = Arc::new(Semaphore::new(2));
         let Some(executable) = options.lsp.clone() else {
             return Ok(Self {
                 requests: None,
                 responses,
-                worker: None,
+                cancellation: None,
+                admission,
                 previous: None,
             });
         };
@@ -79,36 +90,42 @@ impl LanguageUi {
         let root_uri = Url::from_directory_path(root)
             .map_err(|_| "language-server root is not an absolute directory")?
             .to_string();
-        let worker = std::thread::spawn(move || {
+        let handle = options.runtime.handle()?;
+        let processes = handle.processes.clone();
+        let preparation = Preparation::new()?;
+        let config = LanguageServerConfig {
+            executable,
+            arguments,
+            root_uri: Some(root_uri),
+            language_id: "plaintext".into(),
+        };
+        let cancellation = handle.spawn_owned(move |mut shutdown| async move {
             let mut active: Option<ActiveServer> = None;
-            while let Ok(request) = input.recv() {
-                let snapshot = request.capture.clone().snapshot();
-                let value = perform(
-                    &mut active,
-                    &executable,
-                    &arguments,
-                    &root_uri,
-                    &request,
-                    &snapshot,
-                )
-                .map_err(|error| error.to_string());
-                if output
-                    .send(Response {
-                        path: request.path,
-                        pane: request.pane,
-                        snapshot,
-                        value,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {},
+                _ = async {
+                    while let Some(request) = input.recv().await {
+                        let snapshot = match preparation.capture(request.capture.clone()).await {
+                            Ok(snapshot) => snapshot,
+                            Err(_) => break,
+                        };
+                        let value = perform(&mut active, &config, &request, &snapshot, &processes, &preparation)
+                            .await.map_err(|error| error.to_string());
+                        if output.send(Response {
+                            path: request.path, pane: request.pane, snapshot, value,
+                            _permit: request.permit,
+                        }).await.is_err() { break; }
+                    }
+                } => {},
             }
-        });
+            if let Some(active) = active { let _ = active.process.shutdown().await; }
+        })?;
         Ok(Self {
             requests: Some(requests),
             responses,
-            worker: Some(worker),
+            cancellation: Some(cancellation),
+            admission,
             previous: None,
         })
     }
@@ -170,6 +187,9 @@ impl LanguageUi {
             capture: session.pane_capture(pane),
             line: cursor.line,
             grapheme: cursor.grapheme,
+            permit: Arc::clone(&self.admission)
+                .try_acquire_owned()
+                .map_err(|_| "language-server results are awaiting consumption")?,
         };
         match sender.try_send(request) {
             Ok(()) => {
@@ -178,7 +198,7 @@ impl LanguageUi {
             Err(TrySendError::Full(_)) => {
                 return Err("a language-server request is already queued".into());
             }
-            Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Closed(_)) => {
                 return Err("language-server worker stopped".into());
             }
         }
@@ -189,7 +209,7 @@ impl LanguageUi {
         if session.is_review_modal() {
             return Ok(());
         }
-        for response in self.responses.try_iter() {
+        while let Ok(response) = self.responses.try_recv() {
             if self.previous.is_some()
                 || response.path != path
                 || !session.pane_matches_snapshot(response.pane, &response.snapshot)
@@ -226,29 +246,102 @@ impl LanguageUi {
 impl Drop for LanguageUi {
     fn drop(&mut self) {
         self.requests.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.cancellation.take();
     }
 }
 
-fn perform(
+enum PreparationJob {
+    Capture(CapturedText, oneshot::Sender<TextSnapshot>),
+    Definition(
+        PathBuf,
+        TextSnapshot,
+        LspLocation,
+        oneshot::Sender<Result<Box<ReviewSession>>>,
+    ),
+}
+
+struct Preparation(std::sync::mpsc::SyncSender<PreparationJob>);
+
+impl Preparation {
+    fn new() -> Result<Self> {
+        let (sender, jobs) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("chvrn-language-preparation".into())
+            .spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    match job {
+                        PreparationJob::Capture(capture, reply) => {
+                            let _ = reply.send(capture.snapshot());
+                        }
+                        PreparationJob::Definition(path, snapshot, location, reply) => {
+                            let _ = reply
+                                .send(definition_view(&path, &snapshot, location).map(Box::new));
+                        }
+                    }
+                }
+            })?;
+        Ok(Self(sender))
+    }
+
+    async fn capture(&self, capture: CapturedText) -> Result<TextSnapshot> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .try_send(PreparationJob::Capture(capture, reply))
+            .map_err(|_| "language preparation busy or stopped")?;
+        response
+            .await
+            .map_err(|_| "language preparation stopped".into())
+    }
+
+    async fn definition(
+        &self,
+        path: PathBuf,
+        snapshot: TextSnapshot,
+        location: LspLocation,
+    ) -> Result<Box<ReviewSession>> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .try_send(PreparationJob::Definition(path, snapshot, location, reply))
+            .map_err(|_| "language preparation busy or stopped")?;
+        response.await.map_err(|_| "language preparation stopped")?
+    }
+}
+
+async fn perform(
     active: &mut Option<ActiveServer>,
-    executable: &Path,
-    arguments: &[String],
-    root_uri: &str,
+    config: &LanguageServerConfig,
     request: &Request,
     snapshot: &TextSnapshot,
+    processes: &chvrn_integrations::process::ProcessSupervisor,
+    preparation: &Preparation,
 ) -> Result<ResponseValue> {
-    let line = snapshot
-        .text()
-        .split('\n')
-        .nth(request.line)
-        .unwrap_or_default();
+    let result = perform_action(active, config, request, snapshot, processes, preparation).await;
+    if active
+        .as_ref()
+        .is_some_and(|server| server.process.is_desynchronised())
+    {
+        if let Some(server) = active.take() {
+            let _ = server.process.shutdown().await;
+        }
+    }
+    result
+}
+
+async fn perform_action(
+    active: &mut Option<ActiveServer>,
+    config: &LanguageServerConfig,
+    request: &Request,
+    snapshot: &TextSnapshot,
+    processes: &chvrn_integrations::process::ProcessSupervisor,
+    preparation: &Preparation,
+) -> Result<ResponseValue> {
+    let range = chvrn_core::text::line_range(snapshot.text(), request.line)
+        .ok_or("cursor line is outside document")?;
+    let line = &snapshot.text()[range];
     let byte_column = line
         .grapheme_indices(true)
         .nth(request.grapheme)
-        .map_or(line.trim_end_matches('\r').len(), |(offset, _)| offset);
+        .map_or(line.len(), |(offset, _)| offset);
     let position = TextPosition {
         line: request.line.try_into()?,
         byte_column,
@@ -257,6 +350,9 @@ fn perform(
         .as_ref()
         .is_none_or(|active| active.path != request.path)
     {
+        if let Some(previous) = active.take() {
+            let _ = previous.process.shutdown().await;
+        }
         let language_id = match request.path.extension().and_then(|value| value.to_str()) {
             Some("rs") => "rust",
             Some("ts") => "typescript",
@@ -267,12 +363,8 @@ fn perform(
             Some("json") => "json",
             _ => "plaintext",
         };
-        let config = LanguageServerConfig {
-            executable: executable.to_path_buf(),
-            arguments: arguments.to_vec(),
-            root_uri: Some(root_uri.into()),
-            language_id: language_id.into(),
-        };
+        let mut config = config.clone();
+        config.language_id = language_id.into();
         let uri = Url::from_file_path(&request.path)
             .map_err(|_| "language-server document path is not absolute")?
             .to_string();
@@ -282,7 +374,8 @@ fn perform(
             version: 1,
             snapshot_id: snapshot_id(),
         };
-        let process = LspProcess::start(Some(&config), document)
+        let process = LspProcess::start(Some(&config), document, processes)
+            .await
             .map_err(|error| format!("language-server startup failed: {error:?}"))?;
         *active = Some(ActiveServer {
             path: request.path.clone(),
@@ -302,6 +395,7 @@ fn perform(
         process
             .session_mut()
             .replace_text(snapshot.text().into(), snapshot_id())
+            .await
             .map_err(|error| format!("language-server sync failed: {error:?}"))?;
         active.snapshot = Some(snapshot.clone());
     }
@@ -313,19 +407,21 @@ fn perform(
         Action::Hover => Ok(ResponseValue::Message(
             process
                 .hover(position)
+                .await
                 .map_err(|error| format!("hover unavailable: {error:?}"))?
                 .unwrap_or_else(|| "No hover information at the cursor".into()),
         )),
         Action::Definition => {
             let location = process
                 .definition(position)
+                .await
                 .map_err(|error| format!("definition unavailable: {error:?}"))?
                 .ok_or("No definition at the cursor")?;
-            Ok(ResponseValue::Definition(Box::new(definition_view(
-                &request.path,
-                snapshot,
-                location,
-            )?)))
+            Ok(ResponseValue::Definition(
+                preparation
+                    .definition(request.path.clone(), snapshot.clone(), location)
+                    .await?,
+            ))
         }
         Action::Format => {
             active.snapshot = None;
@@ -335,25 +431,31 @@ fn perform(
                     inspected_snapshot_id,
                     new_snapshot_id: snapshot_id(),
                 })
+                .await
                 .map_err(|error| format!("formatting unavailable: {error:?}"))?;
             Ok(ResponseValue::Formatted(
                 process.session_mut().document().text.clone(),
             ))
         }
-        Action::Diagnostics => Ok(ResponseValue::Message(diagnostic_message(
-            process.session_mut(),
-            snapshot,
-        )?)),
+        Action::Diagnostics => Ok(ResponseValue::Message(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                diagnostic_message(process.session_mut(), snapshot),
+            )
+            .await
+            .map_err(|_| "diagnostic operation deadline exceeded")??,
+        )),
     }
 }
 
-fn diagnostic_message<R: std::io::Read, W: std::io::Write>(
+async fn diagnostic_message<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
     session: &mut chvrn_integrations::lsp::LspSession<R, W>,
     snapshot: &TextSnapshot,
 ) -> Result<String> {
     while session.diagnostics_for_snapshot(snapshot).is_none() {
         session
             .read_diagnostics()
+            .await
             .map_err(|error| format!("diagnostic update unavailable: {error:?}"))?;
     }
     let diagnostics = session
@@ -394,10 +496,9 @@ fn definition_view(
         Some(file) => std::str::from_utf8(file.bytes())?,
         None => snapshot.text(),
     };
-    let line = text
-        .split('\n')
-        .nth(location.line as usize)
+    let range = chvrn_core::text::line_range(text, location.line as usize)
         .ok_or("definition line is outside target document")?;
+    let line = &text[range];
     let mut units = 0;
     let mut byte_column = 0;
     for (byte, character) in line.char_indices() {
@@ -430,7 +531,105 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeated_diagnostics_reuse_the_current_snapshot_but_equal_new_text_invalidates_them() {
+    fn partial_failure_retires_child_and_later_request_gets_a_fresh_gracefully_closed_server() {
+        use clap::Parser;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("language-server");
+        let launches = dir.path().join("launches");
+        let exited = dir.path().join("exited");
+        let script = format!(
+            r#"#!/usr/bin/python3
+import json, sys
+launches = {launches:?}
+exited = {exited:?}
+try:
+    with open(launches, 'rb') as source: first = not source.read()
+except FileNotFoundError:
+    first = True
+with open(launches, 'ab') as target: target.write(b'x')
+def read():
+    size = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: raise EOFError()
+        if line == b'\r\n': break
+        if line.lower().startswith(b'content-length:'): size = int(line.split(b':')[1])
+    return json.loads(sys.stdin.buffer.read(size))
+def send(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
+    sys.stdout.buffer.flush()
+request = read()
+send({{'jsonrpc':'2.0','id':request['id'],'result':{{'capabilities':{{'hoverProvider':True}}}}}})
+read()
+read()
+request = read()
+if first:
+    sys.stdout.buffer.write(b'Content-Length: 100\r\n\r\n{{}}')
+    sys.stdout.buffer.flush()
+    sys.exit(0)
+send({{'jsonrpc':'2.0','id':request['id'],'result':{{'contents':'recovered'}}}})
+request = read()
+assert request['method'] == 'shutdown'
+send({{'jsonrpc':'2.0','id':request['id'],'result':None}})
+assert read()['method'] == 'exit'
+with open(exited, 'w') as target: target.write('graceful')
+"#,
+            launches = launches.to_str().unwrap(),
+            exited = exited.to_str().unwrap()
+        );
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cli = crate::Cli::try_parse_from(["chvrn", "--lsp", binary.to_str().unwrap()]).unwrap();
+        let mut ui = LanguageUi::new(&cli.options, dir.path()).unwrap();
+        let buffer = chvrn_core::edit::TextBuffer::new(TextSnapshot::from_bytes(b"value").unwrap());
+        let enqueue = |ui: &LanguageUi| {
+            ui.requests
+                .as_ref()
+                .unwrap()
+                .try_send(Request {
+                    action: Action::Hover,
+                    path: dir.path().join("file.rs"),
+                    pane: Pane::Right,
+                    capture: buffer.capture(),
+                    line: 0,
+                    grapheme: 0,
+                    permit: Arc::clone(&ui.admission).try_acquire_owned().unwrap(),
+                })
+                .unwrap_or_else(|_| panic!("language admission failed"));
+        };
+        let response = |ui: &mut LanguageUi| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(response) = ui.responses.try_recv() {
+                    break response;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "language response deadline exceeded"
+                );
+                std::thread::yield_now();
+            }
+        };
+        enqueue(&ui);
+        let failed = response(&mut ui);
+        assert!(matches!(&failed.value, Err(error) if error.contains("early eof")));
+        drop(failed);
+        enqueue(&ui);
+        let recovered = response(&mut ui);
+        assert!(
+            matches!(&recovered.value, Ok(ResponseValue::Message(text)) if text == "recovered")
+        );
+        assert_eq!(std::fs::read(launches).unwrap(), b"xx");
+        drop(recovered);
+        drop(ui);
+        cli.options.runtime.shutdown();
+        assert_eq!(std::fs::read_to_string(exited).unwrap(), "graceful");
+    }
+
+    #[tokio::test]
+    async fn repeated_diagnostics_reuse_the_current_snapshot_but_equal_new_text_invalidates_them() {
         let snapshot = TextSnapshot::from_bytes(b"unknown\n").unwrap();
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
@@ -444,31 +643,32 @@ mod tests {
                 }]
             }
         }).to_string();
-        let reader = std::io::Cursor::new(
-            format!("Content-Length: {}\r\n\r\n{payload}", payload.len()).into_bytes(),
-        );
+        let frame = format!("Content-Length: {}\r\n\r\n{payload}", payload.len()).into_bytes();
+        let reader = frame.as_slice();
         let document = Document {
             uri: "file:///diagnostics.cpp".into(),
             text: snapshot.text().into(),
             version: 1,
             snapshot_id: "first".into(),
         };
-        let mut session = chvrn_integrations::lsp::LspSession::new(reader, Vec::new(), document);
+        let mut session =
+            chvrn_integrations::lsp::LspSession::new(reader, tokio::io::sink(), document);
         session.bind_snapshot(snapshot.clone()).unwrap();
         assert_eq!(
-            diagnostic_message(&mut session, &snapshot).unwrap(),
+            diagnostic_message(&mut session, &snapshot).await.unwrap(),
             "1:1 undeclared identifier"
         );
         assert_eq!(
-            diagnostic_message(&mut session, &snapshot).unwrap(),
+            diagnostic_message(&mut session, &snapshot).await.unwrap(),
             "1:1 undeclared identifier"
         );
         let fresh = TextSnapshot::from_bytes(snapshot.as_bytes()).unwrap();
         session
             .replace_text(fresh.text().into(), "second".into())
+            .await
             .unwrap();
         session.bind_snapshot(fresh.clone()).unwrap();
-        assert!(diagnostic_message(&mut session, &fresh).is_err());
+        assert!(diagnostic_message(&mut session, &fresh).await.is_err());
     }
 
     #[test]
@@ -506,5 +706,47 @@ mod tests {
         assert_eq!(view.pane_text(Pane::Right), "target\nsymbol\n");
         assert_eq!(view.cursor().line, 1);
         assert_eq!(snapshot.text(), "unsaved source\n");
+    }
+
+    #[test]
+    fn incoming_definition_positions_use_cr_and_terminal_empty_lines_but_reject_half_surrogates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("result.ts");
+        let snapshot = TextSnapshot::from_bytes("first\r😀value\r".as_bytes()).unwrap();
+        let uri = Url::from_file_path(&path).unwrap().to_string();
+        let view = definition_view(
+            &path,
+            &snapshot,
+            LspLocation {
+                uri: uri.clone(),
+                line: 1,
+                utf16_column: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!((view.cursor().line, view.cursor().grapheme), (1, 1));
+        let eof = definition_view(
+            &path,
+            &snapshot,
+            LspLocation {
+                uri: uri.clone(),
+                line: 2,
+                utf16_column: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!((eof.cursor().line, eof.cursor().grapheme), (2, 0));
+        assert!(
+            definition_view(
+                &path,
+                &snapshot,
+                LspLocation {
+                    uri,
+                    line: 1,
+                    utf16_column: 1
+                }
+            )
+            .is_err()
+        );
     }
 }

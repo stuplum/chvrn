@@ -9,3 +9,6 @@ license.workspace = true
 chvrn-core.workspace = true
 tempfile.workspace = true
 similar.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

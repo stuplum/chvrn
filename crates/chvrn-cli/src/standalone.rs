@@ -8,7 +8,7 @@ use chvrn_core::TextSnapshot;
 use chvrn_core::diff::{Diff, WhitespacePolicy};
 use chvrn_core::merge::Merge;
 use chvrn_core::structural::{Language, StructuralAnalysis};
-use chvrn_tui::{Pane, ReviewInput, ReviewOutcome, ReviewSession, ReviewSubmission};
+use chvrn_tui::{DiffRequestId, Pane, ReviewInput, ReviewOutcome, ReviewSession, ReviewSubmission};
 use crossterm::event::{Event, KeyCode};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -113,7 +113,7 @@ pub fn diff(left: PathBuf, right: PathBuf, options: &Options) -> Result<u8> {
         reading: None,
         refresh_again: false,
         pending: None,
-        pending_generation: 0,
+        pending_request: None,
         refresh_conflict: false,
     };
     terminal::run(&mut session, &mut host)
@@ -135,8 +135,18 @@ struct FileHost {
     reading: Option<std::sync::mpsc::Receiver<Result<Option<FileRefresh>>>>,
     refresh_again: bool,
     pending: Option<(GuardedFile, GuardedFile)>,
-    pending_generation: u64,
+    pending_request: Option<DiffRequestId>,
     refresh_conflict: bool,
+}
+
+impl FileHost {
+    fn retire_refresh(&mut self) {
+        self.pending = None;
+        self.pending_request = None;
+        self.reading = None;
+        self.refresh_conflict = false;
+        self.refresh_again = true;
+    }
 }
 
 impl ReviewHost for FileHost {
@@ -162,7 +172,7 @@ impl ReviewHost for FileHost {
                 }) = result?
                 {
                     let request = session.request_diff_snapshots(left_text, right_text);
-                    self.pending_generation = request.generation();
+                    self.pending_request = Some(request.id());
                     self.refresh_conflict = false;
                     self.background.request(request);
                     self.pending = Some((left, right));
@@ -195,20 +205,23 @@ impl ReviewHost for FileHost {
             self.reading = Some(receive);
         }
         if let Some(completion) = self.background.latest() {
-            let generation = completion.generation();
-            let outcome = session.handle(ReviewInput::DiffReady(completion));
-            if generation == self.pending_generation {
-                if outcome == ReviewOutcome::RefreshConflict {
-                    self.refresh_conflict = true;
-                    session.set_message(
-                        "Files changed externally. R explicitly discards local edits and reloads",
-                    );
-                } else if session.accepted_generation() == generation {
-                    self.refresh_conflict = false;
-                    if let Some((left, right)) = self.pending.take() {
-                        self.left = left;
-                        self.right = right;
+            if self.pending_request == Some(completion.id()) {
+                match session.handle(ReviewInput::DiffReady(completion)) {
+                    ReviewOutcome::RefreshConflict => {
+                        self.refresh_conflict = true;
+                        session.set_message(
+                            "Files changed externally. R explicitly discards local edits and reloads",
+                        );
                     }
+                    ReviewOutcome::RefreshApplied => {
+                        self.refresh_conflict = false;
+                        self.pending_request = None;
+                        if let Some((left, right)) = self.pending.take() {
+                            self.left = left;
+                            self.right = right;
+                        }
+                    }
+                    _ => self.retire_refresh(),
                 }
             }
         }
@@ -228,14 +241,15 @@ impl ReviewHost for FileHost {
             && !session.is_editing()
             && self.refresh_conflict
         {
-            session.handle(ReviewInput::DiscardAndReload);
-            if session.accepted_generation() != self.pending_generation {
+            if session.handle(ReviewInput::DiscardAndReload) != ReviewOutcome::RefreshApplied {
+                self.retire_refresh();
                 return Err(
                     "the latest refresh is still computing; no filesystem guards were changed"
                         .into(),
                 );
             }
             if let Some((left, right)) = self.pending.take() {
+                self.pending_request = None;
                 self.refresh_conflict = false;
                 self.left = left;
                 self.right = right;
@@ -366,5 +380,121 @@ impl ReviewHost for MergeHost {
         self.theirs.validate()?;
         self.output.write(result.as_bytes())?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+    use std::time::{Duration, Instant};
+
+    fn with_file_host(check: impl FnOnce(&mut FileHost, &mut ReviewSession)) {
+        let directory = tempfile::tempdir().unwrap();
+        let left = directory.path().join("left");
+        let right = directory.path().join("right");
+        std::fs::write(&left, "left\n").unwrap();
+        std::fs::write(&right, "old\n").unwrap();
+        let options = crate::Cli::parse_from(["chvrn", "diff", "left", "right"]).options;
+        let mut host = FileHost {
+            left: GuardedFile::read(&left).unwrap(),
+            right: GuardedFile::read(&right).unwrap(),
+            watch: FileWatch::new(&[], false).unwrap(),
+            language: LanguageUi::new(&options, directory.path()).unwrap(),
+            background: BackgroundDiff::new(),
+            reading: None,
+            refresh_again: false,
+            pending: None,
+            pending_request: None,
+            refresh_conflict: false,
+        };
+        let mut session = ReviewSession::two_way("left\n", "old\n");
+        check(&mut host, &mut session);
+    }
+
+    fn queue_file_refresh(host: &mut FileHost, session: &mut ReviewSession) {
+        std::fs::write(&host.right.path, "external\n").unwrap();
+        let left = GuardedFile::read(&host.left.path).unwrap();
+        let right = GuardedFile::read(&host.right.path).unwrap();
+        let request = session.request_diff_snapshots(
+            snapshot(left.bytes()).unwrap(),
+            snapshot(right.bytes()).unwrap(),
+        );
+        host.pending_request = Some(request.id());
+        host.pending = Some((left, right));
+        host.background.request(request);
+    }
+
+    fn finish_file_refresh(host: &mut FileHost, session: &mut ReviewSession) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while host.pending.is_some() && !host.refresh_conflict {
+            host.tick(session).unwrap();
+            assert!(Instant::now() < deadline, "file refresh did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn whitespace_change_publishes_matching_file_guards() {
+        with_file_host(|host, session| {
+            queue_file_refresh(host, session);
+            session.set_whitespace_policy(WhitespacePolicy::IgnoreEdge);
+            finish_file_refresh(host, session);
+            assert_eq!(session.pane_text(Pane::Right), "external\n");
+            assert_eq!(host.right.bytes(), b"external\n");
+            host.right.validate().unwrap();
+        });
+    }
+
+    #[test]
+    fn dirty_policy_change_keeps_original_guards_until_explicit_discard() {
+        with_file_host(|host, session| {
+            queue_file_refresh(host, session);
+            session.go_to(Pane::Right, 0, 0);
+            session.handle(ReviewInput::Key(KeyEvent::new(
+                KeyCode::Char('i'),
+                KeyModifiers::NONE,
+            )));
+            session.handle(ReviewInput::Paste("edit".into()));
+            session.handle(ReviewInput::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )));
+            session.set_whitespace_policy(WhitespacePolicy::IgnoreEdge);
+            finish_file_refresh(host, session);
+            assert!(host.refresh_conflict);
+            assert_eq!(session.pane_text(Pane::Right), "editold\n");
+            assert_eq!(host.right.bytes(), b"old\n");
+            assert!(host.right.validate().is_err());
+            assert!(
+                host.input(
+                    session,
+                    &Event::Key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE))
+                )
+                .unwrap()
+            );
+            assert_eq!(session.pane_text(Pane::Right), "external\n");
+            assert_eq!(host.right.bytes(), b"external\n");
+            host.right.validate().unwrap();
+        });
+    }
+
+    #[test]
+    fn foreign_completion_cannot_publish_file_guards_for_an_accepted_generation() {
+        with_file_host(|host, session| {
+            queue_file_refresh(host, session);
+            *session = ReviewSession::two_way("left\n", "old\n");
+            let request = session.request_diff("left\n", "other\n");
+            assert_eq!(
+                session.handle(ReviewInput::DiffReady(request.compute())),
+                ReviewOutcome::RefreshApplied
+            );
+            finish_file_refresh(host, session);
+            assert_eq!(session.pane_text(Pane::Right), "other\n");
+            assert_eq!(host.right.bytes(), b"old\n");
+            assert!(host.right.validate().is_err());
+            assert!(host.refresh_again);
+        });
     }
 }

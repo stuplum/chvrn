@@ -8,7 +8,7 @@ pub use patch::PatchCandidate;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,6 +100,13 @@ pub struct ReviewedFile {
     pub content: ContentKind,
     hunks: Vec<Hunk>,
     worktree_mode: Option<u32>,
+    worktree_permissions: Option<fs::Permissions>,
+}
+
+impl ReviewedFile {
+    pub fn replacement_mode(&self) -> u32 {
+        self.worktree_mode.or(self.base_mode).unwrap_or(0o100644)
+    }
 }
 
 pub struct Review {
@@ -107,6 +114,7 @@ pub struct Review {
     resolved_revision: Option<String>,
     files: Vec<ReviewedFile>,
     index_snapshot: Option<Vec<u8>>,
+    index_contents: Option<Vec<u8>>,
     repository_root: PathBuf,
 }
 
@@ -136,9 +144,94 @@ impl Review {
 pub struct Repository {
     root: PathBuf,
     index_path: PathBuf,
+    inspection_index: Option<PathBuf>,
+}
+
+struct PinnedIndex {
+    repository: Repository,
+    snapshot: Option<Vec<u8>>,
+    _directory: tempfile::TempDir,
+}
+
+impl PinnedIndex {
+    fn validate(&self, original: &Repository) -> Result<(), GitError> {
+        if transaction::read_optional(&original.index_path)? != self.snapshot {
+            return Err(GitError::StaleReview);
+        }
+        Ok(())
+    }
+
+    fn finish(self, original: &Repository, mut review: Review) -> Result<Review, GitError> {
+        self.validate(original)?;
+        review.index_contents = transaction::read_optional(
+            self.repository
+                .inspection_index
+                .as_deref()
+                .ok_or(GitError::GitFailure)?,
+        )?;
+        review.index_snapshot = self.snapshot;
+        Ok(review)
+    }
 }
 
 impl Repository {
+    fn pin_index(&self) -> Result<PinnedIndex, GitError> {
+        let (snapshot, modified) = match fs::File::open(&self.index_path) {
+            Ok(mut file) => {
+                let modified = file
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .map_err(|_| GitError::IoFailure)?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .map_err(|_| GitError::IoFailure)?;
+                (Some(bytes), Some(modified))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(_) => return Err(GitError::IoFailure),
+        };
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("chvrn-index-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let directory = builder
+            .tempdir_in(self.index_path.parent().ok_or(GitError::UnsafePath)?)
+            .map_err(|_| GitError::IoFailure)?;
+        let path = directory.path().join("index");
+        if let Some(bytes) = &snapshot {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|_| GitError::IoFailure)?;
+            file.write_all(bytes).map_err(|_| GitError::IoFailure)?;
+            let times = fs::FileTimes::new().set_modified(modified.ok_or(GitError::IoFailure)?);
+            file.set_times(times).map_err(|_| GitError::IoFailure)?;
+            self.git(
+                &words(&["update-index", "--no-split-index"]),
+                None,
+                Some(&path),
+            )?;
+            fs::File::open(&path)
+                .and_then(|file| file.set_times(times))
+                .map_err(|_| GitError::IoFailure)?;
+        }
+        let pinned = PinnedIndex {
+            repository: Repository {
+                root: self.root.clone(),
+                index_path: self.index_path.clone(),
+                inspection_index: Some(path),
+            },
+            snapshot,
+            _directory: directory,
+        };
+        pinned.validate(self)?;
+        Ok(pinned)
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self, GitError> {
         let root = fs::canonicalize(root).map_err(|_| GitError::IoFailure)?;
         let top = git_output(&root, &words(&["rev-parse", "--show-toplevel"]), None, None)?;
@@ -158,7 +251,11 @@ impl Repository {
         } else {
             root.join(index)
         };
-        Ok(Self { root, index_path })
+        Ok(Self {
+            root,
+            index_path,
+            inspection_index: None,
+        })
     }
 
     pub fn discover(start: &Path) -> Result<Self, GitError> {
@@ -187,6 +284,13 @@ impl Repository {
     }
 
     pub fn changes(&self, base: &str) -> Result<Vec<Change>, GitError> {
+        let pinned = self.pin_index()?;
+        let changes = pinned.repository.changes_pinned(base)?;
+        pinned.validate(self)?;
+        Ok(changes)
+    }
+
+    fn changes_pinned(&self, base: &str) -> Result<Vec<Change>, GitError> {
         let tree = self.resolve_revision(base)?;
         let mut args = words(&[
             "diff",
@@ -213,10 +317,10 @@ impl Repository {
                 Some(b'M' | b'T' | b'C' | b'U') => ChangeKind::Modified,
                 _ => return Err(GitError::GitFailure),
             };
-            let first = path_from_git(*fields.get(index).ok_or(GitError::GitFailure)?)?;
+            let first = path_from_git(fields.get(index).ok_or(GitError::GitFailure)?)?;
             index += 1;
             let (old_path, path) = if kind == ChangeKind::Renamed {
-                let second = path_from_git(*fields.get(index).ok_or(GitError::GitFailure)?)?;
+                let second = path_from_git(fields.get(index).ok_or(GitError::GitFailure)?)?;
                 index += 1;
                 (Some(first), second)
             } else {
@@ -256,6 +360,12 @@ impl Repository {
     }
 
     pub fn review(&self, base: Base, paths: &[PathBuf]) -> Result<Review, GitError> {
+        let pinned = self.pin_index()?;
+        let review = pinned.repository.review_pinned(base, paths)?;
+        pinned.finish(self, review)
+    }
+
+    fn review_pinned(&self, base: Base, paths: &[PathBuf]) -> Result<Review, GitError> {
         let resolved_revision = match &base {
             Base::Index => None,
             Base::Revision(revision) => Some(self.resolve_revision(revision)?),
@@ -284,9 +394,9 @@ impl Repository {
                     }
                 }
                 Base::Revision(_) => {
-                    for change in
-                        self.changes(resolved_revision.as_deref().ok_or(GitError::InvalidBase)?)?
-                    {
+                    for change in self.changes_pinned(
+                        resolved_revision.as_deref().ok_or(GitError::InvalidBase)?,
+                    )? {
                         if let Some(old) = change.old_path {
                             discovered.insert(old);
                         }
@@ -305,10 +415,23 @@ impl Repository {
         } else {
             paths.iter().cloned().collect()
         };
-        self.capture_review(base, resolved_revision, requested)
+        self.capture_review_pinned(base, resolved_revision, requested)
     }
 
     fn capture_review(
+        &self,
+        base: Base,
+        resolved_revision: Option<String>,
+        requested: BTreeSet<PathBuf>,
+    ) -> Result<Review, GitError> {
+        let pinned = self.pin_index()?;
+        let review = pinned
+            .repository
+            .capture_review_pinned(base, resolved_revision, requested)?;
+        pinned.finish(self, review)
+    }
+
+    fn capture_review_pinned(
         &self,
         base: Base,
         resolved_revision: Option<String>,
@@ -345,18 +468,15 @@ impl Repository {
                 hunks,
                 base_mode: original.mode,
                 worktree_mode: worktree.mode,
+                worktree_permissions: worktree.permissions,
             });
         }
-        let index_snapshot = match fs::read(&self.index_path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err(GitError::IoFailure),
-        };
         Ok(Review {
             base,
             resolved_revision,
             files,
-            index_snapshot,
+            index_snapshot: None,
+            index_contents: None,
             repository_root: self.root.clone(),
         })
     }
@@ -405,7 +525,10 @@ impl Repository {
                 }
             } else {
                 let original = before.file(&file.path).ok_or(GitError::StaleReview)?;
-                if file.worktree != original.worktree || file.mode != original.mode {
+                if file.worktree != original.worktree
+                    || file.mode != original.mode
+                    || file.worktree_permissions != original.worktree_permissions
+                {
                     return Err(GitError::StaleReview);
                 }
             }
@@ -479,45 +602,93 @@ impl Repository {
         if mode != 0o100644 && mode != 0o100755 {
             return Err(GitError::BinaryContent);
         }
-        let bytes = self.git(
-            &vec!["cat-file".into(), "blob".into(), oid.into()],
-            None,
-            None,
-        )?;
+        let bytes = self.git(&["cat-file".into(), "blob".into(), oid.into()], None, None)?;
         Ok(FileState {
             bytes: Some(bytes),
             mode: Some(mode),
+            permissions: None,
         })
     }
 
     fn worktree_file(&self, path: &Path) -> Result<FileState, GitError> {
         self.validate_path(path)?;
-        match fs::read(self.root.join(path)) {
-            Ok(bytes) => {
-                let metadata =
-                    fs::metadata(self.root.join(path)).map_err(|_| GitError::IoFailure)?;
-                if !metadata.is_file() {
-                    return Err(GitError::UnsafePath);
-                }
-                #[cfg(unix)]
-                let mode = {
-                    use std::os::unix::fs::PermissionsExt;
-                    if metadata.permissions().mode() & 0o111 != 0 {
-                        0o100755
-                    } else {
-                        0o100644
-                    }
-                };
-                #[cfg(not(unix))]
-                let mode = 0o100644;
-                Ok(FileState {
-                    bytes: Some(bytes),
-                    mode: Some(mode),
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileState::empty()),
-            Err(_) => Err(GitError::IoFailure),
+        let Some(mut file) = self.open_worktree_file(path)? else {
+            return Ok(FileState::empty());
+        };
+        let metadata = file.metadata().map_err(|_| GitError::IoFailure)?;
+        if !metadata.is_file() {
+            return Err(GitError::UnsafePath);
         }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| GitError::IoFailure)?;
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            }
+        };
+        #[cfg(not(unix))]
+        let mode = 0o100644;
+        Ok(FileState {
+            bytes: Some(bytes),
+            mode: Some(mode),
+            permissions: Some(metadata.permissions()),
+        })
+    }
+
+    #[cfg(unix)]
+    fn open_worktree_file(&self, path: &Path) -> Result<Option<fs::File>, GitError> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        let mut directory = fs::File::open(&self.root).map_err(|_| GitError::IoFailure)?;
+        let mut parts = path.components().peekable();
+        while let Some(part) = parts.next() {
+            let name = std::ffi::CString::new(part.as_os_str().as_bytes())
+                .map_err(|_| GitError::UnsafePath)?;
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK
+                | if parts.peek().is_some() {
+                    libc::O_DIRECTORY
+                } else {
+                    0
+                };
+            let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                return if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(None)
+                } else if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ELOOP | libc::ENOTDIR | libc::ENXIO)
+                ) {
+                    Err(GitError::UnsafePath)
+                } else {
+                    Err(GitError::IoFailure)
+                };
+            }
+            directory = unsafe { fs::File::from_raw_fd(fd) };
+        }
+        Ok(Some(directory))
+    }
+
+    #[cfg(not(unix))]
+    fn open_worktree_file(&self, path: &Path) -> Result<Option<fs::File>, GitError> {
+        let target = self.root.join(path);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if !metadata.is_file() => return Err(GitError::UnsafePath),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(GitError::IoFailure),
+            Ok(_) => (),
+        }
+        fs::File::open(target)
+            .map(Some)
+            .map_err(|_| GitError::IoFailure)
     }
 
     fn validate_path(&self, path: &Path) -> Result<(), GitError> {
@@ -534,7 +705,7 @@ impl Repository {
         for part in path.components() {
             cursor.push(part.as_os_str());
             match fs::symlink_metadata(&cursor) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
+                Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
                     return Err(GitError::UnsafePath);
                 }
                 Ok(_) => (),
@@ -555,7 +726,7 @@ impl Repository {
     }
 
     fn untracked_output(&self) -> Result<Vec<u8>, GitError> {
-        let config = git_command(&self.root)
+        let config = git_command(&self.root)?
             .args(["config", "--null", "--path", "--get", "core.excludesFile"])
             .output()
             .map_err(|_| GitError::GitFailure)?;
@@ -582,7 +753,12 @@ impl Repository {
         input: Option<&[u8]>,
         index: Option<&Path>,
     ) -> Result<Vec<u8>, GitError> {
-        git_output(&self.root, args, input, index)
+        git_output(
+            &self.root,
+            args,
+            input,
+            index.or(self.inspection_index.as_deref()),
+        )
     }
 }
 
@@ -590,6 +766,7 @@ impl Repository {
 struct FileState {
     bytes: Option<Vec<u8>>,
     mode: Option<u32>,
+    permissions: Option<fs::Permissions>,
 }
 
 impl FileState {
@@ -597,6 +774,7 @@ impl FileState {
         Self {
             bytes: None,
             mode: None,
+            permissions: None,
         }
     }
 }
@@ -668,7 +846,34 @@ fn git_output(
     git_output_with_objects(root, args, input, index, None)
 }
 
-fn git_command(root: &Path) -> Command {
+fn git_command(root: &Path) -> Result<Command, GitError> {
+    let config = raw_git_command(root)
+        .args([
+            "config",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process|required)$",
+        ])
+        .output()
+        .map_err(|_| GitError::GitFailure)?;
+    if !config.status.success() && config.status.code() != Some(1) {
+        return Err(GitError::GitFailure);
+    }
+    let mut command = raw_git_command(root);
+    for key in nul_fields(&config.stdout)? {
+        let mut setting = path_from_git(key)?.into_os_string();
+        setting.push(if key.ends_with(b".required") {
+            "=false"
+        } else {
+            "="
+        });
+        command.arg("-c").arg(setting);
+    }
+    Ok(command)
+}
+
+fn raw_git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .current_dir(root)
@@ -678,10 +883,14 @@ fn git_command(root: &Path) -> Command {
         .env_remove("GIT_EXTERNAL_DIFF")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CONFIG")
         .env_remove("GIT_CONFIG_PARAMETERS")
-        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_COUNT", "2")
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_KEY_1", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_1", "false")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -695,7 +904,7 @@ fn git_output_with_objects(
     index: Option<&Path>,
     objects: Option<(&Path, &Path)>,
 ) -> Result<Vec<u8>, GitError> {
-    let mut command = git_command(root);
+    let mut command = git_command(root)?;
     command
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")

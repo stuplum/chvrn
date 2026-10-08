@@ -27,6 +27,8 @@ Crossterm's `use-dev-tty` polling backend reads keyboard events from the control
 
 Interactive file comparison permits editing both buffers. `s` explicitly saves changed files; guarded replacement is atomic per file, not across both inputs. Quit discards no dirty text without confirmation and never implies saving.
 
+External refresh authority is bound to the originating session and exact diff request, not a numeric generation alone. File/preview/session replacement retires old work. A whitespace-policy change recomputes incoming snapshots under the current policy without discarding their filesystem authority. The host publishes guarded files only after the matching completion is accepted; dirty buffers still require explicit discard.
+
 ## Merge
 
 `chvrn merge --base BASE --ours OURS --theirs THEIRS --output RESULT --non-interactive` combines conflict-free changes into RESULT while preserving the three inputs. Success exits `0`. Unresolved conflicts exit `1` without creating or replacing RESULT. Existing-output and concurrent-write guards also apply to successful writes.
@@ -53,6 +55,8 @@ Escape returns to repository review before merge edits. Confirmed submission val
 
 `--patch FILE` previews candidate changes; interactive acceptance of every candidate file is required before application. `--export-patch PATH` needs revision-based interactive review and `P`. `--report PATH` writes after completed interactive submission. Either output option in headless review fails with exit code `2` and an actionable diagnostic before inspecting changed files or accessing output destinations. `--open-companion` retains its separate launcher behaviour and forwards these options to the interactive companion.
 
+Socket decisions reserve queue capacity before filesystem mutation and then enter a nonblocking pending-receipt state. Navigation, repeated submission and snapshot refresh remain blocked until the matching acknowledgement. A failed receipt retains whether bytes were applied and cannot trigger an implicit retry. Quit reports unconfirmed delivery and exits without approval.
+
 ## Git tools
 
 `difftool` accepts explicit paths or Git's `LOCAL`/`REMOTE` environment variables and reuses file comparison. `mergetool` accepts merge flags or Git's `BASE`/`LOCAL`/`REMOTE`/`MERGED` and reuses three-way merging. Missing required paths are errors. These entry points retain normal interactive/headless and write semantics.
@@ -62,3 +66,5 @@ Escape returns to repository review before merge edits. Confirmed submission val
 Explicit `--herdr` modes require `HERDR_ENV=1`; gate mode also requires a TTY. Interactive Git review inside Herdr defaults to automatic mode, with `--agent` overriding the inherited `HERDR_PANE_ID`. Standalone file diff/merge do not construct the repository's Herdr adapter. No headless invocation accepts an agent review on the user's behalf.
 
 LSP requires explicit configuration. The private socket is started only by interactive repository review. Protocol/lifecycle tests do not establish arbitrary server/platform compatibility; see the [integration guide](../integrations.md) and [integration contract](integrations.md).
+
+The CLI owns one lazy integration runtime. Terminal guards restore terminal state before explicit protocol shutdown. Outstanding work, saturated ordinary queues and pending Herdr feedback do not prevent quit. Healthy LSP shutdown permits a bounded cooperative exit; cancelled or unresponsive children are killed and reaped. Synchronous Git preparation lanes are detached during shutdown and may continue until process exit.

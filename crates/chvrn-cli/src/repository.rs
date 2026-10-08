@@ -2,7 +2,7 @@ use crate::files::{GuardedFile, read_bytes};
 use crate::herdr_ui::{self, HerdrUi, Notice};
 use crate::jev_ui::JevUi;
 use crate::language::LanguageUi;
-use crate::socket_ui::SocketUi;
+use crate::socket_ui::{PendingDecision, SocketUi};
 use crate::standalone::{diff_value, print_value, snapshot};
 use crate::terminal::{self, ReviewHost};
 use crate::watch::{BackgroundDiff, FileWatch};
@@ -11,7 +11,8 @@ use chvrn_core::TextSnapshot;
 use chvrn_git::{Base, ConflictSnapshot, ContentKind, PatchCandidate, Repository, Review};
 use chvrn_integrations::herdr::{HunkRange, ReviewedFile};
 use chvrn_tui::{
-    Pane, RepositoryReviewMode, ReviewInput, ReviewOutcome, ReviewSession, ReviewSubmission,
+    DiffRequestId, Pane, RepositoryReviewMode, ReviewInput, ReviewOutcome, ReviewSession,
+    ReviewSubmission,
 };
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use serde_json::{Value, json};
@@ -91,7 +92,12 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
             Base::Index => "index",
             Base::Revision(name) => name,
         };
-        return herdr_ui::open_companion(&args, options, repo.root(), base_name);
+        return options.runtime.run(herdr_ui::open_companion(
+            &args,
+            options,
+            repo.root(),
+            base_name,
+        ))?;
     }
     if !interactive && (args.report.is_some() || args.export_patch.is_some()) {
         return Err(
@@ -190,7 +196,7 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
     let socket = args
         .socket
         .as_deref()
-        .map(|path| SocketUi::new(path, repo.root(), &inspected, &snapshot))
+        .map(|path| SocketUi::new(path, repo.root(), &inspected, &snapshot, &options.runtime))
         .transpose()?;
     let mut host = RepositoryHost {
         repo,
@@ -213,12 +219,13 @@ pub fn review(args: ReviewArgs, options: &Options) -> Result<u8> {
         language,
         herdr,
         socket,
+        pending_socket_decision: None,
         socket_candidates: VecDeque::new(),
         loading: None,
         needs_refresh: false,
         background: BackgroundDiff::new(),
         pending_review: None,
-        pending_generation: 0,
+        pending_request: None,
         refresh_conflict: false,
         finished: None,
     };
@@ -238,6 +245,17 @@ struct RepositoryMerge {
     source: ConflictSnapshot,
     output: GuardedFile,
     stale: bool,
+}
+
+enum SocketReceipt {
+    Awaiting(PendingDecision),
+    Failed(String),
+}
+
+struct PendingSocketDecision {
+    preview: PatchPreview,
+    accepted: bool,
+    receipt: SocketReceipt,
 }
 
 struct RepositoryHost<'a> {
@@ -261,17 +279,100 @@ struct RepositoryHost<'a> {
     language: LanguageUi,
     herdr: Option<HerdrUi>,
     socket: Option<SocketUi>,
+    pending_socket_decision: Option<PendingSocketDecision>,
     socket_candidates: VecDeque<chvrn_integrations::socket::PatchCandidate>,
     loading: Option<std::sync::mpsc::Receiver<Result<Option<RepositoryRefresh>>>>,
     needs_refresh: bool,
     background: BackgroundDiff,
     pending_review: Option<Arc<Review>>,
-    pending_generation: u64,
+    pending_request: Option<DiffRequestId>,
     refresh_conflict: bool,
     finished: Option<u8>,
 }
 
+impl Drop for RepositoryHost<'_> {
+    fn drop(&mut self) {
+        if let Some(pending) = &self.pending_socket_decision {
+            match &pending.receipt {
+                SocketReceipt::Failed(error) => eprintln!("chvrn: {error}"),
+                SocketReceipt::Awaiting(_) if pending.accepted => {
+                    eprintln!("chvrn: patch was applied, but its socket receipt was not confirmed")
+                }
+                SocketReceipt::Awaiting(_) => {
+                    eprintln!("chvrn: files unchanged; declined socket receipt was not confirmed")
+                }
+            }
+        }
+    }
+}
+
 impl RepositoryHost<'_> {
+    fn poll_socket_decision(&mut self, session: &mut ReviewSession) -> Result<()> {
+        let Some(mut pending) = self.pending_socket_decision.take() else {
+            return Ok(());
+        };
+        let completion = match &mut pending.receipt {
+            SocketReceipt::Awaiting(receipt) => receipt.try_complete(),
+            SocketReceipt::Failed(_) => None,
+        };
+        let Some(completion) = completion else {
+            self.pending_socket_decision = Some(pending);
+            return Ok(());
+        };
+        let result: Result<()> = match completion {
+            Err(error) => Err(format!(
+                "{}; socket receipt was not confirmed: {error}",
+                if pending.accepted {
+                    "Patch was applied"
+                } else {
+                    "Files unchanged"
+                },
+            )
+            .into()),
+            Ok(()) => {
+                let transition = if pending.accepted {
+                    self.checked_transition(&pending.preview.candidates)
+                } else {
+                    self.reload(session)
+                };
+                transition.map_err(|error| {
+                    format!(
+                    "Socket receipt confirmed, but repository state could not be refreshed: {error}"
+                ).into()
+                })
+            }
+        };
+        if let Err(error) = result {
+            pending.receipt = SocketReceipt::Failed(error.to_string());
+            self.pending_socket_decision = Some(pending);
+            return Err(error);
+        }
+        self.decisions.clear();
+        self.accepted_paths.clear();
+        self.selected = 0;
+        self.replace_session(session)?;
+        session.set_message(if pending.accepted {
+            "Patch candidate explicitly accepted and applied; accepted receipt confirmed"
+        } else {
+            "Patch candidate explicitly declined; files unchanged; declined receipt confirmed"
+        });
+        Ok(())
+    }
+
+    fn retire_refresh(&mut self) {
+        let was_loading = self.loading.take().is_some();
+        let was_pending = self.pending_review.take().is_some();
+        self.needs_refresh |= was_loading || was_pending;
+        self.pending_request = None;
+        self.refresh_conflict = false;
+    }
+
+    fn replace_session(&mut self, session: &mut ReviewSession) -> Result<()> {
+        self.retire_refresh();
+        *session = self.session()?;
+        Ok(())
+    }
+
     fn paths(&self) -> &[PathBuf] {
         &self.paths
     }
@@ -418,11 +519,13 @@ impl RepositoryHost<'_> {
     }
 
     fn reload(&mut self, session: &mut ReviewSession) -> Result<()> {
+        self.retire_refresh();
         let path = self.current_path().ok();
         self.inspected = Arc::new(
             self.repo
                 .review(self.inspected.base().clone(), &self.args.paths)?,
         );
+        self.needs_refresh = false;
         self.reset_paths();
         self.invalidate()?;
         self.selected = path
@@ -457,7 +560,7 @@ impl RepositoryHost<'_> {
 
     fn invalidate(&mut self) -> Result<()> {
         if let Some(herdr) = &self.herdr {
-            herdr.invalidate(&self.snapshot);
+            herdr.invalidate(&self.snapshot)?;
         }
         self.snapshot = snapshot_id();
         self.decisions.clear();
@@ -502,7 +605,7 @@ impl RepositoryHost<'_> {
         };
         if let Some(herdr) = &self.herdr {
             if herdr.pending {
-                herdr.invalidate(&self.snapshot);
+                herdr.invalidate(&self.snapshot)?;
             }
         }
         self.inspected = Arc::new(next);
@@ -541,11 +644,9 @@ impl RepositoryHost<'_> {
     }
 
     fn publish_refresh(&mut self, session: &mut ReviewSession, rebuild: bool) -> Result<()> {
-        if !rebuild && session.accepted_generation() != self.pending_generation {
-            return Err("the latest repository refresh is still computing; no snapshot authority was changed".into());
-        }
         let old_path = self.current_path().ok();
         if let Some(review) = self.pending_review.take() {
+            self.pending_request = None;
             self.inspected = review;
             self.reset_paths();
             self.selected = old_path
@@ -579,6 +680,9 @@ impl ReviewHost for RepositoryHost<'_> {
     }
 
     fn tick(&mut self, session: &mut ReviewSession) -> Result<()> {
+        if self.pending_socket_decision.is_some() {
+            return self.poll_socket_decision(session);
+        }
         let path = self
             .repo
             .root()
@@ -647,14 +751,14 @@ impl ReviewHost for RepositoryHost<'_> {
                         self.refresh_conflict = false;
                         if let Some((left, right)) = refresh.text {
                             let request = session.request_diff_snapshots(left, right);
-                            self.pending_generation = request.generation();
+                            self.pending_request = Some(request.id());
                             self.background.request(request);
                         } else {
-                            self.pending_generation = 0;
+                            self.pending_request = None;
                             self.refresh_conflict = session.is_dirty();
                         }
                         self.pending_review = Some(refresh.incoming);
-                        if self.pending_generation == 0 && !self.refresh_conflict {
+                        if self.pending_request.is_none() && !self.refresh_conflict {
                             self.publish_refresh(session, true)?;
                         }
                     }
@@ -702,14 +806,14 @@ impl ReviewHost for RepositoryHost<'_> {
             self.loading = Some(receive);
         }
         if let Some(completion) = self.background.latest() {
-            let generation = completion.generation();
-            let outcome = session.handle(ReviewInput::DiffReady(completion));
-            if generation == self.pending_generation {
-                if outcome == ReviewOutcome::RefreshConflict {
-                    self.refresh_conflict = true;
-                    session.set_message("External edits conflict with local edits. R discards local edits and reloads; submission is blocked");
-                } else if session.accepted_generation() == generation {
-                    self.publish_refresh(session, false)?;
+            if self.pending_request == Some(completion.id()) {
+                match session.handle(ReviewInput::DiffReady(completion)) {
+                    ReviewOutcome::RefreshConflict => {
+                        self.refresh_conflict = true;
+                        session.set_message("External edits conflict with local edits. R discards local edits and reloads; submission is blocked");
+                    }
+                    ReviewOutcome::RefreshApplied => self.publish_refresh(session, false)?,
+                    _ => self.retire_refresh(),
                 }
             }
         }
@@ -717,6 +821,13 @@ impl ReviewHost for RepositoryHost<'_> {
     }
 
     fn input(&mut self, session: &mut ReviewSession, event: &Event) -> Result<bool> {
+        if self.pending_socket_decision.is_some() {
+            return match event {
+                Event::Key(key) if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) => Ok(false),
+                Event::Resize(_, _) => Ok(false),
+                _ => Err("socket receipt is pending or failed; no further changes can be submitted; q quits".into()),
+            };
+        }
         let path = self
             .repo
             .root()
@@ -759,11 +870,6 @@ impl ReviewHost for RepositoryHost<'_> {
         if session.is_editing() {
             return Ok(false);
         }
-        if matches!(key.code, KeyCode::Char('q'))
-            && self.herdr.as_ref().is_some_and(|herdr| herdr.pending)
-        {
-            return Err("Submitted feedback is still pending. Resolve the agent's own prompt separately; chvrn will not approve it or silently discard feedback".into());
-        }
         if matches!(key.code, KeyCode::Char('S' | 'x' | 'v'))
             && self.herdr.as_ref().is_some_and(|herdr| herdr.pending)
         {
@@ -772,10 +878,14 @@ impl ReviewHost for RepositoryHost<'_> {
             );
         }
         if key.code == KeyCode::Char('R') && self.refresh_conflict {
-            if self.pending_generation != 0 {
-                session.handle(ReviewInput::DiscardAndReload);
+            let rebuild = self.pending_request.is_none();
+            if !rebuild
+                && session.handle(ReviewInput::DiscardAndReload) != ReviewOutcome::RefreshApplied
+            {
+                self.retire_refresh();
+                return Err("refresh was superseded; waiting for the current snapshot".into());
             }
-            self.publish_refresh(session, self.pending_generation == 0)?;
+            self.publish_refresh(session, rebuild)?;
             return Ok(true);
         }
         if key.code == KeyCode::Char('m') && key.modifiers.is_empty() {
@@ -811,18 +921,31 @@ impl ReviewHost for RepositoryHost<'_> {
             self.accepted_paths.clear();
             self.reset_paths();
             self.selected = 0;
-            *session = self.session()?;
+            self.replace_session(session)?;
             return Ok(true);
         }
         if key.code == KeyCode::Char('x') && self.preview.is_some() {
+            let permit = self
+                .preview
+                .as_ref()
+                .and_then(|preview| preview.socket_snapshot.as_ref())
+                .map(|_| {
+                    self.socket
+                        .as_ref()
+                        .ok_or("socket is unavailable")?
+                        .reserve_decision()
+                })
+                .transpose()?;
             let preview = self.preview.take().ok_or("patch preview is unavailable")?;
-            if let Some(snapshot) = preview.socket_snapshot {
-                self.socket
-                    .as_ref()
-                    .ok_or("socket is unavailable")?
-                    .decision(&snapshot, false)?;
-                self.reload(session)?;
-                session.set_message("Patch candidate explicitly declined; files unchanged");
+            if let (Some(snapshot), Some(permit)) = (&preview.socket_snapshot, permit) {
+                let receipt = permit.record(snapshot, false);
+                self.retire_refresh();
+                self.pending_socket_decision = Some(PendingSocketDecision {
+                    preview,
+                    accepted: false,
+                    receipt: SocketReceipt::Awaiting(receipt),
+                });
+                session.set_message("Files unchanged; waiting for declined socket receipt");
             } else {
                 self.finished = Some(1);
             }
@@ -856,7 +979,7 @@ impl ReviewHost for RepositoryHost<'_> {
             } else {
                 self.selected.saturating_sub(1)
             };
-            *session = self.session()?;
+            self.replace_session(session)?;
             return Ok(true);
         }
         match key.code {
@@ -891,7 +1014,7 @@ impl ReviewHost for RepositoryHost<'_> {
                     .iter()
                     .position(|candidate| *candidate == path)
                     .unwrap_or(0);
-                *session = self.session()?;
+                self.replace_session(session)?;
                 session.set_message("Selected hunk rejected; its snapshot-bound decision is retained for explicit submission");
             }
             KeyCode::Char('c') => {
@@ -917,6 +1040,12 @@ impl ReviewHost for RepositoryHost<'_> {
         session: &mut ReviewSession,
         submission: ReviewSubmission,
     ) -> Result<bool> {
+        if self.pending_socket_decision.is_some() {
+            return Err(
+                "socket receipt is pending or failed; patch application will not be repeated"
+                    .into(),
+            );
+        }
         if let Some(merge) = &mut self.merge {
             if merge.stale {
                 return Err("Git conflict inputs changed; nothing written".into());
@@ -966,7 +1095,7 @@ impl ReviewHost for RepositoryHost<'_> {
                 && file.content != ContentKind::Binary
                 && submission.right.as_bytes() != file.worktree.as_deref().unwrap_or_default()
             {
-                let mode = Some(file.mode.unwrap_or(0o100644));
+                let mode = Some(file.replacement_mode());
                 self.repo
                     .save_worktree(&self.inspected, &path, submission.right.as_bytes())?;
                 self.checked_transition(&[PatchCandidate {
@@ -1014,37 +1143,38 @@ impl ReviewHost for RepositoryHost<'_> {
                 .position(|path| !self.accepted_paths.contains(path))
             {
                 self.selected = next;
-                *session = self.session()?;
+                self.replace_session(session)?;
                 return Ok(false);
             }
         }
+        let permit = self
+            .preview
+            .as_ref()
+            .and_then(|preview| preview.socket_snapshot.as_ref())
+            .map(|_| {
+                self.socket
+                    .as_ref()
+                    .ok_or("socket is unavailable")?
+                    .reserve_decision()
+            })
+            .transpose()?;
         if let Some(preview) = self.preview.take() {
             if let Err(error) = self.repo.import_patch(&self.inspected, &preview.patch) {
                 self.preview = Some(preview);
                 return Err(error.into());
             }
-            if let Some(snapshot) = &preview.socket_snapshot {
-                self.socket
-                    .as_ref()
-                    .ok_or("socket is unavailable")?
-                    .decision(snapshot, true)
-                    .map_err(|error| {
-                        format!(
-                            "Patch was applied, but its socket receipt was not confirmed: {error}"
-                        )
-                    })?;
-            }
-            self.checked_transition(&preview.candidates)?;
-            if preview.socket_snapshot.is_some() {
-                self.decisions.clear();
-                self.accepted_paths.clear();
-                self.selected = 0;
-                *session = self.session()?;
-                session.set_message(
-                    "Patch candidate explicitly accepted and applied; accepted receipt confirmed",
-                );
+            if let (Some(snapshot), Some(permit)) = (&preview.socket_snapshot, permit) {
+                let receipt = permit.record(snapshot, true);
+                self.retire_refresh();
+                self.pending_socket_decision = Some(PendingSocketDecision {
+                    preview,
+                    accepted: true,
+                    receipt: SocketReceipt::Awaiting(receipt),
+                });
+                session.set_message("Patch applied; waiting for accepted socket receipt");
                 return Ok(false);
             }
+            self.checked_transition(&preview.candidates)?;
         }
         let report = if let Some(report) = &mut prepared {
             report.snapshot_id = self.snapshot.clone();
@@ -1092,6 +1222,7 @@ fn same_review(left: &Review, right: &Review) -> bool {
 mod tests {
     use super::*;
     use crate::{OutputFormat, Whitespace};
+    use chvrn_tui::WhitespacePolicy;
     use crossterm::event::KeyEvent;
     use ratatui::{Terminal, backend::TestBackend};
     use std::{fs, process::Command};
@@ -1143,6 +1274,7 @@ mod tests {
             whitespace: Whitespace::Exact,
             lsp: None,
             lsp_args: Vec::new(),
+            runtime: Default::default(),
         };
         let repo = Repository::discover(root.path()).unwrap();
         let inspected = repo.review(base(base_name), &[]).unwrap();
@@ -1179,12 +1311,13 @@ mod tests {
             language: LanguageUi::new(&options, root.path()).unwrap(),
             herdr: None,
             socket: None,
+            pending_socket_decision: None,
             socket_candidates: VecDeque::new(),
             loading: None,
             needs_refresh: false,
             background: BackgroundDiff::new(),
             pending_review: None,
-            pending_generation: 0,
+            pending_request: None,
             refresh_conflict: false,
             finished: None,
         };
@@ -1562,6 +1695,314 @@ mod tests {
             assert!(rows[11].contains("discards"));
             assert!(!rows[11].contains("first.rs"));
             assert!(!rows[11].contains("[s]"));
+        });
+    }
+
+    fn queue_external_refresh(host: &mut RepositoryHost<'_>, session: &mut ReviewSession) {
+        host.watch = FileWatch::new(&[], false).unwrap();
+        let path = host.current_path().unwrap();
+        fs::write(host.repo.root().join(&path), "fn refreshed() {}\n").unwrap();
+        let incoming = Arc::new(
+            host.repo
+                .review(host.inspected.base().clone(), &[])
+                .unwrap(),
+        );
+        let file = incoming.file(&path).unwrap();
+        let request = session.request_diff_snapshots(
+            snapshot(file.base.as_deref().unwrap_or_default()).unwrap(),
+            snapshot(file.worktree.as_deref().unwrap_or_default()).unwrap(),
+        );
+        host.pending_request = Some(request.id());
+        host.pending_review = Some(incoming);
+        host.background.request(request);
+    }
+
+    #[test]
+    fn changing_files_during_refresh_retires_old_presentation_authority() {
+        with_host("index", false, |host| {
+            let mut session = host.session().unwrap();
+            queue_external_refresh(host, &mut session);
+            host.input(
+                &mut session,
+                &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                host.tick(&mut session).unwrap();
+                if host.pending_review.is_none() && host.loading.is_none() && !host.needs_refresh {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "refresh never retired: loading={}, pending={}, needs_refresh={}",
+                    host.loading.is_some(),
+                    host.pending_review.is_some(),
+                    host.needs_refresh,
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(host.current_path().unwrap(), Path::new("last.rs"));
+            assert_eq!(session.pane_text(Pane::Right), "fn after() {}\n");
+            assert_eq!(
+                host.inspected
+                    .file(Path::new("first.rs"))
+                    .unwrap()
+                    .worktree
+                    .as_deref(),
+                Some(b"fn refreshed() {}\n".as_slice()),
+            );
+        });
+    }
+
+    #[test]
+    fn whitespace_change_during_refresh_publishes_matching_repository_authority() {
+        with_host("index", false, |host| {
+            let mut session = host.session().unwrap();
+            queue_external_refresh(host, &mut session);
+            session.set_whitespace_policy(WhitespacePolicy::IgnoreEdge);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while host.pending_review.is_some() {
+                host.tick(&mut session).unwrap();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "refresh never published"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(session.pane_text(Pane::Right), "fn refreshed() {}\n");
+            assert_eq!(
+                host.inspected
+                    .file(Path::new("first.rs"))
+                    .unwrap()
+                    .worktree
+                    .as_deref(),
+                Some(session.pane_text(Pane::Right).as_bytes()),
+            );
+            assert!(host.repo.validate_review(&host.inspected).is_ok());
+        });
+    }
+
+    fn with_socket_preview(check: impl FnOnce(&mut RepositoryHost<'_>, &mut ReviewSession)) {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+        with_host("index", false, |host| {
+            host.watch = FileWatch::new(&[], false).unwrap();
+            let directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")
+                .unwrap();
+            let path = directory.path().join("review.sock");
+            host.socket = Some(
+                SocketUi::new(
+                    &path,
+                    host.repo.root(),
+                    &host.inspected,
+                    &host.snapshot,
+                    &host.options.runtime,
+                )
+                .unwrap(),
+            );
+            let request = serde_json::to_vec(&json!({
+                "type": "patch_candidate",
+                "snapshot": format!("{}:0", host.snapshot),
+                "path": "first.rs",
+                "patch": "--- a/first.rs\n+++ b/first.rs\n@@ -1 +1 @@\n-fn after() {}\n+fn candidate() {}\n",
+            })).unwrap();
+            let mut connection = UnixStream::connect(&path).unwrap();
+            connection
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            connection
+                .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            connection
+                .write_all(&(request.len() as u32).to_be_bytes())
+                .unwrap();
+            connection.write_all(&request).unwrap();
+            let mut length = [0; 4];
+            connection.read_exact(&mut length).unwrap();
+            let size = u32::from_be_bytes(length) as usize;
+            assert!(size <= 65_536);
+            let mut response = vec![0; size];
+            connection.read_exact(&mut response).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&response).unwrap()["status"],
+                "queued"
+            );
+            let mut session = host.session().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while host.socket_candidates.is_empty() {
+                host.tick(&mut session).unwrap();
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "candidate was not delivered"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            host.input(&mut session, &key('v')).unwrap();
+            check(host, &mut session);
+        });
+    }
+
+    fn preview_submission(session: &ReviewSession) -> ReviewSubmission {
+        ReviewSubmission {
+            left: session.pane_text(Pane::Left),
+            right: session.pane_text(Pane::Right),
+            result: None,
+        }
+    }
+
+    #[test]
+    fn socket_receipt_gates_refresh_and_prevents_duplicate_application() {
+        for accepted in [true, false] {
+            with_socket_preview(|host, session| {
+                let before = host.snapshot.clone();
+                if accepted {
+                    assert!(!host.submit(session, preview_submission(session)).unwrap());
+                } else {
+                    host.input(session, &key('x')).unwrap();
+                }
+                let expected = if accepted {
+                    b"fn candidate() {}\n".as_slice()
+                } else {
+                    b"fn after() {}\n".as_slice()
+                };
+                assert_eq!(
+                    fs::read(host.repo.root().join("first.rs")).unwrap(),
+                    expected
+                );
+                assert_eq!(host.snapshot, before);
+                assert!(host.submit(session, preview_submission(session)).is_err());
+                assert!(
+                    host.input(
+                        session,
+                        &Event::Key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL,))
+                    )
+                    .is_err()
+                );
+                host.needs_refresh = true;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                while host.pending_socket_decision.is_some() {
+                    host.tick(session).unwrap();
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "receipt did not complete"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert_ne!(host.snapshot, before);
+                assert_eq!(
+                    fs::read(host.repo.root().join("first.rs")).unwrap(),
+                    expected
+                );
+                assert_eq!(
+                    host.inspected
+                        .file(Path::new("first.rs"))
+                        .unwrap()
+                        .worktree
+                        .as_deref(),
+                    Some(expected)
+                );
+                assert!(host.preview.is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn full_socket_decision_queue_refuses_application_without_consuming_preview() {
+        with_socket_preview(|host, session| {
+            let permits: Vec<_> = (0..32)
+                .map(|_| host.socket.as_ref().unwrap().reserve_decision().unwrap())
+                .collect();
+            assert!(host.submit(session, preview_submission(session)).is_err());
+            assert!(host.preview.is_some());
+            assert!(host.pending_socket_decision.is_none());
+            assert_eq!(
+                fs::read(host.repo.root().join("first.rs")).unwrap(),
+                b"fn after() {}\n"
+            );
+            drop(permits);
+            assert!(!host.submit(session, preview_submission(session)).unwrap());
+            assert_eq!(
+                fs::read(host.repo.root().join("first.rs")).unwrap(),
+                b"fn candidate() {}\n"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while host.pending_socket_decision.is_some() {
+                host.tick(session).unwrap();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+    }
+
+    #[test]
+    fn post_receipt_external_change_blocks_approval_without_reapplying_the_patch() {
+        with_socket_preview(|host, session| {
+            assert!(!host.submit(session, preview_submission(session)).unwrap());
+            fs::write(host.repo.root().join("first.rs"), b"fn external() {}\n").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if host.tick(session).is_err() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(matches!(
+                host.pending_socket_decision,
+                Some(PendingSocketDecision {
+                    accepted: true,
+                    receipt: SocketReceipt::Failed(_),
+                    ..
+                })
+            ));
+            assert!(host.submit(session, preview_submission(session)).is_err());
+            host.tick(session).unwrap();
+            assert_eq!(
+                fs::read(host.repo.root().join("first.rs")).unwrap(),
+                b"fn external() {}\n"
+            );
+            assert!(!host.input(session, &key('q')).unwrap());
+            assert!(host.finished.is_none());
+        });
+    }
+
+    #[test]
+    fn failed_socket_receipt_retains_applied_bytes_without_retrying_or_approving() {
+        with_socket_preview(|host, session| {
+            host.socket
+                .as_ref()
+                .unwrap()
+                .refresh(&host.inspected, "replacement-authority")
+                .unwrap();
+            assert!(!host.submit(session, preview_submission(session)).unwrap());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if host.tick(session).is_err() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(matches!(
+                host.pending_socket_decision,
+                Some(PendingSocketDecision {
+                    accepted: true,
+                    receipt: SocketReceipt::Failed(_),
+                    ..
+                })
+            ));
+            assert!(host.submit(session, preview_submission(session)).is_err());
+            host.tick(session).unwrap();
+            assert_eq!(
+                fs::read(host.repo.root().join("first.rs")).unwrap(),
+                b"fn candidate() {}\n"
+            );
+            assert!(!host.input(session, &key('q')).unwrap());
+            assert!(host.finished.is_none());
         });
     }
 }

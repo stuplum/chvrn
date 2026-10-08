@@ -197,6 +197,30 @@ fn overlapping_insertion_session(ours: &str, theirs: &str) -> ReviewSession {
 }
 
 #[test]
+fn asymmetric_conflicts_shade_unchanged_lines_inside_the_complete_choice() {
+    use ratatui::style::Color;
+    let mut session = ReviewSession::three_way("a\nb\n", "A\nb\n", "X\nY\n");
+    session.set_theme(external_theme(
+        r##"
+"ui.background" = { bg = "#101010" }
+"chvrn.diff.conflict.selected" = { bg = "#aabbcc" }
+"chvrn.diff.conflict.result.selected" = { bg = "#aabbcc" }
+        "##,
+    ));
+    let buffer = draw(&session, 180, 12);
+    let mut unchanged_choice_lines = 0;
+    for y in 2..6 {
+        for x in 0..buffer.area.width {
+            if buffer[(x, y)].symbol() == "b" {
+                unchanged_choice_lines += 1;
+                assert_eq!(buffer[(x + 12, y)].bg, Color::Rgb(170, 187, 204));
+            }
+        }
+    }
+    assert_eq!(unchanged_choice_lines, 2);
+}
+
+#[test]
 fn shared_lines_in_competing_insertions_are_shaded_as_part_of_the_whole_conflict() {
     use ratatui::style::Color;
     let short = "head\nαshared\nβshared\ntail\n";

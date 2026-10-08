@@ -1,3 +1,4 @@
+use crate::integration_runtime::Cancellation;
 use crate::{HerdrMode, Options, Result, ReviewArgs};
 use chvrn_git::{GitError, Repository, Review};
 use chvrn_integrations::herdr::{
@@ -5,11 +6,12 @@ use chvrn_integrations::herdr::{
     ReviewedFile, SplitDirection,
 };
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    mpsc::{self, Receiver, RecvTimeoutError, Sender},
-};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{
+    mpsc::{self, Receiver, Sender},
+    oneshot,
+};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Identity {
@@ -41,10 +43,22 @@ enum Command {
     },
 }
 
+struct PendingPrompt(chvrn_integrations::herdr::DeliveryState);
+
+impl Drop for PendingPrompt {
+    fn drop(&mut self) {
+        if self.0.unconfirmed() {
+            eprintln!(
+                "chvrn: Herdr prompt delivery remains uncertain; no automatic retry was made"
+            );
+        }
+    }
+}
+
 pub struct HerdrUi {
     sender: Option<Sender<Command>>,
     notices: Receiver<Notice>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    cancellation: Option<Cancellation>,
     identity: Option<Identity>,
     pub pending: bool,
     pub mode: HerdrMode,
@@ -62,17 +76,30 @@ impl HerdrUi {
             .clone()
             .or_else(|| std::env::var("HERDR_PANE_ID").ok())
             .ok_or("herdr mode requires --agent NAME_OR_PANE")?;
-        let process = HerdrProcess::from_environment()?;
-        let pane = process.resolve_target(&target)?;
+        let handle = options.runtime.handle()?;
+        let process = HerdrProcess::from_environment(handle.processes.clone())?;
+        let delivery = process.delivery_state();
         let own_pane = std::env::var("HERDR_PANE_ID").ok();
-        let (sender, commands) = mpsc::channel();
-        let (output, notices) = mpsc::channel();
-        let worker =
-            std::thread::spawn(move || run_worker(process, pane, own_pane, mode, commands, output));
+        let (sender, commands) = mpsc::channel(32);
+        let (output, notices) = mpsc::channel(32);
+        let preparation = GitPreparation::new()?;
+        let cancellation = handle.spawn(async move {
+            let _pending_prompt = PendingPrompt(delivery);
+            match process.resolve_target(&target).await {
+                Ok(pane) => {
+                    run_worker(process, pane, own_pane, mode, commands, output, preparation).await
+                }
+                Err(error) => {
+                    let _ = output
+                        .send(Notice::Failed(format!("Herdr target unavailable: {error}")))
+                        .await;
+                }
+            }
+        })?;
         Ok(Some(Self {
             sender: Some(sender),
             notices,
-            worker: Some(worker),
+            cancellation: Some(cancellation),
             identity: None,
             pending: false,
             mode,
@@ -80,7 +107,10 @@ impl HerdrUi {
     }
 
     pub fn notices(&mut self) -> Vec<Notice> {
-        let notices: Vec<_> = self.notices.try_iter().collect();
+        let mut notices = Vec::new();
+        while let Ok(notice) = self.notices.try_recv() {
+            notices.push(notice);
+        }
         for notice in &notices {
             match notice {
                 Notice::Identity(identity) => self.identity = identity.clone(),
@@ -124,19 +154,23 @@ impl HerdrUi {
         self.sender
             .as_ref()
             .ok_or("herdr worker stopped")?
-            .send(Command::Submit {
+            .try_send(Command::Submit {
                 report,
                 review,
                 root,
-            })?;
+            })
+            .map_err(|_| "herdr command queue full or stopped")?;
         self.pending = true;
         Ok(())
     }
 
-    pub fn invalidate(&self, snapshot: &str) {
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(Command::Invalidate(snapshot.into()));
-        }
+    pub fn invalidate(&self, snapshot: &str) -> Result<()> {
+        self.sender
+            .as_ref()
+            .ok_or("herdr worker stopped")?
+            .try_send(Command::Invalidate(snapshot.into()))
+            .map_err(|_| "herdr command queue full or stopped")?;
+        Ok(())
     }
 
     pub fn explain(
@@ -149,24 +183,28 @@ impl HerdrUi {
         self.sender
             .as_ref()
             .ok_or("herdr worker stopped")?
-            .send(Command::Explain {
+            .try_send(Command::Explain {
                 snapshot: snapshot.into(),
                 path: path.into(),
                 range: HunkRange {
                     start: range.start,
                     end: range.end,
                 },
-            })?;
+            })
+            .map_err(|_| "herdr command queue full or stopped")?;
         Ok(())
     }
 }
 
 impl Drop for HerdrUi {
     fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if self.pending {
+            eprintln!(
+                "chvrn: submitted Herdr feedback was not confirmed; quitting without approval or automatic retry"
+            );
         }
+        self.sender.take();
+        self.cancellation.take();
     }
 }
 
@@ -182,14 +220,43 @@ fn validate_inspected(root: &Path, review: &Review) -> std::result::Result<(), G
     Repository::open(root)?.validate_review(review)
 }
 
-fn accept_submission(
+struct GitPreparation(std::sync::mpsc::SyncSender<(PathBuf, Arc<Review>, oneshot::Sender<bool>)>);
+
+impl GitPreparation {
+    fn new() -> Result<Self> {
+        let (sender, jobs) =
+            std::sync::mpsc::sync_channel::<(PathBuf, Arc<Review>, oneshot::Sender<bool>)>(1);
+        std::thread::Builder::new()
+            .name("chvrn-herdr-preparation".into())
+            .spawn(move || {
+                while let Ok((root, review, reply)) = jobs.recv() {
+                    let _ = reply.send(validate_inspected(&root, &review).is_ok());
+                }
+            })?;
+        Ok(Self(sender))
+    }
+
+    async fn validate(&self, root: PathBuf, review: Arc<Review>) -> bool {
+        let (reply, response) = oneshot::channel();
+        if self.0.try_send((root, review, reply)).is_err() {
+            return false;
+        }
+        response.await.unwrap_or(false)
+    }
+}
+
+async fn accept_submission(
     bridge: &mut HerdrBridge,
     inspected: &mut Option<(Arc<Review>, PathBuf)>,
     report: ReviewReport,
     review: Arc<Review>,
     root: PathBuf,
+    preparation: &GitPreparation,
 ) -> Notice {
-    if validate_inspected(&root, &review).is_err() {
+    if !preparation
+        .validate(root.clone(), Arc::clone(&review))
+        .await
+    {
         bridge.invalidate_snapshot(&report.snapshot_id);
         Notice::Invalidated
     } else if let Err(error) = bridge.submit(report) {
@@ -202,15 +269,17 @@ fn accept_submission(
     }
 }
 
-fn feedback_review_is_current(
+async fn feedback_review_is_current(
     bridge: &mut HerdrBridge,
     inspected: &Option<(Arc<Review>, PathBuf)>,
     report: &ReviewReport,
+    preparation: &GitPreparation,
 ) -> bool {
-    if inspected
-        .as_ref()
-        .is_some_and(|(review, root)| validate_inspected(root, review).is_ok())
-    {
+    let valid = match inspected {
+        Some((review, root)) => preparation.validate(root.clone(), Arc::clone(review)).await,
+        None => false,
+    };
+    if valid {
         true
     } else {
         bridge.invalidate_snapshot(&report.snapshot_id);
@@ -218,23 +287,24 @@ fn feedback_review_is_current(
     }
 }
 
-fn run_worker(
+async fn run_worker(
     process: HerdrProcess,
     pane: String,
     own_pane: Option<String>,
     mode: HerdrMode,
-    commands: Receiver<Command>,
+    mut commands: Receiver<Command>,
     output: Sender<Notice>,
+    preparation: GitPreparation,
 ) {
     let mut bridge = HerdrBridge::new(&pane);
     let mut identity = None;
     let mut inspected: Option<(Arc<Review>, PathBuf)> = None;
     let mut previous_error = String::new();
     if mode == HerdrMode::Gate {
-        let _ = output.send(Notice::Offer);
+        let _ = output.send(Notice::Offer).await;
     }
     loop {
-        let mut effects = match process.sample(&mut bridge) {
+        let mut effects = match process.sample(&mut bridge).await {
             Ok(effects) => {
                 previous_error.clear();
                 effects
@@ -242,7 +312,7 @@ fn run_worker(
             Err(error) => {
                 let message = format!("Herdr lifecycle unavailable: {error}");
                 if previous_error != message {
-                    let _ = output.send(Notice::Message(message.clone()));
+                    let _ = output.send(Notice::Message(message.clone())).await;
                     previous_error = message;
                 }
                 Vec::new()
@@ -251,87 +321,111 @@ fn run_worker(
         let current = current_identity(&bridge);
         if current != identity {
             if identity.is_some() {
-                let _ = output.send(Notice::Invalidated);
+                let _ = output.send(Notice::Invalidated).await;
             }
             identity = current.clone();
-            let _ = output.send(Notice::Identity(current));
+            let _ = output.send(Notice::Identity(current)).await;
         }
         for effect in effects.drain(..) {
             match effect {
                 BridgeEffect::OfferReview { .. } if mode != HerdrMode::Companion => {
-                    let _ = output.send(Notice::Offer);
+                    let _ = output.send(Notice::Offer).await;
                     if let Some(own) = &own_pane {
                         if own != &pane {
-                            if let Err(error) = process.focus_pane(own) {
-                                let _ = output.send(Notice::Message(format!(
-                                    "Review ready; focus unchanged because: {error}"
-                                )));
+                            if let Err(error) = process.focus_pane(own).await {
+                                let _ = output
+                                    .send(Notice::Message(format!(
+                                        "Review ready; focus unchanged because: {error}"
+                                    )))
+                                    .await;
                             }
                         }
                     }
                 }
                 BridgeEffect::OfferReview { .. } => {}
                 BridgeEffect::InvalidateReview { .. } => {
-                    let _ = output.send(Notice::Invalidated);
+                    let _ = output.send(Notice::Invalidated).await;
                 }
                 BridgeEffect::SendFeedback { report } => {
-                    if !feedback_review_is_current(&mut bridge, &inspected, &report) {
-                        let _ = output.send(Notice::Invalidated);
+                    if !feedback_review_is_current(&mut bridge, &inspected, &report, &preparation)
+                        .await
+                    {
+                        let _ = output.send(Notice::Invalidated).await;
                         continue;
                     }
-                    match process.deliver_feedback(&mut bridge, &report) {
+                    match process.deliver_feedback(&mut bridge, &report).await {
                         Ok(FeedbackDelivery::Delivered) => {
-                            let _ = output.send(Notice::Delivered);
+                            let _ = output.send(Notice::Delivered).await;
                         }
                         Ok(FeedbackDelivery::RejectedBlocked) => {
-                            let _ = output.send(Notice::Message("Feedback remains pending; the agent is blocked. No approval keys were sent".into()));
+                            let _ = output.send(Notice::Message("Feedback remains pending; the agent is blocked. No approval keys were sent".into())).await;
                         }
                         Ok(FeedbackDelivery::Uncertain(message)) => {
                             let _ = output.send(Notice::Failed(format!(
                                 "Feedback delivery uncertain; not retrying automatically: {message}"
-                            )));
+                            ))).await;
                         }
                         Err(error) => {
-                            let _ = output.send(Notice::Failed(format!(
-                                "Feedback transport failed; not retrying automatically: {error}"
-                            )));
+                            let _ = output
+                                .send(Notice::Failed(format!(
+                                    "Feedback transport failed; not retrying automatically: {error}"
+                                )))
+                                .await;
                         }
                     }
                 }
             }
         }
-        match commands.recv_timeout(Duration::from_millis(350)) {
-            Ok(Command::Submit { report, review, root }) => {
-                let notice = accept_submission(&mut bridge, &mut inspected, report, review, root);
-                let _ = output.send(notice);
+        match tokio::time::timeout(Duration::from_millis(350), commands.recv()).await {
+            Ok(Some(Command::Submit { report, review, root })) => {
+                let notice = accept_submission(&mut bridge, &mut inspected, report, review, root, &preparation).await;
+                let _ = output.send(notice).await;
             }
-            Ok(Command::Invalidate(snapshot)) => {
+            Ok(Some(Command::Invalidate(snapshot))) => {
                 bridge.invalidate_snapshot(&snapshot);
-                let _ = output.send(Notice::Invalidated);
+                let _ = output.send(Notice::Invalidated).await;
             }
-            Ok(Command::Explain { snapshot, path, range }) => {
-                match process.request_explanation(&bridge, &snapshot, &path, range, "Explain this hunk's intent and risks in your pane. Any proposed patch remains a suggestion, not permission to edit or approve.") {
-                    Ok(FeedbackDelivery::Delivered) => { let _ = output.send(Notice::Message("Hunk explanation requested from the selected agent; any suggestion still requires explicit review".into())); }
-                    Ok(result) => { let _ = output.send(Notice::Message(format!("Explanation not confirmed; no automatic retry: {result:?}"))); }
-                    Err(error) => { let _ = output.send(Notice::Message(format!("Explanation unavailable: {error}"))); }
+            Ok(Some(Command::Explain { snapshot, path, range })) => {
+                match process.request_explanation(&bridge, &snapshot, &path, range, "Explain this hunk's intent and risks in your pane. Any proposed patch remains a suggestion, not permission to edit or approve.").await {
+                    Ok(FeedbackDelivery::Delivered) => { let _ = output.send(Notice::Message("Hunk explanation requested from the selected agent; any suggestion still requires explicit review".into())).await; }
+                    Ok(result) => { let _ = output.send(Notice::Message(format!("Explanation not confirmed; no automatic retry: {result:?}"))).await; }
+                    Err(error) => { let _ = output.send(Notice::Message(format!("Explanation unavailable: {error}"))).await; }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => { bridge.quit(); break; }
+            Err(_) => {}
+            Ok(None) => { bridge.quit(); break; }
         }
     }
 }
 
-pub fn open_companion(args: &ReviewArgs, options: &Options, root: &Path, base: &str) -> Result<u8> {
-    let process = HerdrProcess::from_environment()?;
+pub async fn open_companion(
+    args: &ReviewArgs,
+    options: &Options,
+    root: &Path,
+    base: &str,
+) -> Result<u8> {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        open_companion_operation(args, options, root, base),
+    )
+    .await
+    .map_err(|_| "companion command deadline exceeded; delivery may be uncertain")?
+}
+
+async fn open_companion_operation(
+    args: &ReviewArgs,
+    options: &Options,
+    root: &Path,
+    base: &str,
+) -> Result<u8> {
+    let process = HerdrProcess::from_environment(options.runtime.handle()?.processes)?;
     let target = options
         .agent
         .clone()
         .or_else(|| std::env::var("HERDR_PANE_ID").ok())
         .ok_or("--open-companion needs an explicit agent target")?;
-    let target = process.resolve_target(&target)?;
+    let target = process.resolve_target(&target).await?;
     let caller = std::env::var("HERDR_PANE_ID").map_err(|_| "caller pane is unavailable")?;
-    let pane = process.split(&caller, SplitDirection::Right, root)?;
     let binary = std::env::current_exe()?;
     let mut words = vec![
         binary.into_os_string(),
@@ -388,7 +482,8 @@ pub fn open_companion(args: &ReviewArgs, options: &Options, root: &Path, base: &
         })
         .collect::<std::result::Result<Vec<_>, _>>()?
         .join(" ");
-    process.run_pane(&pane, &command)?;
+    let pane = process.split(&caller, SplitDirection::Right, root).await?;
+    process.run_pane(&pane, &command).await?;
     println!(
         "Opened chvrn companion in {pane}; caller focus and working directory were not changed"
     );
@@ -401,7 +496,7 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Notice, accept_submission, feedback_review_is_current};
+    use super::{GitPreparation, Notice, accept_submission, feedback_review_is_current};
     use chvrn_git::{Base, Repository};
     use chvrn_integrations::herdr::{AgentSessionIdentity, HerdrBridge, ReviewReport};
     use std::fs;
@@ -424,8 +519,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn review_delivery_rejects_index_only_changes_after_submission_when_worktree_bytes_match() {
+    #[tokio::test]
+    async fn review_delivery_rejects_index_only_changes_after_submission_when_worktree_bytes_match()
+    {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         git(root, &["init", "--quiet"]);
@@ -449,13 +545,16 @@ mod tests {
         let mut bridge = HerdrBridge::new("w9:p5");
         bridge.observe_agent_session(AgentSessionIdentity::Verified("session-one".into()));
         let mut inspected = None;
+        let preparation = GitPreparation::new().unwrap();
         let notice = accept_submission(
             &mut bridge,
             &mut inspected,
             report.clone(),
             review.clone(),
             root.to_path_buf(),
-        );
+            &preparation,
+        )
+        .await;
         assert!(matches!(notice, Notice::Message(_)));
         assert!(bridge.pending_report().is_some());
 
@@ -468,11 +567,7 @@ mod tests {
             review.files()[0].worktree.as_deref(),
             Some(b"original\n".as_slice())
         );
-        assert!(!feedback_review_is_current(
-            &mut bridge,
-            &inspected,
-            &report
-        ));
+        assert!(!feedback_review_is_current(&mut bridge, &inspected, &report, &preparation,).await);
         assert!(bridge.pending_report().is_none());
     }
 }

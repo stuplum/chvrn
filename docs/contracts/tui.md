@@ -62,6 +62,8 @@ pub enum ReviewOutcome {
     DiscardRequired,
     LocalDiffPending,
     RefreshConflict,
+    RefreshApplied,
+    RefreshSuperseded,
     UnresolvedConflicts(usize),
     Submitted(ReviewSubmission),
     Quit,
@@ -128,11 +130,13 @@ impl ReviewSession {
 }
 
 impl DiffRequest {
+    pub fn id(&self) -> DiffRequestId;
     pub fn generation(&self) -> u64;
     pub fn compute(self) -> DiffCompletion;
 }
 
 impl DiffCompletion {
+    pub fn id(&self) -> DiffRequestId;
     pub fn generation(&self) -> u64;
 }
 ```
@@ -147,9 +151,9 @@ impl DiffCompletion {
 
 `request_diff_snapshots` accepts already owned core snapshots and retains their identities in the resulting request. Use it when the filesystem worker has already read snapshots; `request_diff` remains the UTF-8 string convenience entry point. Neither API computes the diff on the caller thread.
 
-`request_diff` copies its two input snapshots into an owned request, assigns a monotonically increasing generation and returns promptly without computing the diff. The caller runs `DiffRequest::compute` off the input/render thread and dispatches its completion with `ReviewInput::DiffReady`. Only a completion for the latest requested generation may replace the displayed snapshots/alignment. An older completion cannot change text, hunk selection or the displayed diff, regardless of arrival order. Even the latest completion cannot overwrite dirty buffers, whether edits predate the request or occur before its completion: `handle` retains the edited buffers and pending newer snapshots, returns `RefreshConflict`, and blocks submission. `DiscardAndReload` explicitly abandons local edits and adopts the latest pending snapshots. If the user wants to retain edits, the host must reconcile them against those newer snapshots in a separate review/merge session, then submit that reconciled session against its inspected snapshot; it cannot make the conflicted session silently submit. The host must still perform its snapshot preflight before any write.
+`request_diff` copies its two input snapshots into an owned request, assigns a monotonically increasing generation bound to the originating session and returns promptly without computing the diff. The caller runs `DiffRequest::compute` off the input/render thread and dispatches its completion with `ReviewInput::DiffReady`. Only the latest request from that session can replace displayed buffers. Foreign and superseded completions return `RefreshSuperseded` without changing text or alignment, including when their numeric generation equals an already accepted generation. Even the latest completion cannot overwrite dirty buffers: `handle` retains the edited buffers and pending newer snapshots, returns `RefreshConflict`, and blocks submission. `DiscardAndReload` explicitly abandons local edits and adopts the latest pending snapshots, returning `RefreshApplied`. Retaining edits requires a separately reconciled review/merge against the newer snapshot. The host must still perform its snapshot preflight before any write.
 
-`DiffRequest::generation` and `DiffCompletion::generation` carry the same token. `ReviewSession::accepted_generation` starts at zero and advances only when that exact completion replaces displayed buffers, never for a stale completion or `RefreshConflict`. The host may publish new filesystem write guards only after observing the accepted generation equal the completion's generation. A whitespace-policy change during an in-flight request invalidates that request's presentation; the host requests a fresh diff. `DiffRequest::compute` also prepares registered syntax spans off the input/render thread.
+`DiffRequest::id` and `DiffCompletion::id` expose an opaque `DiffRequestId` with equality and copy semantics. Hosts retain it alongside pending filesystem authority and publish new write guards only when that exact completion returns `RefreshApplied`. Numeric `generation` and `accepted_generation` values are not cross-session authority. Hosts retire or restart pending work when replacing a session, file or preview, and handle `RefreshSuperseded` explicitly. A whitespace-policy change preserves incoming snapshot authority while recomputing presentation under the current policy; dirty buffers still require explicit discard. `DiffRequest::compute` also prepares registered syntax spans off the input/render thread.
 
 Large local buffer mutations defer diff alignment and syntax generation to a coalescing worker. `is_local_diff_pending` remains true until `poll_background` accepts the latest generation; the host calls `poll_background` on each review tick before drawing. While pending, `selected_hunk_ranges` is `None`, hunk apply is disabled, and `s` returns `LocalDiffPending` without a submission. Older local completions cannot replace the latest edit or undo. External refresh generations remain independently guarded.
 
@@ -194,6 +198,8 @@ The header uses distinct labelled styles for modified buffers and insert mode. T
 Connector rasterisation pins each outer column to its corresponding pane's half-open source range, keeping connector backgrounds off neighbouring unchanged lines. Interior columns cover their horizontal extent rather than sampling a single point, so steep thin bands remain connected. Painting one half-cell preserves the other half's existing colour. Gutter controls are drawn after all band backgrounds so adjoining bands cannot cover an action.
 
 During deferred alignment, the renderer shows bounded slices of current buffer lines with an updating status instead of showing stale hunk rows or stale syntax. Viewport grapheme-to-cell checkpoints bound clipping and cursor lookup for long lines; unchanged source buffers remain intact.
+
+Syntax spans are ordered and non-overlapping. Per-grapheme style lookup binary-searches their start positions and checks only the immediately preceding span for containment; a plain gap does not scan earlier spans. Viewport rendering cost therefore does not grow with all preceding highlighted spans.
 
 `set_paths` retains paths for filename display and help, and selects syntax from the configured core catalogue using each path and snapshot's first line. Review sessions share one catalogue loaded on first use; syntax errors are visible in the footer. `set_output_path` supplies the merge destination without changing buffers or writing files. Unknown syntax remains plain text. `set_message` displays host status without interpreting it as a command. Clicking a pane targets its real source line; gutter controls share render/hit-test geometry and overlap priority. Pending matching suppresses actions. Syntax spans, projections and change bands are cached on refresh, not rebuilt in `render`; large updates prepare them on the worker.
 

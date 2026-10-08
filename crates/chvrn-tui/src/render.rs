@@ -1425,7 +1425,7 @@ impl ReviewSession {
         let end = range
             .end
             .min(top.saturating_add(usize::from(connector.area.height)));
-        for index in range.start.max(top)..end {
+        if let Some(index) = (range.start.max(top)..end).next() {
             let offset = index - top;
             let row = self.pane_row(source, offset)?;
             let y = connector.area.y + offset as u16;
@@ -1853,10 +1853,10 @@ pub(crate) fn render_line(
         }
         let absolute_byte = line.byte_start + stop.byte + byte;
         let prefix = syntax.partition_point(|span| span.bytes.start <= absolute_byte);
-        let syntax_style = syntax[..prefix]
-            .iter()
-            .rev()
-            .find(|span| absolute_byte < span.bytes.end)
+        let syntax_style = prefix
+            .checked_sub(1)
+            .and_then(|index| syntax.get(index))
+            .filter(|span| absolute_byte < span.bytes.end)
             .map(|span| palette.syntax(&span.kind))
             .unwrap_or_default();
         let changed_prefix = line.changed.partition_point(|span| span.start <= current);

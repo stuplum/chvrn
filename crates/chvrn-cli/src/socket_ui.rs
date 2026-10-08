@@ -1,28 +1,73 @@
 use crate::Result;
+use crate::integration_runtime::{Cancellation, IntegrationRuntime};
 use chvrn_git::Review;
-use chvrn_integrations::socket::{InspectedFile, PatchCandidate, ReviewOutcome, SocketServer};
+use chvrn_integrations::socket::{
+    InspectedFile, PatchCandidate, ReviewOutcome, SocketCommand, SocketServer,
+};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-enum Command {
-    Refresh(Vec<InspectedFile>),
-    Decision {
-        snapshot: String,
-        outcome: ReviewOutcome,
-        reply: Sender<std::io::Result<()>>,
-    },
+pub struct DecisionPermit {
+    command: mpsc::OwnedPermit<SocketCommand>,
+    reply: OwnedSemaphorePermit,
+}
+
+pub struct PendingDecision {
+    completion: oneshot::Receiver<std::result::Result<(), String>>,
+    reply: Option<OwnedSemaphorePermit>,
+}
+
+impl DecisionPermit {
+    pub fn record(self, snapshot: &str, accepted: bool) -> PendingDecision {
+        let (reply, completion) = oneshot::channel();
+        self.command.send(SocketCommand::Decision {
+            snapshot: snapshot.into(),
+            outcome: if accepted {
+                ReviewOutcome::Accepted
+            } else {
+                ReviewOutcome::Declined
+            },
+            reply,
+        });
+        PendingDecision {
+            completion,
+            reply: Some(self.reply),
+        }
+    }
+}
+
+impl PendingDecision {
+    pub fn try_complete(&mut self) -> Option<std::result::Result<(), String>> {
+        self.reply.as_ref()?;
+        let result = match self.completion.try_recv() {
+            Ok(result) => result,
+            Err(oneshot::error::TryRecvError::Empty) => return None,
+            Err(oneshot::error::TryRecvError::Closed) => {
+                Err("socket owner stopped before recording receipt".into())
+            }
+        };
+        self.reply.take();
+        Some(result)
+    }
 }
 
 pub struct SocketUi {
-    commands: Option<Sender<Command>>,
-    candidates: Receiver<PatchCandidate>,
-    errors: Receiver<String>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    commands: mpsc::Sender<SocketCommand>,
+    candidates: Mutex<mpsc::Receiver<PatchCandidate>>,
+    errors: Mutex<mpsc::Receiver<String>>,
+    replies: Arc<Semaphore>,
+    _cancellation: Cancellation,
 }
 
 impl SocketUi {
-    pub fn new(path: &Path, root: &Path, review: &Review, snapshot: &str) -> Result<Self> {
+    pub fn new(
+        path: &Path,
+        root: &Path,
+        review: &Review,
+        snapshot: &str,
+        runtime: &IntegrationRuntime,
+    ) -> Result<Self> {
         let parent = path
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -34,92 +79,64 @@ impl SocketUi {
                 .mode(0o700)
                 .create(parent)?;
         }
-        let mut server = SocketServer::bind(path, root, inspected(review, snapshot)?)?;
-        server.set_nonblocking(true)?;
-        let (commands, input) = mpsc::channel();
-        let (send_candidate, candidates) = mpsc::channel();
-        let (send_error, errors) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            loop {
-                match server.poll() {
-                    Ok(true) => {
-                        for candidate in server.take_pending_candidates() {
-                            if send_candidate.send(candidate).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        let _ = send_error.send(error.to_string());
-                    }
-                }
-                match input.recv_timeout(Duration::from_millis(30)) {
-                    Ok(Command::Refresh(files)) => {
-                        if let Err(error) = server.refresh_inspected(files) {
-                            let _ = send_error.send(error.to_string());
-                        }
-                    }
-                    Ok(Command::Decision {
-                        snapshot,
-                        outcome,
-                        reply,
-                    }) => {
-                        let _ = reply.send(server.record_review(&snapshot, outcome));
-                    }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-            }
-        });
+        let server = SocketServer::bind(path, root, inspected(review, snapshot)?)?;
+        let (commands, input) = mpsc::channel(32);
+        let (send_candidate, candidates) = mpsc::channel(32);
+        let (send_error, errors) = mpsc::channel(32);
+        let cancellation =
+            runtime
+                .handle()?
+                .spawn(server.run(input, send_candidate, send_error))?;
         Ok(Self {
-            commands: Some(commands),
-            candidates,
-            errors,
-            worker: Some(worker),
+            commands,
+            candidates: Mutex::new(candidates),
+            errors: Mutex::new(errors),
+            replies: Arc::new(Semaphore::new(32)),
+            _cancellation: cancellation,
         })
     }
 
     pub fn candidates(&self) -> Vec<PatchCandidate> {
-        self.candidates.try_iter().collect()
+        let mut receiver = self
+            .candidates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut values = Vec::new();
+        while let Ok(value) = receiver.try_recv() {
+            values.push(value);
+        }
+        values
     }
+
     pub fn errors(&self) -> Vec<String> {
-        self.errors.try_iter().collect()
+        let mut receiver = self
+            .errors
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut values = Vec::new();
+        while let Ok(value) = receiver.try_recv() {
+            values.push(value);
+        }
+        values
     }
 
     pub fn refresh(&self, review: &Review, snapshot: &str) -> Result<()> {
         self.commands
-            .as_ref()
-            .ok_or("socket worker stopped")?
-            .send(Command::Refresh(inspected(review, snapshot)?))?;
+            .try_send(SocketCommand::Refresh(inspected(review, snapshot)?))
+            .map_err(|_| "socket command queue full or stopped")?;
         Ok(())
     }
 
-    pub fn decision(&self, snapshot: &str, accepted: bool) -> Result<()> {
-        let (reply, acknowledgement) = mpsc::channel();
-        self.commands
-            .as_ref()
-            .ok_or("socket worker stopped")?
-            .send(Command::Decision {
-                snapshot: snapshot.into(),
-                outcome: if accepted {
-                    ReviewOutcome::Accepted
-                } else {
-                    ReviewOutcome::Declined
-                },
-                reply,
-            })?;
-        acknowledgement.recv_timeout(Duration::from_secs(3))??;
-        Ok(())
-    }
-}
-
-impl Drop for SocketUi {
-    fn drop(&mut self) {
-        self.commands.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+    pub fn reserve_decision(&self) -> Result<DecisionPermit> {
+        let reply = Arc::clone(&self.replies)
+            .try_acquire_owned()
+            .map_err(|_| "socket decision acknowledgements full")?;
+        let command = self
+            .commands
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| "socket command queue full or stopped")?;
+        Ok(DecisionPermit { command, reply })
     }
 }
 
@@ -168,6 +185,20 @@ mod tests {
         serde_json::from_slice(&response).unwrap()
     }
 
+    fn complete(mut pending: super::PendingDecision) -> std::result::Result<(), String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(result) = pending.try_complete() {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "decision receipt timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     #[test]
     fn decision_confirms_completed_receipt_and_propagates_failed_recording() {
         let dir = tempfile::tempdir_in("/tmp").unwrap();
@@ -186,13 +217,11 @@ mod tests {
             .review(Base::Index, &[std::path::PathBuf::from("file.txt")])
             .unwrap();
         let socket = dir.path().join("chvrn.sock");
-        let ui = SocketUi::new(&socket, dir.path(), &review, "session-1").unwrap();
+        let runtime = crate::integration_runtime::IntegrationRuntime::default();
+        let ui = SocketUi::new(&socket, dir.path(), &review, "session-1", &runtime).unwrap();
 
-        let not_issued = ui.decision("session-1:0", true).unwrap_err();
-        assert_eq!(
-            not_issued.downcast_ref::<std::io::Error>().unwrap().kind(),
-            std::io::ErrorKind::NotFound
-        );
+        let not_issued = complete(ui.reserve_decision().unwrap().record("session-1:0", true));
+        assert!(not_issued.is_err());
 
         let queued = request(
             &socket,
@@ -204,11 +233,17 @@ mod tests {
             }),
         );
         assert_eq!(queued["status"], "queued");
-        ui.decision("session-1:0", true).unwrap();
+        complete(ui.reserve_decision().unwrap().record("session-1:0", true)).unwrap();
         let status = request(
             &socket,
             &json!({"type": "review_status", "snapshot": "session-1:0"}),
         );
         assert_eq!(status["status"], "accepted");
+        let permits: Vec<_> = (0..32).map(|_| ui.reserve_decision().unwrap()).collect();
+        assert!(ui.reserve_decision().is_err());
+        drop(permits);
+        let mut pending = ui.reserve_decision().unwrap().record("missing", false);
+        runtime.shutdown();
+        assert!(pending.try_complete().unwrap().is_err());
     }
 }

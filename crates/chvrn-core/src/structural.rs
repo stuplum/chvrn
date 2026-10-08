@@ -82,6 +82,7 @@ struct Token<'a> {
 
 struct SyntaxUnit<'a> {
     kind: &'static str,
+    node: Node<'a>,
     name: Option<&'a str>,
     text: &'a str,
     range: Range<usize>,
@@ -142,7 +143,7 @@ fn collect_tokens<'a>(
     }
 }
 
-fn units<'a>(source: &'a TextSnapshot, tree: &Tree) -> Vec<SyntaxUnit<'a>> {
+fn units<'a>(source: &'a TextSnapshot, tree: &'a Tree) -> Vec<SyntaxUnit<'a>> {
     let root = tree.root_node();
     let mut units = Vec::new();
     for index in 0..root.named_child_count() {
@@ -155,6 +156,7 @@ fn units<'a>(source: &'a TextSnapshot, tree: &Tree) -> Vec<SyntaxUnit<'a>> {
         collect_tokens(node, source.text(), name_range.clone(), &mut tokens);
         units.push(SyntaxUnit {
             kind: node.kind(),
+            node,
             name: name_range.map(|name| &source.text()[name]),
             text: &source.text()[range.clone()],
             range,
@@ -164,8 +166,16 @@ fn units<'a>(source: &'a TextSnapshot, tree: &Tree) -> Vec<SyntaxUnit<'a>> {
     units
 }
 
+fn same_tree_shape(left: Node<'_>, right: Node<'_>) -> bool {
+    left.kind_id() == right.kind_id()
+        && left.child_count() == right.child_count()
+        && (0..left.child_count())
+            .all(|index| same_tree_shape(left.child(index).unwrap(), right.child(index).unwrap()))
+}
+
 fn same_tokens(left: &SyntaxUnit<'_>, right: &SyntaxUnit<'_>) -> bool {
     left.tokens.len() == right.tokens.len()
+        && same_tree_shape(left.node, right.node)
         && left
             .tokens
             .iter()
@@ -179,6 +189,7 @@ fn renamed(left: &SyntaxUnit<'_>, right: &SyntaxUnit<'_>) -> bool {
         && right.name.is_some()
         && left.name != right.name
         && left.tokens.len() == right.tokens.len()
+        && same_tree_shape(left.node, right.node)
         && left
             .tokens
             .iter()

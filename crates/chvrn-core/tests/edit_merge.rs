@@ -114,6 +114,23 @@ fn visible_line_accessors_keep_unicode_offsets_and_crlf_without_flattening_the_b
 }
 
 #[test]
+fn editor_treats_unicode_separators_as_content_and_only_cr_lf_as_lines() {
+    for separator in ['\u{000b}', '\u{000c}', '\u{0085}', '\u{2028}', '\u{2029}'] {
+        let mut buffer = TextBuffer::new(snapshot(&format!("a{separator}b\nc")));
+        assert_eq!(buffer.line_count(), 2, "{separator:?}");
+        assert_eq!(buffer.line_to_char(1), Some(4), "{separator:?}");
+        buffer.set_cursor(buffer.line_to_char(1).unwrap()).unwrap();
+        buffer.insert("X").unwrap();
+        assert_eq!(buffer.text(), format!("a{separator}b\nXc"));
+    }
+    let buffer = TextBuffer::new(snapshot("a\rb\r\nc\n"));
+    assert_eq!(buffer.line_count(), 4);
+    assert_eq!(buffer.line_to_char(1), Some(2));
+    assert_eq!(buffer.line_to_char(2), Some(5));
+    assert_eq!(buffer.line_to_char(3), Some(7));
+}
+
+#[test]
 fn a_new_edit_after_undo_clears_redo_without_changing_original_line_endings() {
     let mut buffer = TextBuffer::new(snapshot("a\r\nz"));
     buffer.set_cursor(1).unwrap();
@@ -370,4 +387,86 @@ fn unknown_conflict_selection_does_not_resolve_the_actual_conflict() {
         Err(ResolveError::UnknownConflict)
     );
     assert!(merge.result().is_none());
+}
+
+#[test]
+fn conflict_source_ranges_cover_complete_choices_and_resolve_to_the_same_text() {
+    let cases = [
+        ("a\nb\n", "A\nb\n", "X\nY\n"),
+        ("a\nb\n", "X\nY\n", "A\nb\n"),
+        ("a\nb\n", "", "X\nb\n"),
+        ("a\nb\n", "X\nb\n", ""),
+        ("a\nb\n", "a\n", "X\nY\n"),
+        ("a\nb\n", "X\nY\n", "a\n"),
+        ("a\nb\n", "A\nINSERTED\nb\n", "X\nY\n"),
+        ("a\nb\nc\nd\ne\n", "A\nB\nc\nD\nE\n", "a\nX\nY\nZ\ne\n"),
+        ("a\nb\nc\n", "a\ninserted\nb\nc\n", "XYZ\n"),
+        ("", "ours\n", "theirs\n"),
+    ];
+    for (base, ours, theirs) in cases {
+        let mut merge = Merge::three_way(&snapshot(base), &snapshot(ours), &snapshot(theirs));
+        assert_eq!(merge.conflicts().len(), 1, "{base:?} {ours:?} {theirs:?}");
+        let conflict = &merge.conflicts()[0];
+        let ours_lines: Vec<_> = ours.split_inclusive('\n').collect();
+        let theirs_lines: Vec<_> = theirs.split_inclusive('\n').collect();
+        let ours_choice = ours_lines[conflict.ours_lines.clone()].concat();
+        let theirs_choice = theirs_lines[conflict.theirs_lines.clone()].concat();
+        assert_eq!(ours_choice, ours, "{base:?}");
+        assert_eq!(theirs_choice, theirs, "{base:?}");
+        let id = conflict.id;
+        merge.resolve(id, ConflictResolution::Ours).unwrap();
+        assert_eq!(merge.result().unwrap().text(), ours_choice);
+        merge.resolve(id, ConflictResolution::Theirs).unwrap();
+        assert_eq!(merge.result().unwrap().text(), theirs_choice);
+        merge.resolve(id, ConflictResolution::Both).unwrap();
+        assert_eq!(
+            merge.result().unwrap().text(),
+            format!("{ours_choice}{theirs_choice}")
+        );
+    }
+}
+
+#[test]
+fn conflict_source_projection_keeps_prior_insertions_and_adjacent_edits_separate() {
+    let mut merge = Merge::three_way(
+        &snapshot("head\na\nb\ntail\n"),
+        &snapshot("extra\nhead\nA\nb\ntail\n"),
+        &snapshot("head\nX\nY\ntail\n"),
+    );
+    assert_eq!(merge.conflicts().len(), 1);
+    let conflict = &merge.conflicts()[0];
+    let ours = ["extra\n", "head\n", "A\n", "b\n", "tail\n"];
+    let theirs = ["head\n", "X\n", "Y\n", "tail\n"];
+    assert_eq!(ours[conflict.ours_lines.clone()].concat(), "A\nb\n");
+    assert_eq!(theirs[conflict.theirs_lines.clone()].concat(), "X\nY\n");
+    let id = conflict.id;
+    merge.resolve(id, ConflictResolution::Theirs).unwrap();
+    assert_eq!(merge.result().unwrap().text(), "extra\nhead\nX\nY\ntail\n");
+
+    let merge = Merge::three_way(
+        &snapshot("a\nb\n"),
+        &snapshot("A\nb\n"),
+        &snapshot("a\nB\n"),
+    );
+    assert!(merge.conflicts().is_empty());
+    assert_eq!(merge.result().unwrap().text(), "A\nB\n");
+}
+
+#[test]
+fn insertion_conflicts_at_eof_select_only_inserted_source_lines() {
+    let mut merge = Merge::three_way(
+        &snapshot("head\n"),
+        &snapshot("head\nours\n"),
+        &snapshot("head\ntheirs\n"),
+    );
+    assert_eq!(merge.conflicts().len(), 1);
+    let conflict = &merge.conflicts()[0];
+    assert_eq!(conflict.base_lines, 1..1);
+    let ours = ["head\n", "ours\n"];
+    let theirs = ["head\n", "theirs\n"];
+    assert_eq!(ours[conflict.ours_lines.clone()].concat(), "ours\n");
+    assert_eq!(theirs[conflict.theirs_lines.clone()].concat(), "theirs\n");
+    let id = conflict.id;
+    merge.resolve(id, ConflictResolution::Both).unwrap();
+    assert_eq!(merge.result().unwrap().text(), "head\nours\ntheirs\n");
 }

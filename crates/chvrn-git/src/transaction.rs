@@ -1,22 +1,16 @@
 use crate::{
-    Base, ContentKind, GitError, Hunk, HunkId, NEXT_ID, Repository, Review, ReviewedFile, classify,
-    words,
+    Base, ContentKind, GitError, Hunk, HunkId, Repository, Review, ReviewedFile, classify, words,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 pub(crate) struct Cleanup(pub(crate) PathBuf);
 
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        if self.0.is_dir() {
-            let _ = fs::remove_dir_all(&self.0);
-        } else {
-            let _ = fs::remove_file(&self.0);
-        }
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -77,7 +71,7 @@ impl Repository {
             return Ok(());
         }
         let lock_path = self.index_lock_path();
-        let lock = OpenOptions::new()
+        let mut lock = OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&lock_path)
@@ -93,14 +87,29 @@ impl Repository {
             return Err(GitError::StaleReview);
         }
         self.preflight(review, updates.iter().map(|update| update.path), true)?;
-        let candidate = self.index_path.with_file_name(format!(
-            "chvrn-index-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let candidate_guard = Cleanup(candidate.clone());
-        if let Some(data) = &review.index_snapshot {
-            fs::write(&candidate, data).map_err(|_| GitError::IoFailure)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("chvrn-index-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
+        }
+        let directory = builder
+            .tempdir_in(self.index_path.parent().ok_or(GitError::UnsafePath)?)
+            .map_err(|_| GitError::IoFailure)?;
+        let candidate = directory.path().join("index");
+        if let Some(data) = &review.index_contents {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+                .map_err(|_| GitError::IoFailure)?;
+            file.write_all(data).map_err(|_| GitError::IoFailure)?;
+            let modified = fs::metadata(&self.index_path)
+                .and_then(|metadata| metadata.modified())
+                .map_err(|_| GitError::IoFailure)?;
+            file.set_times(fs::FileTimes::new().set_modified(modified))
+                .map_err(|_| GitError::IoFailure)?;
         } else {
             self.git(&words(&["read-tree", "--empty"]), None, Some(&candidate))?;
         }
@@ -130,7 +139,7 @@ impl Repository {
             entries.push(0);
         }
         self.git(
-            &words(&["update-index", "-z", "--index-info"]),
+            &words(&["update-index", "--no-split-index", "-z", "--index-info"]),
             Some(&entries),
             Some(&candidate),
         )?;
@@ -139,10 +148,10 @@ impl Repository {
         }
         self.preflight(review, updates.iter().map(|update| update.path), true)?;
         let updated = fs::read(&candidate).map_err(|_| GitError::IoFailure)?;
-        fs::write(&lock_path, updated).map_err(|_| GitError::IoFailure)?;
+        lock.write_all(&updated).map_err(|_| GitError::IoFailure)?;
+        lock.sync_all().map_err(|_| GitError::IoFailure)?;
         drop(lock);
         fs::rename(&lock_path, &self.index_path).map_err(|_| GitError::IoFailure)?;
-        drop(candidate_guard);
         drop(lock_guard);
         Ok(())
     }
@@ -196,7 +205,7 @@ impl Repository {
         } else {
             Some(bytes)
         };
-        let mode = bytes.as_ref().map(|_| file.mode.unwrap_or(0o100644));
+        let mode = bytes.as_ref().map(|_| file.replacement_mode());
         Ok(crate::PatchCandidate {
             path: path.to_path_buf(),
             bytes,
@@ -343,14 +352,11 @@ impl Repository {
         for path in paths {
             let file = review.file(path).ok_or(GitError::UnsafePath)?;
             let current = self.worktree_file(path)?;
-            if current.bytes != file.worktree || current.mode != file.worktree_mode {
+            if current.bytes != file.worktree
+                || current.mode != file.worktree_mode
+                || current.permissions != file.worktree_permissions
+            {
                 return Err(GitError::StaleReview);
-            }
-            if check_index {
-                let index = self.index_file(path)?;
-                if index.bytes != file.index {
-                    return Err(GitError::StaleReview);
-                }
             }
         }
         Ok(())
@@ -400,49 +406,46 @@ impl Repository {
         let parent = target.parent().ok_or(GitError::UnsafePath)?;
         fs::create_dir_all(parent).map_err(|_| GitError::IoFailure)?;
         self.validate_path(path)?;
-        let name = format!(
-            ".chvrn-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let temp = parent.join(name);
-        let guard = Cleanup(temp.clone());
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
+        let mut output = tempfile::Builder::new()
+            .prefix(".chvrn-")
+            .tempfile_in(parent)
             .map_err(|_| GitError::IoFailure)?;
         output.write_all(bytes).map_err(|_| GitError::IoFailure)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = if let Some(mode) = mode_override {
+            let mode = if let Some(mode) =
+                mode_override.filter(|mode| Some(*mode) != file.worktree_mode)
+            {
                 if mode != 0o100644 && mode != 0o100755 {
                     return Err(GitError::UnsafePath);
                 }
                 if mode == 0o100755 { 0o755 } else { 0o644 }
-            } else if file.worktree.is_some() {
-                fs::metadata(&target)
-                    .map_err(|_| GitError::IoFailure)?
-                    .permissions()
-                    .mode()
-            } else if file.base_mode == Some(0o100755) {
+            } else if let Some(permissions) = &file.worktree_permissions {
+                permissions.mode()
+            } else if file.replacement_mode() == 0o100755 {
                 0o755
             } else {
                 0o644
             };
-            fs::set_permissions(&temp, fs::Permissions::from_mode(mode))
+            output
+                .as_file()
+                .set_permissions(fs::Permissions::from_mode(mode))
                 .map_err(|_| GitError::IoFailure)?;
         }
-        output.sync_all().map_err(|_| GitError::IoFailure)?;
-        drop(output);
+        output
+            .as_file()
+            .sync_all()
+            .map_err(|_| GitError::IoFailure)?;
         self.validate_path(path)?;
         let current = self.worktree_file(path)?;
-        if current.bytes != file.worktree || current.mode != file.worktree_mode {
+        if current.bytes != file.worktree
+            || current.mode != file.worktree_mode
+            || current.permissions != file.worktree_permissions
+        {
             return Err(GitError::StaleReview);
         }
-        fs::rename(&temp, &target).map_err(|_| GitError::IoFailure)?;
-        drop(guard);
+        output.persist(&target).map_err(|_| GitError::IoFailure)?;
         Ok(())
     }
 
@@ -514,7 +517,7 @@ fn replace_selected(
     Ok(output)
 }
 
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
+pub(crate) fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, GitError> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),

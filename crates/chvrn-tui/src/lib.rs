@@ -15,7 +15,9 @@ pub use chvrn_core::structural::Language;
 pub use input::ReviewEditError;
 pub use merge_advice::{MergeAdviceError, MergeAdviceRequest};
 pub use pager::PagerSession;
-pub use session::{DiffCompletion, DiffRequest, RepositoryReviewMode, ReviewSession};
+pub use session::{
+    DiffCompletion, DiffRequest, DiffRequestId, RepositoryReviewMode, ReviewSession,
+};
 pub use theme::{BUNDLED_THEMES, Theme, ThemeError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -57,6 +59,8 @@ pub enum ReviewOutcome {
     Continue,
     DiscardRequired,
     RefreshConflict,
+    RefreshApplied,
+    RefreshSuperseded,
     LocalDiffPending,
     UnresolvedConflicts(usize),
     Submitted(ReviewSubmission),

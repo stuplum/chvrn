@@ -4,7 +4,7 @@ Status: approved for implementation. This contract describes the Git crate's pro
 
 ## Dependencies
 
-Production crate: standard library, `similar` 2.7, and a Git executable available on `PATH`. Test-only dev dependency: `tempfile`. Tests use `std::process::Command` for real local Git fixtures. No network or global Git configuration is required.
+Production crate: standard library, `chvrn-core`, `similar` 2.7, `tempfile`, Unix-only `libc`, and a Git executable available on `PATH`. Tests use `std::process::Command` for real local Git fixtures. No network or global Git configuration is required.
 
 ## Types and signatures
 
@@ -77,6 +77,10 @@ pub struct ReviewedFile {
     pub content: ContentKind,
 }
 
+impl ReviewedFile {
+    pub fn replacement_mode(&self) -> u32;
+}
+
 pub struct PatchCandidate {
     pub path: PathBuf,
     pub bytes: Option<Vec<u8>>,
@@ -139,20 +143,32 @@ pub enum GitError {
 
 `Base::Index` compares the exact inspected index entries against worktree bytes and modes, including staged content on the same path. `Base::Revision` compares the named tree against worktree bytes and modes; the revision is resolved and pinned when creating the review. `changes(base)` compares a named revision against index and worktree combined: a path is reported if either layer differs, with rename source in `old_path`, and reports untracked files. A binary file (NUL or invalid UTF-8) is labelled `Binary`; text operations on its hunks are unavailable. Rename reporting is based on Git's rename detection, not just delete/add names. Paths with non-UTF-8 bytes are preserved as native paths on Unix.
 
+Index-dependent discovery and captured entries use one owned private index, not repeated reads of the live index. Split indexes are materialised into self-contained private indexes; an absent index starts as a nonexistent path inside an owned directory. Native paths and linked-worktree index locations remain supported. Private index copies retain the original index modification time so copying does not hide racily clean, same-size worktree edits. The original index bytes remain the freshness authority and are compared before publication and staging; temporary candidates never replace unrelated existing paths.
+
 `ReviewedFile::base` contains bytes from the selected index/revision, `index` contains staged bytes and `worktree` contains inspected filesystem bytes. Absence is `None`, distinct from an empty file. `mode` describes inspected worktree permissions (Git file mode), and `content` marks binary/invalid UTF-8 rather than rewriting it. `Review::resolved_revision` exposes the pinned tree ID. `save_worktree` and `save_files` validate reviewed snapshots before atomic per-file worktree replacement, preserve executable permissions, and never stage. `review_patch` captures every path touched by a validated patch even on a clean worktree or absent new target. `preview_patch` returns target bytes and modes without writing the worktree or index; `import_patch` applies those same validated candidates subject to another stale check.
 
-`base_mode` captures the selected base's Git file mode. Compare it with `mode` to detect permission changes even when the compared bytes are identical.
+`base_mode` captures the selected base's Git file mode. Compare it with `mode` to detect permission changes even when the compared bytes are identical. `replacement_mode()` returns the existing worktree Git mode, otherwise the base mode, otherwise `100644`; replacement candidates use this effective mode, including executable deletion restoration. Existing full Unix permissions, including restrictive modes such as `0600`, are captured and freshness-checked. Content-only saves, rejections and patches preserve those permissions; an explicit differing Git mode uses the requested mode, and restored/new files use base/default permissions.
 
 Reviews include unresolved paths, even when worktree content matches a revision base. An unresolved index entry has no stage-zero bytes and is represented as `None` in `ReviewedFile::index`. `conflict` reads literal-pathspec stage entries and their blobs without changing the index or worktree; non-conflicted paths return `None`. An absent base stage means empty bytes, but both ours and theirs must exist. Sources and the worktree must be regular UTF-8 text files. The snapshot retains the repository and index identity, exact stage modes/object IDs, worktree bytes and permissions.
 
 `validate_conflict` rejects a snapshot from another repository/index with `ForeignConflict` and changed entries, worktree bytes or permissions with `StaleConflict`. Unsafe paths and unsupported content retain their specific errors. `index_path` exposes the absolute index path resolved by Git, including linked-worktree locations, so callers can watch index changes outside the worktree.
 
+Worktree reads validate regular files before consuming bytes. Unix reads traverse directory handles with no-follow opens and use nonblocking opens, then inspect metadata on the opened file handle. Symlink paths, FIFOs and other nonregular worktree inputs are rejected rather than followed or allowed to wait for a writer.
+
 `review_after_changes(before, changes)` is the post-mutation re-inspection path for review acceptance. Each candidate names a repository-relative path and the exact authorised post-write bytes and Git mode (`None`/`None` for deletion); paths may be newly introduced, but duplicate or unsafe paths are rejected. It checks the original pinned revision and exact index snapshot, requires every other inspected worktree file to remain unchanged, and requires each candidate to match the actual post-write bytes and mode. It returns a fresh review covering the union of all originally inspected paths and candidate paths, even if some are now equal to the base or absent. A mismatch returns `StaleReview`, never a newly approved snapshot; the returned review supports `validate_review` at asynchronous feedback delivery. This method does not write files or index entries.
 
 `validate_review` checks every inspected worktree path, the exact inspected index and, for `Base::Revision`, that its named reference still resolves to the captured tree. Moving `HEAD` to another tree is stale; an immutable revision SHA remains valid when `HEAD` moves. This also applies to unchanged sessions and does not mutate anything. `stage` is valid only for `Base::Index` reviews. It applies chosen text hunks to the index, preserving previously staged material and unrelated worktree edits; it does not change worktree bytes or commit. `stage_file` stages complete reviewed bytes and mode, including mode-only changes, empty files and opaque binary content. `reject` is valid only for `Base::Revision` reviews and restores selected worktree hunks to the pinned revision without changing the index or other hunks. `reject_file` restores complete reviewed text and mode. A stale requested path or index rejects the mutation before writing; no silent reload, rebase or HEAD substitution. A filesystem failure after multi-file preflight can report `PartialWrite { applied, failed }`; cross-file atomicity is not promised. Replacement is atomic per file.
 
+Worktree replacements and patch scratch directories use exclusively acquired, owned temporary resources. Replacement files are created beside their targets, retain validated permissions, are synced and checked for freshness before atomic installation. Staging retains the real `index.lock` protocol, writes and syncs the acquired lock handle, and reads private candidate index bytes from the pathname after Git may have replaced the file. Cleanup is armed only for acquired resources.
+
+Unix patch scratch and private-index directories are created with mode `0700`, independent of a permissive process umask. Copies of private worktree content are not exposed through the temporary parent directory.
+
 `export_patch` exports the complete `Base::Revision` review as an uncoloured Git-compatible unified patch. Git must be able to apply it to the matching base and reverse it back to the original bytes, including CRLF and no-final-newline content. Header style, context count and timestamps are not part of the contract. For paths requiring Git quoting or extended headers, export/import retain exact path bytes and mode/rename metadata; no shell quoting. `import_patch` applies a validated unified patch against the worktree snapshot captured by its `Review` (either base); every touched path must be within that review. All patch paths, preimages, bounds and target safety are checked before writing any file. A malformed/ambiguous patch or a stale inspected snapshot leaves all paths and index entries untouched; import never stages or commits. Binary patch bodies are rejected rather than rewritten lossily. Patch newline control markers are patch syntax, not file content.
 
-The crate does not run hooks, external diff drivers or remote operations. Git subprocesses use argument vectors and machine-readable NUL-delimited status output, with environment isolation sufficient that repository configuration cannot run external programs during inspection. The CLI owns non-TTY rendering and exit codes; this crate returns data/errors without terminal control sequences.
+Patch path validation tracks old/new hunk line counts. Header-like payload such as `+++ b/../outside` inside a hunk is file content, not a second path declaration; actual escaping headers remain rejected. Git quoting, native path bytes, mode/rename metadata and binary-patch rejection remain in force.
+
+Within a hunk, a bare empty line is accepted as an empty context line when both remaining line counts permit it, matching Git's patch grammar.
+
+The crate does not run hooks, filesystem-monitor commands, external diff/textconv drivers, executable clean/smudge/process filters or remote operations. Executable filter settings are disabled together with their `required` flags, so a required repository filter cannot force execution or a generic inspection failure. Non-executable attributes and text/EOL normalisation remain active, and repository/object format settings remain available. Git subprocesses use argument vectors and machine-readable NUL-delimited output. The CLI owns non-TTY rendering and exit codes; this crate returns data/errors without terminal control sequences.
 
 Untracked-file discovery reads Git's effective `core.excludesFile` with path expansion and normal system/global/local configuration precedence. Only that setting is forwarded to the isolated discovery command; other system/global settings remain disabled for repository operations. Git applies repository ignore files, `.git/info/exclude`, negations and its default global ignore location normally. Ignore rules do not suppress tracked changes or explicitly requested paths.

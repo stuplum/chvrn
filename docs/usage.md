@@ -206,6 +206,8 @@ Git actions require a selected presentation hunk matching one exact Git hunk. If
 
 Ordinary file comparison and repository review watch for filesystem changes. Clean buffers can refresh; incoming changes never silently replace dirty edits. A conflicting refresh blocks submission. `R` explicitly discards local edits and reloads the incoming state. Review decisions are invalidated when the inspected state changes.
 
+Switching files retires the previous file's in-flight refresh. Changing whitespace policy while refreshing recomputes the incoming snapshots under the new policy; it does not abandon the refresh or leave submission blocked on an obsolete request.
+
 ## Patches and reports
 
 ```sh

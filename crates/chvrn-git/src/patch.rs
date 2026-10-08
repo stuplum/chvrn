@@ -1,13 +1,11 @@
-use crate::transaction::Cleanup;
 use crate::{
-    ContentKind, GitError, NEXT_ID, Repository, Review, classify, git_output,
-    git_output_with_objects, nul_fields, path_bytes, path_from_git, trim_newline, words,
+    ContentKind, GitError, Repository, Review, classify, git_output, git_output_with_objects,
+    nul_fields, path_bytes, path_from_git, trim_newline, words,
 };
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatchCandidate {
@@ -256,7 +254,24 @@ impl Repository {
         let mut declared = BTreeSet::new();
         let mut previous = b"".as_slice();
         let mut before_previous = b"".as_slice();
+        let mut remaining = (0usize, 0usize);
         for line in patch.split(|byte| *byte == b'\n') {
+            if remaining != (0, 0) {
+                match line.first() {
+                    Some(b' ') | None if remaining.0 > 0 && remaining.1 > 0 => {
+                        remaining.0 -= 1;
+                        remaining.1 -= 1;
+                    }
+                    Some(b'-') if remaining.0 > 0 => remaining.0 -= 1,
+                    Some(b'+') if remaining.1 > 0 => remaining.1 -= 1,
+                    Some(b'\\') if line == b"\\ No newline at end of file" => (),
+                    _ => return Err(GitError::MalformedPatch),
+                }
+                continue;
+            }
+            if line.starts_with(b"@@ ") {
+                remaining = hunk_counts(line)?;
+            }
             if line.ends_with(b" 120000")
                 && [
                     b"new file mode ".as_slice(),
@@ -289,6 +304,9 @@ impl Repository {
             before_previous = previous;
             previous = line;
         }
+        if remaining != (0, 0) {
+            return Err(GitError::MalformedPatch);
+        }
         let stats = git_output(
             scratch,
             &words(&["apply", "--numstat", "-z", "--unsafe-paths", "-"]),
@@ -312,31 +330,60 @@ impl Repository {
 
 struct Scratch {
     path: PathBuf,
-    _cleanup: Cleanup,
+    _directory: tempfile::TempDir,
 }
 
 impl Scratch {
     fn new() -> Result<Self, GitError> {
-        let path = std::env::temp_dir().join(format!(
-            "chvrn-git-{}-{}",
-            std::process::id(),
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        ));
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("chvrn-git-");
         #[cfg(unix)]
         {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&path)
-                .map_err(|_| GitError::IoFailure)?;
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o700));
         }
-        #[cfg(not(unix))]
-        fs::create_dir(&path).map_err(|_| GitError::IoFailure)?;
+        let directory = builder.tempdir().map_err(|_| GitError::IoFailure)?;
         Ok(Self {
-            _cleanup: Cleanup(path.clone()),
-            path,
+            path: directory.path().to_path_buf(),
+            _directory: directory,
         })
     }
+}
+
+fn hunk_counts(line: &[u8]) -> Result<(usize, usize), GitError> {
+    let mut fields = line.split(|byte| *byte == b' ');
+    if fields.next() != Some(b"@@".as_slice()) {
+        return Err(GitError::MalformedPatch);
+    }
+    let mut count = |prefix| {
+        let range = fields
+            .next()
+            .and_then(|field| field.strip_prefix(&[prefix]))
+            .ok_or(GitError::MalformedPatch)?;
+        let mut parts = range.split(|byte| *byte == b',');
+        let start = parts.next().ok_or(GitError::MalformedPatch)?;
+        let parse = |bytes: &[u8]| {
+            if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+                return Err(GitError::MalformedPatch);
+            }
+            std::str::from_utf8(bytes)
+                .map_err(|_| GitError::MalformedPatch)?
+                .parse::<usize>()
+                .map_err(|_| GitError::MalformedPatch)
+        };
+        parse(start)?;
+        let count = parts.next().map(parse).transpose()?.unwrap_or(1);
+        if parts.next().is_some() {
+            return Err(GitError::MalformedPatch);
+        }
+        Ok(count)
+    };
+    let old = count(b'-')?;
+    let new = count(b'+')?;
+    if fields.next() != Some(b"@@".as_slice()) {
+        return Err(GitError::MalformedPatch);
+    }
+    Ok((old, new))
 }
 
 fn patch_paths(data: &[u8]) -> Result<BTreeSet<PathBuf>, GitError> {
@@ -365,4 +412,20 @@ fn patch_paths(data: &[u8]) -> Result<BTreeSet<PathBuf>, GitError> {
         }
     }
     Ok(paths)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn patch_scratch_content_is_inaccessible_to_other_users() {
+        let scratch = Scratch::new().unwrap();
+        fs::write(scratch.path.join("private-source"), b"private source").unwrap();
+        assert_eq!(
+            fs::metadata(&scratch.path).unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
 }

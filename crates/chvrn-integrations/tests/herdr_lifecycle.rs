@@ -78,6 +78,56 @@ fn report() -> ReviewReport {
 }
 
 #[test]
+fn restoring_a_different_session_invalidates_pending_feedback() {
+    let mut bridge = bridge();
+    bridge.submit(report()).unwrap();
+    assert!(
+        bridge
+            .observe_agent_session(AgentSessionIdentity::Unverified)
+            .is_empty()
+    );
+    let effects =
+        bridge.observe_agent_session(AgentSessionIdentity::Verified("agent-run-two".into()));
+    assert_eq!(
+        effects,
+        vec![BridgeEffect::InvalidateReview {
+            snapshot_id: "snapshot-17".into()
+        }]
+    );
+    assert!(bridge.pending_report().is_none());
+    assert!(
+        bridge
+            .observe(
+                &envelope("idle", "w9:p5", 32, 7),
+                LifecycleReliability::Verified
+            )
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn restoring_the_same_session_preserves_pending_feedback() {
+    let mut bridge = bridge();
+    bridge.submit(report()).unwrap();
+    bridge.observe_agent_session(AgentSessionIdentity::Unverified);
+    assert!(
+        bridge
+            .observe_agent_session(AgentSessionIdentity::Verified("agent-run-one".into()))
+            .is_empty()
+    );
+    assert_eq!(
+        bridge
+            .observe(
+                &envelope("idle", "w9:p5", 32, 7),
+                LifecycleReliability::Verified
+            )
+            .unwrap(),
+        vec![BridgeEffect::SendFeedback { report: report() }]
+    );
+}
+
+#[test]
 fn verified_working_to_blocked_offers_one_review_without_refocusing_on_repeated_observations() {
     let mut bridge = bridge();
     assert!(

@@ -8,6 +8,8 @@ Library: `chvrn-core`, `serde`, `serde_json`, `url`, pinned `ureq =3.4.2` with r
 
 Herdr test executables are written and made executable by a separate shell process. Writing them in the parallel test process lets another thread's fork inherit a writable descriptor and makes Linux reject execution with `ETXTBSY`, even after the original writer closes. Keep executable fixture creation outside that process rather than retrying production commands.
 
+The socket backlog stress test observes replies from the load producer through a one-slot channel while the producer continues connecting. A separate competing client can encounter Linux `EAGAIN` or Darwin `ECONNREFUSED` on a full backlog, or fail to gain admission before the deadline. Sampling the producer's connections tests slot recovery without assuming fair admission between clients; the successful-response deadline remains two seconds.
+
 ## Runtime ownership
 
 The CLI lazily starts one continuously driven current-thread Tokio runtime on a dedicated thread. Bounded adapter queues bridge synchronous UI state and async transports. `process::ProcessSupervisor` registers each child before startup awaits; explicit shutdown cancels adapters, completes owned cleanup and reaps children before stopping the runtime. Adapter drops signal cancellation without blocking terminal restoration.

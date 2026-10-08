@@ -600,13 +600,16 @@ async fn connection_slots_recover_under_a_continuous_accept_backlog() {
     let path = socket.clone();
     let (ready, running) = tokio::sync::oneshot::channel();
     let (done, completed) = tokio::sync::oneshot::channel();
+    let (observations, mut observed) = tokio::sync::mpsc::channel(1);
     let producer = std::thread::spawn(move || {
         let frame = framed(&json!({"type":"inspect"}));
         let _ = ready.send(());
         while !finished.load(Ordering::Acquire) {
             if let Ok(mut stream) = UnixStream::connect(&path) {
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-                let _ = std::io::Write::write_all(&mut stream, &frame);
+                if std::io::Write::write_all(&mut stream, &frame).is_ok() {
+                    let _ = observations.try_send(stream);
+                }
             }
         }
         let _ = done.send(());
@@ -614,21 +617,9 @@ async fn connection_slots_recover_under_a_continuous_accept_backlog() {
     running.await.unwrap();
     let response = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let mut stream = match tokio::net::UnixStream::connect(&socket).await {
-                Ok(stream) => stream,
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(error) => break Err(error),
-            };
-            if stream
-                .write_all(&framed(&json!({"type":"inspect"})))
-                .await
-                .is_err()
-            {
-                continue;
-            }
+            let stream = observed.recv().await.unwrap();
+            stream.set_nonblocking(true)?;
+            let mut stream = tokio::net::UnixStream::from_std(stream)?;
             let mut length = [0; 4];
             if stream.read_exact(&mut length).await.is_err() {
                 continue;
